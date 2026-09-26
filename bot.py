@@ -57,7 +57,7 @@ db.commit()
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "games", "repeat",
-    "join", "entry", "add", "notifications", "markdown", "edit"
+"join_lock", "entry", "add", "notifications", "markdown", "edit"
 ]
 
 DEFAULTS = {field: 0 for field in SETTING_FIELDS}
@@ -356,7 +356,7 @@ LOCK_MAP = {
     "lockkeyboard": "keyboard", "unlockkeyboard": "keyboard",
     "lockgames": "games", "unlockgames": "games",
     "lockrepeat": "repeat", "unlockrepeat": "repeat",
-    "lockjoin": "join", "unlockjoin": "join",
+    "lockjoin": "join_lock", "unlockjoin": "join_lock",
     "lockentry": "entry", "unlockentry": "entry",
     "lockadd": "add", "unlockadd": "add",
     "locknotifications": "notifications", "unlocknotifications": "notifications",
@@ -378,7 +378,7 @@ ARABIC_ALIASES = {
     "منع الكيبورد": ("keyboard", 1), "السماح بالكيبورد": ("keyboard", 0),
     "منع الألعاب": ("games", 1), "السماح بالألعاب": ("games", 0),
     "منع التكرار": ("repeat", 1), "السماح بالتكرار": ("repeat", 0),
-    "منع الدخول": ("join", 1), "السماح بالدخول": ("join", 0),
+    "منع الدخول": ("join_lock", 1), "السماح بالدخول": ("join", 0),
     "منع رسائل الدخول": ("entry", 1), "السماح برسائل الدخول": ("entry", 0),
     "منع الإضافة": ("add", 1), "السماح بالإضافة": ("add", 0),
     "منع التعديل": ("edit", 1), "السماح بالتعديل": ("edit", 0),
