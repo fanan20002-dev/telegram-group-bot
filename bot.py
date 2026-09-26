@@ -57,7 +57,7 @@ db.commit()
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "games", "repeat",
-"join_lock", "entry", "add", "notifications", "markdown", "edit"
+    "join_lock", "entry", "add_lock", "notifications", "markdown", "edit"
 ]
 
 DEFAULTS = {field: 0 for field in SETTING_FIELDS}
@@ -67,7 +67,7 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 def ensure_settings(chat_id):
-cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
+    cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
     # SQLite cannot ALTER a missing table definition in one statement, so
     # create a fresh table shape when possible and migrate old installations.
     existing = db.execute("PRAGMA table_info(settings)").fetchall()
@@ -79,7 +79,7 @@ cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
         existing_names = {"chat_id", *SETTING_FIELDS}
     for field in SETTING_FIELDS:
         if field not in existing_names:
-            db.execute(f'ALTER db.execute(f'ALTER TABLE settings ADD COLUMN "{field}" INTEGER DEFAULT {DEFAULTS[field]}')
+            db.execute(f'ALTER TABLE settings ADD COLUMN "{field}" INTEGER DEFAULT {DEFAULTS[field]}')
     row = db.execute("SELECT chat_id FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
     if not row:
         db.execute("INSERT INTO settings(chat_id) VALUES(?)", (chat_id,))
@@ -91,12 +91,12 @@ if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='setti
     cols = {r[1] for r in db.execute("PRAGMA table_info(settings)").fetchall()}
     for field in SETTING_FIELDS:
         if field not in cols:
-            db.execute(f"ALTER TABLE settings ADD COLUMN {field} INTEGER DEFAULT {DEFAULTS[field]}")
+            db.execute(f'ALTER TABLE settings ADD COLUMN "{field}" INTEGER DEFAULT {DEFAULTS[field]}')
     db.commit()
 
 def get_settings(chat_id):
     ensure_settings(chat_id)
-    fields = ", ".join(SETTING_FIELDS)
+    fields = ", ".join(f'"{f}"' for f in SETTING_FIELDS)
     row = db.execute(f"SELECT {fields} FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
     return dict(zip(SETTING_FIELDS, row))
 
@@ -104,7 +104,7 @@ def set_setting(chat_id, field, value):
     if field not in SETTING_FIELDS:
         return
     ensure_settings(chat_id)
-    db.execute(f"UPDATE settings SET {field}=? WHERE chat_id=?", (int(bool(value)), chat_id))
+    db.execute(f'UPDATE settings SET "{field}"=? WHERE chat_id=?', (int(bool(value)), chat_id))
     db.commit()
 
 def log_action(chat_id, user_id, action, details=""):
@@ -129,106 +129,106 @@ async def require_admin(update):
     if not update.effective_user or not update.effective_chat:
         return False
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.effective_message.reply_text("هذا الأمر يعمل داخل القروب فقط.")
+        await update.effective_message.reply_text("ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙØ¹ÙÙ Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙÙØ·.")
         return False
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ ليس لديك صلاحية.")
+        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
         return False
     return True
 
 def panel_markup(owner=False):
     rows = [
-        [InlineKeyboardButton("🛡️ الحماية", callback_data="security"),
-         InlineKeyboardButton("👥 المدراء", callback_data="managers")],
-        [InlineKeyboardButton("📢 المستجدات", callback_data="alerts"),
-         InlineKeyboardButton("📋 السجل", callback_data="logs")],
-        [InlineKeyboardButton("⚙️ إعدادات القروب", callback_data="settings")]
+        [InlineKeyboardButton("ð¡ï¸ Ø§ÙØ­ÙØ§ÙØ©", callback_data="security"),
+         InlineKeyboardButton("ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡", callback_data="managers")],
+        [InlineKeyboardButton("ð¢ Ø§ÙÙØ³ØªØ¬Ø¯Ø§Øª", callback_data="alerts"),
+         InlineKeyboardButton("ð Ø§ÙØ³Ø¬Ù", callback_data="logs")],
+        [InlineKeyboardButton("âï¸ Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§ÙÙØ±ÙØ¨", callback_data="settings")]
     ]
     if owner:
-        rows.append([InlineKeyboardButton("➕ إضافة مدير", callback_data="add_manager_help")])
+        rows.append([InlineKeyboardButton("â Ø¥Ø¶Ø§ÙØ© ÙØ¯ÙØ±", callback_data="add_manager_help")])
     return InlineKeyboardMarkup(rows)
 
 async def start(update, context):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.effective_message.reply_text(
-            f"مرحبًا 👋\nرقم حسابك: {update.effective_user.id}\n\n"
-            "استخدم /panel لفتح لوحة التحكم."
+            f"ÙØ±Ø­Ø¨ÙØ§ ð\nØ±ÙÙ Ø­Ø³Ø§Ø¨Ù: {update.effective_user.id}\n\n"
+            "Ø§Ø³ØªØ®Ø¯Ù /panel ÙÙØªØ­ ÙÙØ­Ø© Ø§ÙØªØ­ÙÙ."
         )
     else:
-        await update.effective_message.reply_text("تم تشغيل البوت ✅\nاستخدم /panel للوحة التحكم.")
+        await update.effective_message.reply_text("ØªÙ ØªØ´ØºÙÙ Ø§ÙØ¨ÙØª â\nØ§Ø³ØªØ®Ø¯Ù /panel ÙÙÙØ­Ø© Ø§ÙØªØ­ÙÙ.")
 
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
-        "📚 أوامر البوت:\n\n"
-        "👑 /panel — لوحة التحكم\n"
-        "👥 /addmanager /delmanager /managers\n"
-        "🔨 /ban /unban /kick /mute /unmute /del /pin\n"
-        "🛡️ /locks — قائمة الحماية\n"
-        "⚙️ /settings — حالة الحماية\n"
-        "🆔 /id /idgroup\n\n"
-        "يمكن أيضًا كتابة أوامر عربية كرسائل عادية، مثل:\n"
-        "منع الروابط، منع الصور، منع الفيديو، منع الملفات، السماح بالروابط."
+        "ð Ø£ÙØ§ÙØ± Ø§ÙØ¨ÙØª:\n\n"
+        "ð /panel â ÙÙØ­Ø© Ø§ÙØªØ­ÙÙ\n"
+        "ð¥ /addmanager /delmanager /managers\n"
+        "ð¨ /ban /unban /kick /mute /unmute /del /pin\n"
+        "ð¡ï¸ /locks â ÙØ§Ø¦ÙØ© Ø§ÙØ­ÙØ§ÙØ©\n"
+        "âï¸ /settings â Ø­Ø§ÙØ© Ø§ÙØ­ÙØ§ÙØ©\n"
+        "ð /id /idgroup\n\n"
+        "ÙÙÙÙ Ø£ÙØ¶ÙØ§ ÙØªØ§Ø¨Ø© Ø£ÙØ§ÙØ± Ø¹Ø±Ø¨ÙØ© ÙØ±Ø³Ø§Ø¦Ù Ø¹Ø§Ø¯ÙØ©Ø ÙØ«Ù:\n"
+        "ÙÙØ¹ Ø§ÙØ±ÙØ§Ø¨Ø·Ø ÙÙØ¹ Ø§ÙØµÙØ±Ø ÙÙØ¹ Ø§ÙÙÙØ¯ÙÙØ ÙÙØ¹ Ø§ÙÙÙÙØ§ØªØ Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ±ÙØ§Ø¨Ø·."
     )
 
 async def panel(update, context):
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ ليس لديك صلاحية استخدام لوحة الإدارة.")
+        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ© Ø§Ø³ØªØ®Ø¯Ø§Ù ÙÙØ­Ø© Ø§ÙØ¥Ø¯Ø§Ø±Ø©.")
         return
     await update.effective_message.reply_text(
-        "👑 لوحة تحكم البوت\n\nاختر القسم المطلوب:",
+        "ð ÙÙØ­Ø© ØªØ­ÙÙ Ø§ÙØ¨ÙØª\n\nØ§Ø®ØªØ± Ø§ÙÙØ³Ù Ø§ÙÙØ·ÙÙØ¨:",
         reply_markup=panel_markup(is_owner(update.effective_user.id))
     )
 
 async def addmanager(update, context):
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ هذا الأمر للمالك فقط.")
+        await update.effective_message.reply_text("â ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙÙÙØ§ÙÙ ÙÙØ·.")
         return
     if not context.args:
-        await update.effective_message.reply_text("الاستخدام: /addmanager رقم_المستخدم")
+        await update.effective_message.reply_text("Ø§ÙØ§Ø³ØªØ®Ø¯Ø§Ù: /addmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("رقم المستخدم غير صحيح.")
+        await update.effective_message.reply_text("Ø±ÙÙ Ø§ÙÙØ³ØªØ®Ø¯Ù ØºÙØ± ØµØ­ÙØ­.")
         return
     db.execute(
         "INSERT OR REPLACE INTO managers(user_id,added_by,added_at) VALUES(?,?,?)",
         (uid, update.effective_user.id, now())
     )
     db.commit()
-    await update.effective_message.reply_text(f"✅ تمت إضافة المدير: {uid}")
+    await update.effective_message.reply_text(f"â ØªÙØª Ø¥Ø¶Ø§ÙØ© Ø§ÙÙØ¯ÙØ±: {uid}")
 
 async def delmanager(update, context):
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ هذا الأمر للمالك فقط.")
+        await update.effective_message.reply_text("â ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙÙÙØ§ÙÙ ÙÙØ·.")
         return
     if not context.args:
-        await update.effective_message.reply_text("الاستخدام: /delmanager رقم_المستخدم")
+        await update.effective_message.reply_text("Ø§ÙØ§Ø³ØªØ®Ø¯Ø§Ù: /delmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("رقم المستخدم غير صحيح.")
+        await update.effective_message.reply_text("Ø±ÙÙ Ø§ÙÙØ³ØªØ®Ø¯Ù ØºÙØ± ØµØ­ÙØ­.")
         return
     db.execute("DELETE FROM managers WHERE user_id=?", (uid,))
     db.commit()
-    await update.effective_message.reply_text(f"✅ تم حذف المدير: {uid}")
+    await update.effective_message.reply_text(f"â ØªÙ Ø­Ø°Ù Ø§ÙÙØ¯ÙØ±: {uid}")
 
 async def managers(update, context):
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ ليس لديك صلاحية.")
+        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
         return
     rows = db.execute("SELECT user_id FROM managers ORDER BY user_id").fetchall()
-    text = "👥 المدراء:\n" + ("\n".join(f"• {r[0]}" for r in rows) if rows else "لا يوجد مدراء إضافيون.")
+    text = "ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡:\n" + ("\n".join(f"â¢ {r[0]}" for r in rows) if rows else "ÙØ§ ÙÙØ¬Ø¯ ÙØ¯Ø±Ø§Ø¡ Ø¥Ø¶Ø§ÙÙÙÙ.")
     if OWNER_ID:
-        text += f"\n\n👑 المالك: {OWNER_ID}"
+        text += f"\n\nð Ø§ÙÙØ§ÙÙ: {OWNER_ID}"
     await update.effective_message.reply_text(text)
 
 async def id_cmd(update, context):
-    await update.effective_message.reply_text(f"🆔 رقمك: {update.effective_user.id}")
+    await update.effective_message.reply_text(f"ð Ø±ÙÙÙ: {update.effective_user.id}")
 
 async def idgroup(update, context):
-    await update.effective_message.reply_text(f"🆔 رقم القروب: {update.effective_chat.id}")
+    await update.effective_message.reply_text(f"ð Ø±ÙÙ Ø§ÙÙØ±ÙØ¨: {update.effective_chat.id}")
 
 def target_from_update(update, context):
     target = update.message.reply_to_message.from_user if update.message and update.message.reply_to_message else None
@@ -245,48 +245,48 @@ async def ban(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("استخدم الأمر بالرد على رسالة العضو أو /ban رقم_المستخدم")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù Ø§ÙØ£ÙØ± Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù Ø£Ù /ban Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         log_action(update.effective_chat.id, update.effective_user.id, "ban", str(uid))
-        await update.message.reply_text("✅ تم حظر العضو.")
+        await update.message.reply_text("â ØªÙ Ø­Ø¸Ø± Ø§ÙØ¹Ø¶Ù.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر الحظر: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ­Ø¸Ø±: {e}")
 
 async def unban(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("استخدم /unban رقم_المستخدم أو بالرد.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /unban Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù Ø£Ù Ø¨Ø§ÙØ±Ø¯.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        await update.message.reply_text("✅ تم فك الحظر.")
+        await update.message.reply_text("â ØªÙ ÙÙ Ø§ÙØ­Ø¸Ø±.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر فك الحظر: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± ÙÙ Ø§ÙØ­Ø¸Ø±: {e}")
 
 async def kick(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("استخدم /kick بالرد على رسالة العضو.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /kick Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        await update.message.reply_text("✅ تم طرد العضو.")
+        await update.message.reply_text("â ØªÙ Ø·Ø±Ø¯ Ø§ÙØ¹Ø¶Ù.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر الطرد: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ·Ø±Ø¯: {e}")
 
 async def mute(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("استخدم /mute بالرد على رسالة العضو.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /mute Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
@@ -294,15 +294,15 @@ async def mute(update, context):
             update.effective_chat.id, uid,
             permissions=ChatPermissions(can_send_messages=False)
         )
-        await update.message.reply_text("✅ تم كتم العضو.")
+        await update.message.reply_text("â ØªÙ ÙØªÙ Ø§ÙØ¹Ø¶Ù.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر الكتم: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙÙØªÙ: {e}")
 
 async def unmute(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("استخدم /unmute بالرد على رسالة العضو.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /unmute Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
@@ -316,31 +316,31 @@ async def unmute(update, context):
                 can_add_web_page_previews=True
             )
         )
-        await update.message.reply_text("✅ تم فك الكتم.")
+        await update.message.reply_text("â ØªÙ ÙÙ Ø§ÙÙØªÙ.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر فك الكتم: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± ÙÙ Ø§ÙÙØªÙ: {e}")
 
 async def del_cmd(update, context):
     if not await require_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("استخدم /del بالرد على الرسالة المراد حذفها.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /del Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø§ÙØ±Ø³Ø§ÙØ© Ø§ÙÙØ±Ø§Ø¯ Ø­Ø°ÙÙØ§.")
         return
     try:
         await context.bot.delete_message(update.effective_chat.id, update.message.reply_to_message.message_id)
         await update.message.delete()
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر الحذف: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ­Ø°Ù: {e}")
 
 async def pin(update, context):
     if not await require_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("استخدم /pin بالرد على الرسالة.")
+        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /pin Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø§ÙØ±Ø³Ø§ÙØ©.")
         return
     try:
         await context.bot.pin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id)
-        await update.message.reply_text("📌 تم التثبيت.")
+        await update.message.reply_text("ð ØªÙ Ø§ÙØªØ«Ø¨ÙØª.")
     except Exception as e:
-        await update.message.reply_text(f"❌ تعذر التثبيت: {e}")
+        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØªØ«Ø¨ÙØª: {e}")
 
 LOCK_MAP = {
     "locklinks": "links", "unlocklinks": "links",
@@ -358,30 +358,30 @@ LOCK_MAP = {
     "lockrepeat": "repeat", "unlockrepeat": "repeat",
     "lockjoin": "join_lock", "unlockjoin": "join_lock",
     "lockentry": "entry", "unlockentry": "entry",
-    "lockadd": "add", "unlockadd": "add",
+    "lockadd": "add_lock", "unlockadd": "add_lock",
     "locknotifications": "notifications", "unlocknotifications": "notifications",
     "lockmarkdown": "markdown", "unlockmarkdown": "markdown",
     "lockedit": "edit", "unlockedit": "edit",
 }
 
 ARABIC_ALIASES = {
-    "منع الروابط": ("links", 1), "السماح بالروابط": ("links", 0),
-    "منع الصور": ("photos", 1), "السماح بالصور": ("photos", 0),
-    "منع الفيديو": ("videos", 1), "السماح بالفيديو": ("videos", 0),
-    "منع الصوت": ("audio", 1), "السماح بالصوت": ("audio", 0),
-    "منع الملفات": ("files", 1), "السماح بالملفات": ("files", 0),
-    "منع الملصقات": ("stickers", 1), "السماح بالملصقات": ("stickers", 0),
-    "منع المتحركة": ("gif", 1), "السماح بالمتحركة": ("gif", 0),
-    "منع المعرفات": ("username", 1), "السماح بالمعرفات": ("username", 0),
-    "منع التاق": ("tag", 1), "السماح بالتاق": ("tag", 0),
-    "منع البوتات": ("bots", 1), "السماح بالبوتات": ("bots", 0),
-    "منع الكيبورد": ("keyboard", 1), "السماح بالكيبورد": ("keyboard", 0),
-    "منع الألعاب": ("games", 1), "السماح بالألعاب": ("games", 0),
-    "منع التكرار": ("repeat", 1), "السماح بالتكرار": ("repeat", 0),
-    "منع الدخول": ("join_lock", 1), "السماح بالدخول": ("join", 0),
-    "منع رسائل الدخول": ("entry", 1), "السماح برسائل الدخول": ("entry", 0),
-    "منع الإضافة": ("add", 1), "السماح بالإضافة": ("add", 0),
-    "منع التعديل": ("edit", 1), "السماح بالتعديل": ("edit", 0),
+    "ÙÙØ¹ Ø§ÙØ±ÙØ§Ø¨Ø·": ("links", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ±ÙØ§Ø¨Ø·": ("links", 0),
+    "ÙÙØ¹ Ø§ÙØµÙØ±": ("photos", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØµÙØ±": ("photos", 0),
+    "ÙÙØ¹ Ø§ÙÙÙØ¯ÙÙ": ("videos", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØ¯ÙÙ": ("videos", 0),
+    "ÙÙØ¹ Ø§ÙØµÙØª": ("audio", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØµÙØª": ("audio", 0),
+    "ÙÙØ¹ Ø§ÙÙÙÙØ§Øª": ("files", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙÙØ§Øª": ("files", 0),
+    "ÙÙØ¹ Ø§ÙÙÙØµÙØ§Øª": ("stickers", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØµÙØ§Øª": ("stickers", 0),
+    "ÙÙØ¹ Ø§ÙÙØªØ­Ø±ÙØ©": ("gif", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙØªØ­Ø±ÙØ©": ("gif", 0),
+    "ÙÙØ¹ Ø§ÙÙØ¹Ø±ÙØ§Øª": ("username", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙØ¹Ø±ÙØ§Øª": ("username", 0),
+    "ÙÙØ¹ Ø§ÙØªØ§Ù": ("tag", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªØ§Ù": ("tag", 0),
+    "ÙÙØ¹ Ø§ÙØ¨ÙØªØ§Øª": ("bots", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¨ÙØªØ§Øª": ("bots", 0),
+    "ÙÙØ¹ Ø§ÙÙÙØ¨ÙØ±Ø¯": ("keyboard", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØ¨ÙØ±Ø¯": ("keyboard", 0),
+    "ÙÙØ¹ Ø§ÙØ£ÙØ¹Ø§Ø¨": ("games", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ£ÙØ¹Ø§Ø¨": ("games", 0),
+    "ÙÙØ¹ Ø§ÙØªÙØ±Ø§Ø±": ("repeat", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªÙØ±Ø§Ø±": ("repeat", 0),
+    "ÙÙØ¹ Ø§ÙØ¯Ø®ÙÙ": ("join_lock", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¯Ø®ÙÙ": ("join_lock", 0),
+    "ÙÙØ¹ Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ": ("entry", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ": ("entry", 0),
+    "ÙÙØ¹ Ø§ÙØ¥Ø¶Ø§ÙØ©": ("add_lock", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¥Ø¶Ø§ÙØ©": ("add_lock", 0),
+    "ÙÙØ¹ Ø§ÙØªØ¹Ø¯ÙÙ": ("edit", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªØ¹Ø¯ÙÙ": ("edit", 0),
 }
 
 async def set_lock(update, context, field=None, value=None):
@@ -391,7 +391,7 @@ async def set_lock(update, context, field=None, value=None):
         field = LOCK_MAP.get(cmd)
         value = 0 if cmd.startswith("unlock") else 1
     set_setting(update.effective_chat.id, field, value)
-    state = "🔒 تم المنع." if value else "🔓 تم السماح."
+    state = "ð ØªÙ Ø§ÙÙÙØ¹." if value else "ð ØªÙ Ø§ÙØ³ÙØ§Ø­."
     await update.effective_message.reply_text(state)
     log_action(update.effective_chat.id, update.effective_user.id, "setting", f"{field}={value}")
 
@@ -399,15 +399,15 @@ async def locks(update, context):
     if not await require_admin(update): return
     s = get_settings(update.effective_chat.id)
     labels = {
-        "links":"الروابط","photos":"الصور","videos":"الفيديو","audio":"الصوت","files":"الملفات",
-        "stickers":"الملصقات","gif":"المتحركة","username":"المعرفات","tag":"التاق",
-        "bots":"البوتات","keyboard":"الكيبورد","games":"الألعاب","repeat":"التكرار",
-        "join":"الدخول","entry":"رسائل الدخول","add":"الإضافة","notifications":"الإشعارات",
-        "markdown":"الماركداون","edit":"التعديل"
+        "links":"Ø§ÙØ±ÙØ§Ø¨Ø·","photos":"Ø§ÙØµÙØ±","videos":"Ø§ÙÙÙØ¯ÙÙ","audio":"Ø§ÙØµÙØª","files":"Ø§ÙÙÙÙØ§Øª",
+        "stickers":"Ø§ÙÙÙØµÙØ§Øª","gif":"Ø§ÙÙØªØ­Ø±ÙØ©","username":"Ø§ÙÙØ¹Ø±ÙØ§Øª","tag":"Ø§ÙØªØ§Ù",
+        "bots":"Ø§ÙØ¨ÙØªØ§Øª","keyboard":"Ø§ÙÙÙØ¨ÙØ±Ø¯","games":"Ø§ÙØ£ÙØ¹Ø§Ø¨","repeat":"Ø§ÙØªÙØ±Ø§Ø±",
+        "join_lock":"Ø§ÙØ¯Ø®ÙÙ","entry":"Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ","add_lock":"Ø§ÙØ¥Ø¶Ø§ÙØ©","notifications":"Ø§ÙØ¥Ø´Ø¹Ø§Ø±Ø§Øª",
+        "markdown":"Ø§ÙÙØ§Ø±ÙØ¯Ø§ÙÙ","edit":"Ø§ÙØªØ¹Ø¯ÙÙ"
     }
-    text = "🛡️ حالة الحماية:\n\n"
+    text = "ð¡ï¸ Ø­Ø§ÙØ© Ø§ÙØ­ÙØ§ÙØ©:\n\n"
     for f in SETTING_FIELDS:
-        text += f"• {labels.get(f,f)}: {'🔒 ممنوع' if s[f] else '🔓 مسموح'}\n"
+        text += f"â¢ {labels.get(f,f)}: {'ð ÙÙÙÙØ¹' if s[f] else 'ð ÙØ³ÙÙØ­'}\n"
     await update.effective_message.reply_text(text)
 
 async def settings_cmd(update, context):
@@ -422,7 +422,7 @@ async def alerts(update, context):
     )
     db.commit()
     set_setting(chat.id, "notifications", 1)
-    await update.effective_message.reply_text("📢 تم تفعيل متابعة مستجدات هذا القروب.")
+    await update.effective_message.reply_text("ð¢ ØªÙ ØªÙØ¹ÙÙ ÙØªØ§Ø¨Ø¹Ø© ÙØ³ØªØ¬Ø¯Ø§Øª ÙØ°Ø§ Ø§ÙÙØ±ÙØ¨.")
 
 async def logs_cmd(update, context):
     if not await require_admin(update): return
@@ -431,10 +431,10 @@ async def logs_cmd(update, context):
         (update.effective_chat.id,)
     ).fetchall()
     if not rows:
-        await update.effective_message.reply_text("📋 لا يوجد سجل بعد.")
+        await update.effective_message.reply_text("ð ÙØ§ ÙÙØ¬Ø¯ Ø³Ø¬Ù Ø¨Ø¹Ø¯.")
         return
-    text = "📋 آخر العمليات:\n\n" + "\n".join(
-        f"• {a} — {d}" for a,d,_ in rows
+    text = "ð Ø¢Ø®Ø± Ø§ÙØ¹ÙÙÙØ§Øª:\n\n" + "\n".join(
+        f"â¢ {a} â {d}" for a,d,_ in rows
     )
     await update.effective_message.reply_text(text)
 
@@ -472,37 +472,37 @@ async def message_filter(update, context):
     reason = ""
 
     if s["links"] and has_link(msg.text or msg.caption):
-        delete, reason = True, "رابط"
+        delete, reason = True, "Ø±Ø§Ø¨Ø·"
     if s["photos"] and msg.photo:
-        delete, reason = True, "صورة"
+        delete, reason = True, "ØµÙØ±Ø©"
     if s["videos"] and (msg.video or msg.video_note):
-        delete, reason = True, "فيديو"
+        delete, reason = True, "ÙÙØ¯ÙÙ"
     if s["audio"] and (msg.audio or msg.voice):
-        delete, reason = True, "صوت"
+        delete, reason = True, "ØµÙØª"
     if s["files"] and (msg.document or msg.animation):
-        delete, reason = True, "ملف"
+        delete, reason = True, "ÙÙÙ"
     if s["stickers"] and msg.sticker:
-        delete, reason = True, "ملصق"
+        delete, reason = True, "ÙÙØµÙ"
     if s["gif"] and msg.animation:
-        delete, reason = True, "متحركة"
+        delete, reason = True, "ÙØªØ­Ø±ÙØ©"
     if s["username"] and has_tag(msg.text or msg.caption):
-        delete, reason = True, "معرف"
+        delete, reason = True, "ÙØ¹Ø±Ù"
     if s["tag"] and (msg.entities or msg.caption_entities):
         entities = list(msg.entities or []) + list(msg.caption_entities or [])
         if any(getattr(e, "type", "") in ("mention", "text_mention") for e in entities):
-            delete, reason = True, "تاق"
+            delete, reason = True, "ØªØ§Ù"
     if s["bots"] and msg.from_user and msg.from_user.is_bot:
-        delete, reason = True, "بوت"
+        delete, reason = True, "Ø¨ÙØª"
     if s["keyboard"] and msg.reply_markup:
-        delete, reason = True, "كيبورد"
+        delete, reason = True, "ÙÙØ¨ÙØ±Ø¯"
     if s["games"] and msg.game:
-        delete, reason = True, "لعبة"
+        delete, reason = True, "ÙØ¹Ø¨Ø©"
 
     if s["repeat"] and msg.text:
         key = (chat.id, uid)
         old = list(recent_messages[key])
         if msg.text.strip() in old:
-            delete, reason = True, "تكرار"
+            delete, reason = True, "ØªÙØ±Ø§Ø±"
         recent_messages[key].append(msg.text.strip())
 
     if delete:
@@ -521,7 +521,7 @@ async def edited_filter(update, context):
         if s["edit"]:
             try:
                 await msg.delete()
-                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "تعديل")
+                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "ØªØ¹Ø¯ÙÙ")
             except Exception:
                 pass
 
@@ -557,7 +557,7 @@ async def service_add_handler(update, context):
     if not msg or not msg.new_chat_members:
         return
     s = get_settings(update.effective_chat.id)
-    if s["add"]:
+    if s["add_lock"]:
         # Telegram does not expose a universal "who added whom" action that can
         # always be reversed safely; delete the service message and report it.
         try:
@@ -569,15 +569,15 @@ async def callback(update, context):
     q = update.callback_query
     await q.answer()
     if not is_manager(q.from_user.id):
-        await q.edit_message_text("⛔ ليس لديك صلاحية.")
+        await q.edit_message_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
         return
     if q.data == "managers":
         rows = db.execute("SELECT user_id FROM managers ORDER BY user_id").fetchall()
-        text = "👥 المدراء:\n" + ("\n".join(f"• {r[0]}" for r in rows) if rows else "لا يوجد مدراء.")
+        text = "ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡:\n" + ("\n".join(f"â¢ {r[0]}" for r in rows) if rows else "ÙØ§ ÙÙØ¬Ø¯ ÙØ¯Ø±Ø§Ø¡.")
         await q.edit_message_text(text)
     elif q.data == "security":
         await q.edit_message_text(
-            "🛡️ الحماية:\n"
+            "ð¡ï¸ Ø§ÙØ­ÙØ§ÙØ©:\n"
             "/locklinks /unlocklinks\n"
             "/lockphoto /unlockphoto\n"
             "/lockvideo /unlockvideo\n"
@@ -597,13 +597,13 @@ async def callback(update, context):
             "/lockedit /unlockedit"
         )
     elif q.data == "alerts":
-        await q.edit_message_text("📢 استخدم /alerts داخل القروب لتفعيل متابعة المستجدات.")
+        await q.edit_message_text("ð¢ Ø§Ø³ØªØ®Ø¯Ù /alerts Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙØªÙØ¹ÙÙ ÙØªØ§Ø¨Ø¹Ø© Ø§ÙÙØ³ØªØ¬Ø¯Ø§Øª.")
     elif q.data == "settings":
-        await q.edit_message_text("⚙️ استخدم /settings أو /locks لعرض حالة الإعدادات.")
+        await q.edit_message_text("âï¸ Ø§Ø³ØªØ®Ø¯Ù /settings Ø£Ù /locks ÙØ¹Ø±Ø¶ Ø­Ø§ÙØ© Ø§ÙØ¥Ø¹Ø¯Ø§Ø¯Ø§Øª.")
     elif q.data == "add_manager_help":
-        await q.edit_message_text("➕ استخدم:\n/addmanager رقم_المستخدم")
+        await q.edit_message_text("â Ø§Ø³ØªØ®Ø¯Ù:\n/addmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
     elif q.data == "logs":
-        await q.edit_message_text("📋 استخدم /logs داخل القروب لعرض آخر العمليات.")
+        await q.edit_message_text("ð Ø§Ø³ØªØ®Ø¯Ù /logs Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙØ¹Ø±Ø¶ Ø¢Ø®Ø± Ø§ÙØ¹ÙÙÙØ§Øª.")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -620,7 +620,7 @@ def start_health_server():
 
 def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
+        raise RuntimeError("BOT_TOKEN ØºÙØ± ÙÙØ¬ÙØ¯ ÙÙ Environment Variables.")
     app = Application.builder().token(TOKEN).build()
 
     command_handlers = {
