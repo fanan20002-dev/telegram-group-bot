@@ -624,7 +624,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel,
+       "start": start, "help": help_cmd,
+"panel": panel,
         "addmanager": addmanager, "delmanager": delmanager, "managers": managers,
         "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
         "kick": kick, "mute": mute, "unmute": unmute, "del": del_cmd, "pin": pin,
