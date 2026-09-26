@@ -129,106 +129,106 @@ async def require_admin(update):
     if not update.effective_user or not update.effective_chat:
         return False
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.effective_message.reply_text("ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙØ¹ÙÙ Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙÙØ·.")
+        await update.effective_message.reply_text("\u0647\u0630\u0627 \u0627\u0644\u0623\u0645\u0631 \u064a\u0639\u0645\u0644 \u062f\u0627\u062e\u0644 \u0627\u0644\u0642\u0631\u0648\u0628 \u0641\u0642\u0637.")
         return False
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
+        await update.effective_message.reply_text("\u26d4 \u0644\u064a\u0633 \u0644\u062f\u064a\u0643 \u0635\u0644\u0627\u062d\u064a\u0629.")
         return False
     return True
 
 def panel_markup(owner=False):
     rows = [
-        [InlineKeyboardButton("ð¡ï¸ Ø§ÙØ­ÙØ§ÙØ©", callback_data="security"),
-         InlineKeyboardButton("ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡", callback_data="managers")],
-        [InlineKeyboardButton("ð¢ Ø§ÙÙØ³ØªØ¬Ø¯Ø§Øª", callback_data="alerts"),
-         InlineKeyboardButton("ð Ø§ÙØ³Ø¬Ù", callback_data="logs")],
-        [InlineKeyboardButton("âï¸ Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§ÙÙØ±ÙØ¨", callback_data="settings")]
+        [InlineKeyboardButton("\ud83d\udee1\ufe0f \u0627\u0644\u062d\u0645\u0627\u064a\u0629", callback_data="security"),
+         InlineKeyboardButton("\ud83d\udc65 \u0627\u0644\u0645\u062f\u0631\u0627\u0621", callback_data="managers")],
+        [InlineKeyboardButton("\ud83d\udce2 \u0627\u0644\u0645\u0633\u062a\u062c\u062f\u0627\u062a", callback_data="alerts"),
+         InlineKeyboardButton("\ud83d\udccb \u0627\u0644\u0633\u062c\u0644", callback_data="logs")],
+        [InlineKeyboardButton("\u2699\ufe0f \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0627\u0644\u0642\u0631\u0648\u0628", callback_data="settings")]
     ]
     if owner:
-        rows.append([InlineKeyboardButton("â Ø¥Ø¶Ø§ÙØ© ÙØ¯ÙØ±", callback_data="add_manager_help")])
+        rows.append([InlineKeyboardButton("\u2795 \u0625\u0636\u0627\u0641\u0629 \u0645\u062f\u064a\u0631", callback_data="add_manager_help")])
     return InlineKeyboardMarkup(rows)
 
 async def start(update, context):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.effective_message.reply_text(
-            f"ÙØ±Ø­Ø¨ÙØ§ ð\nØ±ÙÙ Ø­Ø³Ø§Ø¨Ù: {update.effective_user.id}\n\n"
-            "Ø§Ø³ØªØ®Ø¯Ù /panel ÙÙØªØ­ ÙÙØ­Ø© Ø§ÙØªØ­ÙÙ."
+            f"\u0645\u0631\u062d\u0628\u064b\u0627 \ud83d\udc4b\n\u0631\u0642\u0645 \u062d\u0633\u0627\u0628\u0643: {update.effective_user.id}\n\n"
+            "\u0627\u0633\u062a\u062e\u062f\u0645 /panel \u0644\u0641\u062a\u062d \u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645."
         )
     else:
-        await update.effective_message.reply_text("ØªÙ ØªØ´ØºÙÙ Ø§ÙØ¨ÙØª â\nØ§Ø³ØªØ®Ø¯Ù /panel ÙÙÙØ­Ø© Ø§ÙØªØ­ÙÙ.")
+        await update.effective_message.reply_text("\u062a\u0645 \u062a\u0634\u063a\u064a\u0644 \u0627\u0644\u0628\u0648\u062a \u2705\n\u0627\u0633\u062a\u062e\u062f\u0645 /panel \u0644\u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645.")
 
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
-        "ð Ø£ÙØ§ÙØ± Ø§ÙØ¨ÙØª:\n\n"
-        "ð /panel â ÙÙØ­Ø© Ø§ÙØªØ­ÙÙ\n"
-        "ð¥ /addmanager /delmanager /managers\n"
-        "ð¨ /ban /unban /kick /mute /unmute /del /pin\n"
-        "ð¡ï¸ /locks â ÙØ§Ø¦ÙØ© Ø§ÙØ­ÙØ§ÙØ©\n"
-        "âï¸ /settings â Ø­Ø§ÙØ© Ø§ÙØ­ÙØ§ÙØ©\n"
-        "ð /id /idgroup\n\n"
-        "ÙÙÙÙ Ø£ÙØ¶ÙØ§ ÙØªØ§Ø¨Ø© Ø£ÙØ§ÙØ± Ø¹Ø±Ø¨ÙØ© ÙØ±Ø³Ø§Ø¦Ù Ø¹Ø§Ø¯ÙØ©Ø ÙØ«Ù:\n"
-        "ÙÙØ¹ Ø§ÙØ±ÙØ§Ø¨Ø·Ø ÙÙØ¹ Ø§ÙØµÙØ±Ø ÙÙØ¹ Ø§ÙÙÙØ¯ÙÙØ ÙÙØ¹ Ø§ÙÙÙÙØ§ØªØ Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ±ÙØ§Ø¨Ø·."
+        "\ud83d\udcda \u0623\u0648\u0627\u0645\u0631 \u0627\u0644\u0628\u0648\u062a:\n\n"
+        "\ud83d\udc51 /panel \u2014 \u0644\u0648\u062d\u0629 \u0627\u0644\u062a\u062d\u0643\u0645\n"
+        "\ud83d\udc65 /addmanager /delmanager /managers\n"
+        "\ud83d\udd28 /ban /unban /kick /mute /unmute /del /pin\n"
+        "\ud83d\udee1\ufe0f /locks \u2014 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u062d\u0645\u0627\u064a\u0629\n"
+        "\u2699\ufe0f /settings \u2014 \u062d\u0627\u0644\u0629 \u0627\u0644\u062d\u0645\u0627\u064a\u0629\n"
+        "\ud83c\udd94 /id /idgroup\n\n"
+        "\u064a\u0645\u0643\u0646 \u0623\u064a\u0636\u064b\u0627 \u0643\u062a\u0627\u0628\u0629 \u0623\u0648\u0627\u0645\u0631 \u0639\u0631\u0628\u064a\u0629 \u0643\u0631\u0633\u0627\u0626\u0644 \u0639\u0627\u062f\u064a\u0629\u060c \u0645\u062b\u0644:\n"
+        "\u0645\u0646\u0639 \u0627\u0644\u0631\u0648\u0627\u0628\u0637\u060c \u0645\u0646\u0639 \u0627\u0644\u0635\u0648\u0631\u060c \u0645\u0646\u0639 \u0627\u0644\u0641\u064a\u062f\u064a\u0648\u060c \u0645\u0646\u0639 \u0627\u0644\u0645\u0644\u0641\u0627\u062a\u060c \u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0631\u0648\u0627\u0628\u0637."
     )
 
 async def panel(update, context):
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ© Ø§Ø³ØªØ®Ø¯Ø§Ù ÙÙØ­Ø© Ø§ÙØ¥Ø¯Ø§Ø±Ø©.")
+        await update.effective_message.reply_text("\u26d4 \u0644\u064a\u0633 \u0644\u062f\u064a\u0643 \u0635\u0644\u0627\u062d\u064a\u0629 \u0627\u0633\u062a\u062e\u062f\u0627\u0645 \u0644\u0648\u062d\u0629 \u0627\u0644\u0625\u062f\u0627\u0631\u0629.")
         return
     await update.effective_message.reply_text(
-        "ð ÙÙØ­Ø© ØªØ­ÙÙ Ø§ÙØ¨ÙØª\n\nØ§Ø®ØªØ± Ø§ÙÙØ³Ù Ø§ÙÙØ·ÙÙØ¨:",
+        "\ud83d\udc51 \u0644\u0648\u062d\u0629 \u062a\u062d\u0643\u0645 \u0627\u0644\u0628\u0648\u062a\n\n\u0627\u062e\u062a\u0631 \u0627\u0644\u0642\u0633\u0645 \u0627\u0644\u0645\u0637\u0644\u0648\u0628:",
         reply_markup=panel_markup(is_owner(update.effective_user.id))
     )
 
 async def addmanager(update, context):
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("â ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙÙÙØ§ÙÙ ÙÙØ·.")
+        await update.effective_message.reply_text("\u26d4 \u0647\u0630\u0627 \u0627\u0644\u0623\u0645\u0631 \u0644\u0644\u0645\u0627\u0644\u0643 \u0641\u0642\u0637.")
         return
     if not context.args:
-        await update.effective_message.reply_text("Ø§ÙØ§Ø³ØªØ®Ø¯Ø§Ù: /addmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
+        await update.effective_message.reply_text("\u0627\u0644\u0627\u0633\u062a\u062e\u062f\u0627\u0645: /addmanager \u0631\u0642\u0645_\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("Ø±ÙÙ Ø§ÙÙØ³ØªØ®Ø¯Ù ØºÙØ± ØµØ­ÙØ­.")
+        await update.effective_message.reply_text("\u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u063a\u064a\u0631 \u0635\u062d\u064a\u062d.")
         return
     db.execute(
         "INSERT OR REPLACE INTO managers(user_id,added_by,added_at) VALUES(?,?,?)",
         (uid, update.effective_user.id, now())
     )
     db.commit()
-    await update.effective_message.reply_text(f"â ØªÙØª Ø¥Ø¶Ø§ÙØ© Ø§ÙÙØ¯ÙØ±: {uid}")
+    await update.effective_message.reply_text(f"\u2705 \u062a\u0645\u062a \u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0645\u062f\u064a\u0631: {uid}")
 
 async def delmanager(update, context):
     if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("â ÙØ°Ø§ Ø§ÙØ£ÙØ± ÙÙÙØ§ÙÙ ÙÙØ·.")
+        await update.effective_message.reply_text("\u26d4 \u0647\u0630\u0627 \u0627\u0644\u0623\u0645\u0631 \u0644\u0644\u0645\u0627\u0644\u0643 \u0641\u0642\u0637.")
         return
     if not context.args:
-        await update.effective_message.reply_text("Ø§ÙØ§Ø³ØªØ®Ø¯Ø§Ù: /delmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
+        await update.effective_message.reply_text("\u0627\u0644\u0627\u0633\u062a\u062e\u062f\u0627\u0645: /delmanager \u0631\u0642\u0645_\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("Ø±ÙÙ Ø§ÙÙØ³ØªØ®Ø¯Ù ØºÙØ± ØµØ­ÙØ­.")
+        await update.effective_message.reply_text("\u0631\u0642\u0645 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u063a\u064a\u0631 \u0635\u062d\u064a\u062d.")
         return
     db.execute("DELETE FROM managers WHERE user_id=?", (uid,))
     db.commit()
-    await update.effective_message.reply_text(f"â ØªÙ Ø­Ø°Ù Ø§ÙÙØ¯ÙØ±: {uid}")
+    await update.effective_message.reply_text(f"\u2705 \u062a\u0645 \u062d\u0630\u0641 \u0627\u0644\u0645\u062f\u064a\u0631: {uid}")
 
 async def managers(update, context):
     if not is_manager(update.effective_user.id):
-        await update.effective_message.reply_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
+        await update.effective_message.reply_text("\u26d4 \u0644\u064a\u0633 \u0644\u062f\u064a\u0643 \u0635\u0644\u0627\u062d\u064a\u0629.")
         return
     rows = db.execute("SELECT user_id FROM managers ORDER BY user_id").fetchall()
-    text = "ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡:\n" + ("\n".join(f"â¢ {r[0]}" for r in rows) if rows else "ÙØ§ ÙÙØ¬Ø¯ ÙØ¯Ø±Ø§Ø¡ Ø¥Ø¶Ø§ÙÙÙÙ.")
+    text = "\ud83d\udc65 \u0627\u0644\u0645\u062f\u0631\u0627\u0621:\n" + ("\n".join(f"\u2022 {r[0]}" for r in rows) if rows else "\u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u062f\u0631\u0627\u0621 \u0625\u0636\u0627\u0641\u064a\u0648\u0646.")
     if OWNER_ID:
-        text += f"\n\nð Ø§ÙÙØ§ÙÙ: {OWNER_ID}"
+        text += f"\n\n\ud83d\udc51 \u0627\u0644\u0645\u0627\u0644\u0643: {OWNER_ID}"
     await update.effective_message.reply_text(text)
 
 async def id_cmd(update, context):
-    await update.effective_message.reply_text(f"ð Ø±ÙÙÙ: {update.effective_user.id}")
+    await update.effective_message.reply_text(f"\ud83c\udd94 \u0631\u0642\u0645\u0643: {update.effective_user.id}")
 
 async def idgroup(update, context):
-    await update.effective_message.reply_text(f"ð Ø±ÙÙ Ø§ÙÙØ±ÙØ¨: {update.effective_chat.id}")
+    await update.effective_message.reply_text(f"\ud83c\udd94 \u0631\u0642\u0645 \u0627\u0644\u0642\u0631\u0648\u0628: {update.effective_chat.id}")
 
 def target_from_update(update, context):
     target = update.message.reply_to_message.from_user if update.message and update.message.reply_to_message else None
@@ -245,48 +245,48 @@ async def ban(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù Ø§ÙØ£ÙØ± Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù Ø£Ù /ban Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0623\u0645\u0631 \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0639\u0636\u0648 \u0623\u0648 /ban \u0631\u0642\u0645_\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         log_action(update.effective_chat.id, update.effective_user.id, "ban", str(uid))
-        await update.message.reply_text("â ØªÙ Ø­Ø¸Ø± Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u2705 \u062a\u0645 \u062d\u0638\u0631 \u0627\u0644\u0639\u0636\u0648.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ­Ø¸Ø±: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0627\u0644\u062d\u0638\u0631: {e}")
 
 async def unban(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /unban Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù Ø£Ù Ø¨Ø§ÙØ±Ø¯.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /unban \u0631\u0642\u0645_\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0623\u0648 \u0628\u0627\u0644\u0631\u062f.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        await update.message.reply_text("â ØªÙ ÙÙ Ø§ÙØ­Ø¸Ø±.")
+        await update.message.reply_text("\u2705 \u062a\u0645 \u0641\u0643 \u0627\u0644\u062d\u0638\u0631.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± ÙÙ Ø§ÙØ­Ø¸Ø±: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0641\u0643 \u0627\u0644\u062d\u0638\u0631: {e}")
 
 async def kick(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /kick Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /kick \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0639\u0636\u0648.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        await update.message.reply_text("â ØªÙ Ø·Ø±Ø¯ Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u2705 \u062a\u0645 \u0637\u0631\u062f \u0627\u0644\u0639\u0636\u0648.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ·Ø±Ø¯: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0627\u0644\u0637\u0631\u062f: {e}")
 
 async def mute(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /mute Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /mute \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0639\u0636\u0648.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
@@ -294,15 +294,15 @@ async def mute(update, context):
             update.effective_chat.id, uid,
             permissions=ChatPermissions(can_send_messages=False)
         )
-        await update.message.reply_text("â ØªÙ ÙØªÙ Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u2705 \u062a\u0645 \u0643\u062a\u0645 \u0627\u0644\u0639\u0636\u0648.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙÙØªÙ: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0627\u0644\u0643\u062a\u0645: {e}")
 
 async def unmute(update, context):
     if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /unmute Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø±Ø³Ø§ÙØ© Ø§ÙØ¹Ø¶Ù.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /unmute \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0639\u0636\u0648.")
         return
     uid = target.id if hasattr(target, "id") else target
     try:
@@ -316,31 +316,31 @@ async def unmute(update, context):
                 can_add_web_page_previews=True
             )
         )
-        await update.message.reply_text("â ØªÙ ÙÙ Ø§ÙÙØªÙ.")
+        await update.message.reply_text("\u2705 \u062a\u0645 \u0641\u0643 \u0627\u0644\u0643\u062a\u0645.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± ÙÙ Ø§ÙÙØªÙ: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0641\u0643 \u0627\u0644\u0643\u062a\u0645: {e}")
 
 async def del_cmd(update, context):
     if not await require_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /del Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø§ÙØ±Ø³Ø§ÙØ© Ø§ÙÙØ±Ø§Ø¯ Ø­Ø°ÙÙØ§.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /del \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0627\u0644\u0631\u0633\u0627\u0644\u0629 \u0627\u0644\u0645\u0631\u0627\u062f \u062d\u0630\u0641\u0647\u0627.")
         return
     try:
         await context.bot.delete_message(update.effective_chat.id, update.message.reply_to_message.message_id)
         await update.message.delete()
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØ­Ø°Ù: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0627\u0644\u062d\u0630\u0641: {e}")
 
 async def pin(update, context):
     if not await require_admin(update): return
     if not update.message.reply_to_message:
-        await update.message.reply_text("Ø§Ø³ØªØ®Ø¯Ù /pin Ø¨Ø§ÙØ±Ø¯ Ø¹ÙÙ Ø§ÙØ±Ø³Ø§ÙØ©.")
+        await update.message.reply_text("\u0627\u0633\u062a\u062e\u062f\u0645 /pin \u0628\u0627\u0644\u0631\u062f \u0639\u0644\u0649 \u0627\u0644\u0631\u0633\u0627\u0644\u0629.")
         return
     try:
         await context.bot.pin_chat_message(update.effective_chat.id, update.message.reply_to_message.message_id)
-        await update.message.reply_text("ð ØªÙ Ø§ÙØªØ«Ø¨ÙØª.")
+        await update.message.reply_text("\ud83d\udccc \u062a\u0645 \u0627\u0644\u062a\u062b\u0628\u064a\u062a.")
     except Exception as e:
-        await update.message.reply_text(f"â ØªØ¹Ø°Ø± Ø§ÙØªØ«Ø¨ÙØª: {e}")
+        await update.message.reply_text(f"\u274c \u062a\u0639\u0630\u0631 \u0627\u0644\u062a\u062b\u0628\u064a\u062a: {e}")
 
 LOCK_MAP = {
     "locklinks": "links", "unlocklinks": "links",
@@ -365,23 +365,23 @@ LOCK_MAP = {
 }
 
 ARABIC_ALIASES = {
-    "ÙÙØ¹ Ø§ÙØ±ÙØ§Ø¨Ø·": ("links", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ±ÙØ§Ø¨Ø·": ("links", 0),
-    "ÙÙØ¹ Ø§ÙØµÙØ±": ("photos", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØµÙØ±": ("photos", 0),
-    "ÙÙØ¹ Ø§ÙÙÙØ¯ÙÙ": ("videos", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØ¯ÙÙ": ("videos", 0),
-    "ÙÙØ¹ Ø§ÙØµÙØª": ("audio", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØµÙØª": ("audio", 0),
-    "ÙÙØ¹ Ø§ÙÙÙÙØ§Øª": ("files", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙÙØ§Øª": ("files", 0),
-    "ÙÙØ¹ Ø§ÙÙÙØµÙØ§Øª": ("stickers", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØµÙØ§Øª": ("stickers", 0),
-    "ÙÙØ¹ Ø§ÙÙØªØ­Ø±ÙØ©": ("gif", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙØªØ­Ø±ÙØ©": ("gif", 0),
-    "ÙÙØ¹ Ø§ÙÙØ¹Ø±ÙØ§Øª": ("username", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙØ¹Ø±ÙØ§Øª": ("username", 0),
-    "ÙÙØ¹ Ø§ÙØªØ§Ù": ("tag", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªØ§Ù": ("tag", 0),
-    "ÙÙØ¹ Ø§ÙØ¨ÙØªØ§Øª": ("bots", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¨ÙØªØ§Øª": ("bots", 0),
-    "ÙÙØ¹ Ø§ÙÙÙØ¨ÙØ±Ø¯": ("keyboard", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙÙÙØ¨ÙØ±Ø¯": ("keyboard", 0),
-    "ÙÙØ¹ Ø§ÙØ£ÙØ¹Ø§Ø¨": ("games", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ£ÙØ¹Ø§Ø¨": ("games", 0),
-    "ÙÙØ¹ Ø§ÙØªÙØ±Ø§Ø±": ("repeat", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªÙØ±Ø§Ø±": ("repeat", 0),
-    "ÙÙØ¹ Ø§ÙØ¯Ø®ÙÙ": ("join_lock", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¯Ø®ÙÙ": ("join_lock", 0),
-    "ÙÙØ¹ Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ": ("entry", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ": ("entry", 0),
-    "ÙÙØ¹ Ø§ÙØ¥Ø¶Ø§ÙØ©": ("add_lock", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØ¥Ø¶Ø§ÙØ©": ("add_lock", 0),
-    "ÙÙØ¹ Ø§ÙØªØ¹Ø¯ÙÙ": ("edit", 1), "Ø§ÙØ³ÙØ§Ø­ Ø¨Ø§ÙØªØ¹Ø¯ÙÙ": ("edit", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0631\u0648\u0627\u0628\u0637": ("links", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0631\u0648\u0627\u0628\u0637": ("links", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0635\u0648\u0631": ("photos", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0635\u0648\u0631": ("photos", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0641\u064a\u062f\u064a\u0648": ("videos", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0641\u064a\u062f\u064a\u0648": ("videos", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0635\u0648\u062a": ("audio", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0635\u0648\u062a": ("audio", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0645\u0644\u0641\u0627\u062a": ("files", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0645\u0644\u0641\u0627\u062a": ("files", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0645\u0644\u0635\u0642\u0627\u062a": ("stickers", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0645\u0644\u0635\u0642\u0627\u062a": ("stickers", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0645\u062a\u062d\u0631\u0643\u0629": ("gif", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0645\u062a\u062d\u0631\u0643\u0629": ("gif", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0645\u0639\u0631\u0641\u0627\u062a": ("username", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0645\u0639\u0631\u0641\u0627\u062a": ("username", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u062a\u0627\u0642": ("tag", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u062a\u0627\u0642": ("tag", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0628\u0648\u062a\u0627\u062a": ("bots", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0628\u0648\u062a\u0627\u062a": ("bots", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0643\u064a\u0628\u0648\u0631\u062f": ("keyboard", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0643\u064a\u0628\u0648\u0631\u062f": ("keyboard", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0623\u0644\u0639\u0627\u0628": ("games", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0623\u0644\u0639\u0627\u0628": ("games", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u062a\u0643\u0631\u0627\u0631": ("repeat", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u062a\u0643\u0631\u0627\u0631": ("repeat", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u062f\u062e\u0648\u0644": ("join_lock", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u062f\u062e\u0648\u0644": ("join_lock", 0),
+    "\u0645\u0646\u0639 \u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u062f\u062e\u0648\u0644": ("entry", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u062f\u062e\u0648\u0644": ("entry", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u0625\u0636\u0627\u0641\u0629": ("add_lock", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u0625\u0636\u0627\u0641\u0629": ("add_lock", 0),
+    "\u0645\u0646\u0639 \u0627\u0644\u062a\u0639\u062f\u064a\u0644": ("edit", 1), "\u0627\u0644\u0633\u0645\u0627\u062d \u0628\u0627\u0644\u062a\u0639\u062f\u064a\u0644": ("edit", 0),
 }
 
 async def set_lock(update, context, field=None, value=None):
@@ -391,7 +391,7 @@ async def set_lock(update, context, field=None, value=None):
         field = LOCK_MAP.get(cmd)
         value = 0 if cmd.startswith("unlock") else 1
     set_setting(update.effective_chat.id, field, value)
-    state = "ð ØªÙ Ø§ÙÙÙØ¹." if value else "ð ØªÙ Ø§ÙØ³ÙØ§Ø­."
+    state = "\ud83d\udd12 \u062a\u0645 \u0627\u0644\u0645\u0646\u0639." if value else "\ud83d\udd13 \u062a\u0645 \u0627\u0644\u0633\u0645\u0627\u062d."
     await update.effective_message.reply_text(state)
     log_action(update.effective_chat.id, update.effective_user.id, "setting", f"{field}={value}")
 
@@ -399,15 +399,15 @@ async def locks(update, context):
     if not await require_admin(update): return
     s = get_settings(update.effective_chat.id)
     labels = {
-        "links":"Ø§ÙØ±ÙØ§Ø¨Ø·","photos":"Ø§ÙØµÙØ±","videos":"Ø§ÙÙÙØ¯ÙÙ","audio":"Ø§ÙØµÙØª","files":"Ø§ÙÙÙÙØ§Øª",
-        "stickers":"Ø§ÙÙÙØµÙØ§Øª","gif":"Ø§ÙÙØªØ­Ø±ÙØ©","username":"Ø§ÙÙØ¹Ø±ÙØ§Øª","tag":"Ø§ÙØªØ§Ù",
-        "bots":"Ø§ÙØ¨ÙØªØ§Øª","keyboard":"Ø§ÙÙÙØ¨ÙØ±Ø¯","games":"Ø§ÙØ£ÙØ¹Ø§Ø¨","repeat":"Ø§ÙØªÙØ±Ø§Ø±",
-        "join_lock":"Ø§ÙØ¯Ø®ÙÙ","entry":"Ø±Ø³Ø§Ø¦Ù Ø§ÙØ¯Ø®ÙÙ","add_lock":"Ø§ÙØ¥Ø¶Ø§ÙØ©","notifications":"Ø§ÙØ¥Ø´Ø¹Ø§Ø±Ø§Øª",
-        "markdown":"Ø§ÙÙØ§Ø±ÙØ¯Ø§ÙÙ","edit":"Ø§ÙØªØ¹Ø¯ÙÙ"
+        "links":"\u0627\u0644\u0631\u0648\u0627\u0628\u0637","photos":"\u0627\u0644\u0635\u0648\u0631","videos":"\u0627\u0644\u0641\u064a\u062f\u064a\u0648","audio":"\u0627\u0644\u0635\u0648\u062a","files":"\u0627\u0644\u0645\u0644\u0641\u0627\u062a",
+        "stickers":"\u0627\u0644\u0645\u0644\u0635\u0642\u0627\u062a","gif":"\u0627\u0644\u0645\u062a\u062d\u0631\u0643\u0629","username":"\u0627\u0644\u0645\u0639\u0631\u0641\u0627\u062a","tag":"\u0627\u0644\u062a\u0627\u0642",
+        "bots":"\u0627\u0644\u0628\u0648\u062a\u0627\u062a","keyboard":"\u0627\u0644\u0643\u064a\u0628\u0648\u0631\u062f","games":"\u0627\u0644\u0623\u0644\u0639\u0627\u0628","repeat":"\u0627\u0644\u062a\u0643\u0631\u0627\u0631",
+        "join_lock":"\u0627\u0644\u062f\u062e\u0648\u0644","entry":"\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u062f\u062e\u0648\u0644","add_lock":"\u0627\u0644\u0625\u0636\u0627\u0641\u0629","notifications":"\u0627\u0644\u0625\u0634\u0639\u0627\u0631\u0627\u062a",
+        "markdown":"\u0627\u0644\u0645\u0627\u0631\u0643\u062f\u0627\u0648\u0646","edit":"\u0627\u0644\u062a\u0639\u062f\u064a\u0644"
     }
-    text = "ð¡ï¸ Ø­Ø§ÙØ© Ø§ÙØ­ÙØ§ÙØ©:\n\n"
+    text = "\ud83d\udee1\ufe0f \u062d\u0627\u0644\u0629 \u0627\u0644\u062d\u0645\u0627\u064a\u0629:\n\n"
     for f in SETTING_FIELDS:
-        text += f"â¢ {labels.get(f,f)}: {'ð ÙÙÙÙØ¹' if s[f] else 'ð ÙØ³ÙÙØ­'}\n"
+        text += f"\u2022 {labels.get(f,f)}: {'\ud83d\udd12 \u0645\u0645\u0646\u0648\u0639' if s[f] else '\ud83d\udd13 \u0645\u0633\u0645\u0648\u062d'}\n"
     await update.effective_message.reply_text(text)
 
 async def settings_cmd(update, context):
@@ -422,7 +422,7 @@ async def alerts(update, context):
     )
     db.commit()
     set_setting(chat.id, "notifications", 1)
-    await update.effective_message.reply_text("ð¢ ØªÙ ØªÙØ¹ÙÙ ÙØªØ§Ø¨Ø¹Ø© ÙØ³ØªØ¬Ø¯Ø§Øª ÙØ°Ø§ Ø§ÙÙØ±ÙØ¨.")
+    await update.effective_message.reply_text("\ud83d\udce2 \u062a\u0645 \u062a\u0641\u0639\u064a\u0644 \u0645\u062a\u0627\u0628\u0639\u0629 \u0645\u0633\u062a\u062c\u062f\u0627\u062a \u0647\u0630\u0627 \u0627\u0644\u0642\u0631\u0648\u0628.")
 
 async def logs_cmd(update, context):
     if not await require_admin(update): return
@@ -431,10 +431,10 @@ async def logs_cmd(update, context):
         (update.effective_chat.id,)
     ).fetchall()
     if not rows:
-        await update.effective_message.reply_text("ð ÙØ§ ÙÙØ¬Ø¯ Ø³Ø¬Ù Ø¨Ø¹Ø¯.")
+        await update.effective_message.reply_text("\ud83d\udccb \u0644\u0627 \u064a\u0648\u062c\u062f \u0633\u062c\u0644 \u0628\u0639\u062f.")
         return
-    text = "ð Ø¢Ø®Ø± Ø§ÙØ¹ÙÙÙØ§Øª:\n\n" + "\n".join(
-        f"â¢ {a} â {d}" for a,d,_ in rows
+    text = "\ud83d\udccb \u0622\u062e\u0631 \u0627\u0644\u0639\u0645\u0644\u064a\u0627\u062a:\n\n" + "\n".join(
+        f"\u2022 {a} \u2014 {d}" for a,d,_ in rows
     )
     await update.effective_message.reply_text(text)
 
@@ -472,37 +472,37 @@ async def message_filter(update, context):
     reason = ""
 
     if s["links"] and has_link(msg.text or msg.caption):
-        delete, reason = True, "Ø±Ø§Ø¨Ø·"
+        delete, reason = True, "\u0631\u0627\u0628\u0637"
     if s["photos"] and msg.photo:
-        delete, reason = True, "ØµÙØ±Ø©"
+        delete, reason = True, "\u0635\u0648\u0631\u0629"
     if s["videos"] and (msg.video or msg.video_note):
-        delete, reason = True, "ÙÙØ¯ÙÙ"
+        delete, reason = True, "\u0641\u064a\u062f\u064a\u0648"
     if s["audio"] and (msg.audio or msg.voice):
-        delete, reason = True, "ØµÙØª"
+        delete, reason = True, "\u0635\u0648\u062a"
     if s["files"] and (msg.document or msg.animation):
-        delete, reason = True, "ÙÙÙ"
+        delete, reason = True, "\u0645\u0644\u0641"
     if s["stickers"] and msg.sticker:
-        delete, reason = True, "ÙÙØµÙ"
+        delete, reason = True, "\u0645\u0644\u0635\u0642"
     if s["gif"] and msg.animation:
-        delete, reason = True, "ÙØªØ­Ø±ÙØ©"
+        delete, reason = True, "\u0645\u062a\u062d\u0631\u0643\u0629"
     if s["username"] and has_tag(msg.text or msg.caption):
-        delete, reason = True, "ÙØ¹Ø±Ù"
+        delete, reason = True, "\u0645\u0639\u0631\u0641"
     if s["tag"] and (msg.entities or msg.caption_entities):
         entities = list(msg.entities or []) + list(msg.caption_entities or [])
         if any(getattr(e, "type", "") in ("mention", "text_mention") for e in entities):
-            delete, reason = True, "ØªØ§Ù"
+            delete, reason = True, "\u062a\u0627\u0642"
     if s["bots"] and msg.from_user and msg.from_user.is_bot:
-        delete, reason = True, "Ø¨ÙØª"
+        delete, reason = True, "\u0628\u0648\u062a"
     if s["keyboard"] and msg.reply_markup:
-        delete, reason = True, "ÙÙØ¨ÙØ±Ø¯"
+        delete, reason = True, "\u0643\u064a\u0628\u0648\u0631\u062f"
     if s["games"] and msg.game:
-        delete, reason = True, "ÙØ¹Ø¨Ø©"
+        delete, reason = True, "\u0644\u0639\u0628\u0629"
 
     if s["repeat"] and msg.text:
         key = (chat.id, uid)
         old = list(recent_messages[key])
         if msg.text.strip() in old:
-            delete, reason = True, "ØªÙØ±Ø§Ø±"
+            delete, reason = True, "\u062a\u0643\u0631\u0627\u0631"
         recent_messages[key].append(msg.text.strip())
 
     if delete:
@@ -521,7 +521,7 @@ async def edited_filter(update, context):
         if s["edit"]:
             try:
                 await msg.delete()
-                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "ØªØ¹Ø¯ÙÙ")
+                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "\u062a\u0639\u062f\u064a\u0644")
             except Exception:
                 pass
 
@@ -569,15 +569,15 @@ async def callback(update, context):
     q = update.callback_query
     await q.answer()
     if not is_manager(q.from_user.id):
-        await q.edit_message_text("â ÙÙØ³ ÙØ¯ÙÙ ØµÙØ§Ø­ÙØ©.")
+        await q.edit_message_text("\u26d4 \u0644\u064a\u0633 \u0644\u062f\u064a\u0643 \u0635\u0644\u0627\u062d\u064a\u0629.")
         return
     if q.data == "managers":
         rows = db.execute("SELECT user_id FROM managers ORDER BY user_id").fetchall()
-        text = "ð¥ Ø§ÙÙØ¯Ø±Ø§Ø¡:\n" + ("\n".join(f"â¢ {r[0]}" for r in rows) if rows else "ÙØ§ ÙÙØ¬Ø¯ ÙØ¯Ø±Ø§Ø¡.")
+        text = "\ud83d\udc65 \u0627\u0644\u0645\u062f\u0631\u0627\u0621:\n" + ("\n".join(f"\u2022 {r[0]}" for r in rows) if rows else "\u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u062f\u0631\u0627\u0621.")
         await q.edit_message_text(text)
     elif q.data == "security":
         await q.edit_message_text(
-            "ð¡ï¸ Ø§ÙØ­ÙØ§ÙØ©:\n"
+            "\ud83d\udee1\ufe0f \u0627\u0644\u062d\u0645\u0627\u064a\u0629:\n"
             "/locklinks /unlocklinks\n"
             "/lockphoto /unlockphoto\n"
             "/lockvideo /unlockvideo\n"
@@ -597,13 +597,13 @@ async def callback(update, context):
             "/lockedit /unlockedit"
         )
     elif q.data == "alerts":
-        await q.edit_message_text("ð¢ Ø§Ø³ØªØ®Ø¯Ù /alerts Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙØªÙØ¹ÙÙ ÙØªØ§Ø¨Ø¹Ø© Ø§ÙÙØ³ØªØ¬Ø¯Ø§Øª.")
+        await q.edit_message_text("\ud83d\udce2 \u0627\u0633\u062a\u062e\u062f\u0645 /alerts \u062f\u0627\u062e\u0644 \u0627\u0644\u0642\u0631\u0648\u0628 \u0644\u062a\u0641\u0639\u064a\u0644 \u0645\u062a\u0627\u0628\u0639\u0629 \u0627\u0644\u0645\u0633\u062a\u062c\u062f\u0627\u062a.")
     elif q.data == "settings":
-        await q.edit_message_text("âï¸ Ø§Ø³ØªØ®Ø¯Ù /settings Ø£Ù /locks ÙØ¹Ø±Ø¶ Ø­Ø§ÙØ© Ø§ÙØ¥Ø¹Ø¯Ø§Ø¯Ø§Øª.")
+        await q.edit_message_text("\u2699\ufe0f \u0627\u0633\u062a\u062e\u062f\u0645 /settings \u0623\u0648 /locks \u0644\u0639\u0631\u0636 \u062d\u0627\u0644\u0629 \u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a.")
     elif q.data == "add_manager_help":
-        await q.edit_message_text("â Ø§Ø³ØªØ®Ø¯Ù:\n/addmanager Ø±ÙÙ_Ø§ÙÙØ³ØªØ®Ø¯Ù")
+        await q.edit_message_text("\u2795 \u0627\u0633\u062a\u062e\u062f\u0645:\n/addmanager \u0631\u0642\u0645_\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645")
     elif q.data == "logs":
-        await q.edit_message_text("ð Ø§Ø³ØªØ®Ø¯Ù /logs Ø¯Ø§Ø®Ù Ø§ÙÙØ±ÙØ¨ ÙØ¹Ø±Ø¶ Ø¢Ø®Ø± Ø§ÙØ¹ÙÙÙØ§Øª.")
+        await q.edit_message_text("\ud83d\udccb \u0627\u0633\u062a\u062e\u062f\u0645 /logs \u062f\u0627\u062e\u0644 \u0627\u0644\u0642\u0631\u0648\u0628 \u0644\u0639\u0631\u0636 \u0622\u062e\u0631 \u0627\u0644\u0639\u0645\u0644\u064a\u0627\u062a.")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -620,7 +620,7 @@ def start_health_server():
 
 def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN ØºÙØ± ÙÙØ¬ÙØ¯ ÙÙ Environment Variables.")
+        raise RuntimeError("BOT_TOKEN \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f \u0641\u064a Environment Variables.")
     app = Application.builder().token(TOKEN).build()
 
     command_handlers = {
