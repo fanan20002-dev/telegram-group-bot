@@ -67,7 +67,7 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 def ensure_settings(chat_id):
-    cols = ", ".join(f"{f} INTEGER DEFAULT {DEFAULTS[f]}" for f in SETTING_FIELDS)
+cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
     # SQLite cannot ALTER a missing table definition in one statement, so
     # create a fresh table shape when possible and migrate old installations.
     existing = db.execute("PRAGMA table_info(settings)").fetchall()
@@ -79,7 +79,7 @@ def ensure_settings(chat_id):
         existing_names = {"chat_id", *SETTING_FIELDS}
     for field in SETTING_FIELDS:
         if field not in existing_names:
-            db.execute(f"ALTER TABLE settings ADD COLUMN {field} INTEGER DEFAULT {DEFAULTS[field]}")
+            db.execute(f'ALTER TABLE settings ADD COLUMN "{field}" INTEGER DEFAULT {DEFAULTS[field]}')
     row = db.execute("SELECT chat_id FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
     if not row:
         db.execute("INSERT INTO settings(chat_id) VALUES(?)", (chat_id,))
