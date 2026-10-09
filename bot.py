@@ -171,6 +171,24 @@ CREATE TABLE IF NOT EXISTS game_challenges(
     created_at TEXT NOT NULL
 )
 """)
+db.execute("""CREATE TABLE IF NOT EXISTS game_score_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    points INTEGER NOT NULL, event_type TEXT NOT NULL, created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS game_rounds(
+    token TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, kind TEXT NOT NULL,
+    answer TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS daily_game_challenges(
+    chat_id INTEGER NOT NULL, challenge_date TEXT NOT NULL, message_id INTEGER,
+    answer TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
+    PRIMARY KEY(chat_id, challenge_date)
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS game_xo(
+    token TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, player_x INTEGER NOT NULL,
+    player_o INTEGER, board TEXT NOT NULL DEFAULT '         ', turn TEXT NOT NULL DEFAULT 'X',
+    status TEXT NOT NULL DEFAULT 'waiting', message_id INTEGER, created_at TEXT NOT NULL
+)""")
 db.commit()
 
 SETTING_FIELDS = [
@@ -278,6 +296,20 @@ async def delete_auto_reply(update, context):
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+def record_game_points(chat_id, user_id, points, event_type):
+    """يسجل نقاط الجولة لأغراض المتصدرين الأسبوعيين والشهريين."""
+    if points > 0:
+        db.execute("INSERT INTO game_score_events(chat_id,user_id,points,event_type,created_at) VALUES(?,?,?,?,?)",
+                   (chat_id, user_id, points, event_type, now()))
+        db.commit()
+
+def game_board_markup(token, board):
+    cells = ["❌" if c == "X" else "⭕" if c == "O" else "▫️" for c in board]
+    rows = []
+    for start in (0, 3, 6):
+        rows.append([InlineKeyboardButton(cells[i], callback_data=f"xo_move:{token}:{i}") for i in range(start, start+3)])
+    return InlineKeyboardMarkup(rows)
+
 def ensure_settings(chat_id):
     cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
     # SQLite cannot ALTER a missing table definition in one statement, so
@@ -349,38 +381,30 @@ def remember_delegated_user(user):
         db.commit()
 
 def can_publish_to(uid, chat_id):
+    """المالك والمفوّض ينشران في جميع القروبات المسجلة التي يوجد فيها البوت."""
     if is_owner(uid):
         return True
     if not is_delegated_owner(uid):
         return False
-    return bool(db.execute(
-        "SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id IN (?,0) LIMIT 1",
-        (uid, chat_id)
-    ).fetchone())
+    return bool(db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone())
 
 async def can_publish_to_live(bot, uid, chat_id):
-    """النشر للمالك الأساسي، وللمفوّض فقط في القروبات الممنوحة له والمُسجّلة التي هو عضو فيها."""
+    """السماح للمالك والمفوّض بالنشر إلى القروبات المسجلة؛ صلاحية الإرسال الفعلية تعتمد على وجود البوت فيها."""
     if is_owner(uid):
         return True
-    if not is_delegated_owner(uid) or not can_publish_to(uid, chat_id):
-        return False
-    if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-        return False
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
-        return member.status not in ("left", "kicked")
-    except Exception as exc:
-        log.warning("تعذر التحقق من عضوية المفوض %s في القروب %s: %s", uid, chat_id, exc)
-        return False
-
+    return is_delegated_owner(uid) and bool(
+        db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+    )
 
 async def can_access_group(bot, uid, chat_id):
-    """صلاحيات لوحة المجموعة: المالك/المديرون، أو المفوض إذا كان عضوًا فيها."""
-    if is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+    """المالك المفوّض يملك صلاحيات الإدارة التشغيلية في كل قروب مسجل للبوت؛ الصلاحيات العليا تبقى للمالك الأساسي."""
+    if is_owner(uid):
         return True
-    if not (is_delegated_owner(uid) or group_role(chat_id, uid)):
-        return False
     if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+        return False
+    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+        return True
+    if not group_role(chat_id, uid):
         return False
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
@@ -405,16 +429,14 @@ def is_delegated_owner(uid):
     ).fetchone())
 
 def is_general_manager(uid):
-    # Delegated owners do not inherit administrator permissions automatically.
-    # Only the primary owner or explicitly registered general managers qualify.
-    return is_owner(uid) or bool(db.execute(
+    # المالك المفوض يملك الإدارة التشغيلية في القروبات المسجلة، دون صلاحيات النظام العليا.
+    return is_owner(uid) or is_delegated_owner(uid) or bool(db.execute(
         "SELECT 1 FROM managers WHERE user_id=?", (uid,)
     ).fetchone())
 
 def is_protection_manager(uid):
-    # Delegated owners cannot change protection settings unless separately
-    # assigned an explicit role in the protection_managers table.
-    return is_owner(uid) or bool(db.execute(
+    # المالك المفوض يملك إعدادات الحماية داخل القروبات المسجلة؛ إدارة النظام العليا للمالك الأساسي فقط.
+    return is_owner(uid) or is_delegated_owner(uid) or bool(db.execute(
         "SELECT 1 FROM protection_managers WHERE user_id=?", (uid,)
     ).fetchone())
 
@@ -511,13 +533,13 @@ def panel_markup(uid):
             [InlineKeyboardButton("📊 إحصائيات القروبات", callback_data="statistics"), InlineKeyboardButton("📋 السجلات", callback_data="logs")],
             [InlineKeyboardButton("🛡️ الحماية وإعدادات القروبات", callback_data="security_groups"), InlineKeyboardButton("🔨 أوامر الإشراف", callback_data="administration_groups")],
             [InlineKeyboardButton("👥 توزيع الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("📢 الدخول والخروج والتنبيهات", callback_data="alerts")],
-            [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games")],
+            [InlineKeyboardButton("🎮🏆 مركز الألعاب والتحديات", callback_data="games")],
         ])
     rows = [
         [InlineKeyboardButton("🛡️ الحماية", callback_data="security"),
          InlineKeyboardButton("🔨 الإدارة", callback_data="administration")],
         [InlineKeyboardButton("👋 الترحيب", callback_data="welcome"),
-         InlineKeyboardButton("🎮 الألعاب", callback_data="games")],
+         InlineKeyboardButton("🎮🏆 مركز الألعاب", callback_data="games")],
         [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
          InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
         [InlineKeyboardButton("📢 الإشعارات", callback_data="alerts"),
@@ -669,8 +691,8 @@ async def addowner(update, context):
     db.commit()
     await update.effective_message.reply_text(
         f"👑 تم منح {name or 'المستخدم'} صلاحية «مالك مفوّض» (المعرّف: {uid}).\n"
-        "🔐 لا يملك صلاحية النشر إلا في القروبات التي تمنحها له.\n"
-        "ملكية البوت الأساسية تبقى عندك."
+        "✅ لديه صلاحيات الإدارة التشغيلية والحماية والنشر في جميع القروبات المسجلة التي يوجد فيها البوت.\n"
+        "🔐 إدارة المالكين والأرشيف الخاص والنسخ الاحتياطي وإعدادات النظام العليا تبقى للمالك الأساسي."
     )
 
 async def delowner(update, context):
@@ -1469,6 +1491,44 @@ async def broadcast_draft_message(update, context):
     if not msg or not user or not chat or chat.type != ChatType.PRIVATE:
         return
     remember_delegated_user(user)
+    if context.user_data.get("awaiting_delegated_owner_id"):
+        if not is_owner(user.id):
+            context.user_data.pop("awaiting_delegated_owner_id", None)
+            await msg.reply_text("⛔ هذا الإجراء للمالك الأساسي فقط.")
+            return
+        raw_id = (msg.text or "").strip()
+        if not raw_id.isdigit():
+            await msg.reply_text("أرسل رقم المستخدم فقط، أو اضغط إلغاء من لوحة التحكم.")
+            return
+        target_uid = int(raw_id)
+        if target_uid <= 0 or target_uid == OWNER_ID:
+            await msg.reply_text("❌ رقم غير صالح أو هذا الحساب هو المالك الأساسي بالفعل.")
+            return
+        try:
+            target_chat = await context.bot.get_chat(target_uid)
+            if getattr(target_chat, "is_bot", False):
+                await msg.reply_text("❌ لا يمكن تعيين حساب بوت كمالك مفوّض.")
+                return
+            display_name = getattr(target_chat, "full_name", "") or getattr(target_chat, "first_name", "") or ""
+            username = getattr(target_chat, "username", "") or ""
+        except Exception:
+            # Telegram may not reveal a user until they have started the bot; ID can still be recorded.
+            display_name, username = "", ""
+        db.execute("""INSERT INTO delegated_owners(user_id,added_by,added_at,display_name,username)
+                      VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET added_by=excluded.added_by,
+                      added_at=excluded.added_at,
+                      display_name=CASE WHEN excluded.display_name!='' THEN excluded.display_name ELSE delegated_owners.display_name END,
+                      username=CASE WHEN excluded.username!='' THEN excluded.username ELSE delegated_owners.username END""",
+                   (target_uid, user.id, now(), display_name, username))
+        db.commit()
+        context.user_data.pop("awaiting_delegated_owner_id", None)
+        await msg.reply_text(
+            f"✅ تم تسجيل المعرّف {target_uid} كمالك مفوّض.\n"
+            "✅ لديه صلاحيات الإدارة التشغيلية والحماية والنشر في جميع القروبات المسجلة التي يوجد فيها البوت.\n"
+            "🔐 إدارة المالكين والأرشيف الخاص والنسخ الاحتياطي وإعدادات النظام العليا تبقى للمالك الأساسي.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالكين المفوضين", callback_data="delegated_owner")]])
+        )
+        return
     pending_action = context.user_data.get("awaiting_admin_action")
     if pending_action:
         raw = (msg.text or "").strip()
@@ -1791,9 +1851,11 @@ async def callback(update, context):
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         title = title_row[0] if title_row else str(chat_id)
         rows = [
-            [InlineKeyboardButton("🧠 سؤال ثقافي", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 خمن الكلمة", callback_data=f"game_word:{chat_id}")],
-            [InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر (اختياري)", callback_data=f"game_challenge:{chat_id}")],
-            [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}")],
+            [InlineKeyboardButton("🧠 أسئلة ثقافية وذكاء", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")],
+            [InlineKeyboardButton("🧩 فك الكلمات المبعثرة", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")],
+            [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")],
+            [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")],
+            [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")],
         ]
         if is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid):
             rows.append([InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")])
@@ -1816,7 +1878,7 @@ async def callback(update, context):
         # Return to the group games page.
         cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
-        rows = [[InlineKeyboardButton("🧠 سؤال ثقافي", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 خمن الكلمة", callback_data=f"game_word:{chat_id}")], [InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر (اختياري)", callback_data=f"game_challenge:{chat_id}")], [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}")], [InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")], [InlineKeyboardButton("⬅️ القروبات", callback_data="games")]]
+        rows = [[InlineKeyboardButton("🧠 أسئلة ثقافية", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")], [InlineKeyboardButton("🧩 فك الكلمات", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")], [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")], [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")], [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")], [InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")], [InlineKeyboardButton("⬅️ القروبات", callback_data="games")]]
         await q.edit_message_text(f"🎮 الألعاب والتحديات\n👥 القروب: {title}\nحالة الألعاب: {'مفعّلة' if cfg[0] else 'متوقفة'}\nتحدي الخاسر: {'مفعّل' if cfg[1] else 'متوقف'}\n\nاختر لعبة:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("game_quiz:"):
@@ -1828,16 +1890,16 @@ async def callback(update, context):
         question="ما الكوكب المعروف بالكوكب الأحمر؟"; opts=[("🌍 الأرض",0),("🔴 المريخ",1),("🪐 زحل",0),("🌟 الزهرة",0)]
         rows=[[InlineKeyboardButton(label, callback_data=f"game_answer:{chat_id}:{correct}")] for label,correct in opts]
         rows.append([InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")])
-        await q.edit_message_text(f"🧠 سؤال ثقافي\n\n{question}\n\nاختر الإجابة الصحيحة:", reply_markup=InlineKeyboardMarkup(rows)); return
+        await context.bot.send_message(chat_id, f"🧠 سؤال ثقافي وذكاء\n\n{question}\n\nاختر الإجابة الصحيحة:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("تم نشر السؤال في القروب 🧠", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_answer:"):
         try: _,chat_raw,correct_raw=data.split(":",2); chat_id=int(chat_raw); correct=int(correct_raw)
         except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         if correct:
-            db.execute("UPDATE game_scores SET points=points+3,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?", (name,chat_id,uid)); msg="✅ إجابة صحيحة! ربحت 3 نقاط ⭐"
+            db.execute("UPDATE game_scores SET points=points+3,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?", (name,chat_id,uid)); record_game_points(chat_id, uid, 3, "quiz"); msg="✅ إجابة صحيحة! ربحت 3 نقاط ⭐"
         else:
             db.execute("UPDATE game_scores SET losses=losses+1,display_name=? WHERE chat_id=? AND user_id=?", (name,chat_id,uid)); msg="❌ إجابة غير صحيحة. لم تُخصم نقاطك."
         db.commit()
@@ -1851,16 +1913,16 @@ async def callback(update, context):
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         rows=[[InlineKeyboardButton("👋 مرحبا", callback_data=f"game_word_answer:{chat_id}:1"), InlineKeyboardButton("🏫 مدرسة", callback_data=f"game_word_answer:{chat_id}:0")], [InlineKeyboardButton("🌊 بحر", callback_data=f"game_word_answer:{chat_id}:0"), InlineKeyboardButton("✏️ قلم", callback_data=f"game_word_answer:{chat_id}:0")], [InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]]
-        await q.edit_message_text("🔤 تحدي الكلمات\n\nرتّب الحروف لتكوين كلمة: (ر، ح، ب، ا)\nاختر الإجابة الصحيحة:", reply_markup=InlineKeyboardMarkup(rows)); return
+        await context.bot.send_message(chat_id, "🔤 تحدي الكلمات\n\nرتّب الحروف لتكوين كلمة: (ر، ح، ب، ا)\nاختر الإجابة الصحيحة:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("تم نشر تحدي الكلمات في القروب 🔤", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_word_answer:"):
         try: _,chat_raw,correct_raw=data.split(":",2); chat_id=int(chat_raw); correct=int(correct_raw)
         except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         if correct:
-            db.execute("UPDATE game_scores SET points=points+2,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); msg="✅ إجابة صحيحة! ربحت نقطتين ⭐"
+            db.execute("UPDATE game_scores SET points=points+2,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id, uid, 2, "word"); msg="✅ إجابة صحيحة! ربحت نقطتين ⭐"
         else:
             db.execute("UPDATE game_scores SET losses=losses+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); msg="❌ إجابة غير صحيحة. حاول مرة أخرى!"
         db.commit()
@@ -1888,7 +1950,7 @@ async def callback(update, context):
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         if choice==bot_choice: msg=f"🤝 تعادل! اختيارك {choice} واختيار البوت {bot_choice}."; db.execute("UPDATE game_scores SET display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid))
-        elif wins.get(choice)==bot_choice: msg=f"🎉 فزت! اختيارك {choice} واختيار البوت {bot_choice}. ربحت 2 نقطة ⭐"; db.execute("UPDATE game_scores SET points=points+2,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid))
+        elif wins.get(choice)==bot_choice: msg=f"🎉 فزت! اختيارك {choice} واختيار البوت {bot_choice}. ربحت 2 نقطة ⭐"; db.execute("UPDATE game_scores SET points=points+2,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id, uid, 2, "rps")
         else: msg=f"😅 خسرت! اختيارك {choice} واختيار البوت {bot_choice}."; db.execute("UPDATE game_scores SET losses=losses+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid))
         db.commit()
         buttons=[]
@@ -1927,7 +1989,7 @@ async def callback(update, context):
         if db.execute("SELECT changes()").fetchone()[0] != 1:
             db.commit(); await q.answer("تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
-        db.execute("UPDATE game_scores SET points=points+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); db.commit()
+        db.execute("UPDATE game_scores SET points=points+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id, uid, 1, "challenge"); db.commit()
         await q.edit_message_text("👏 أحسنت! تم تسجيل نقطة مشاركة ⭐", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 العودة للألعاب", callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_scores:"):
@@ -1937,6 +1999,162 @@ async def callback(update, context):
         rows=db.execute("SELECT display_name,points,wins,losses FROM game_scores WHERE chat_id=? ORDER BY points DESC,wins DESC LIMIT 10",(chat_id,)).fetchall()
         body="\n".join(f"{i}. {name or 'عضو'} — ⭐ {points} | 🏆 {wins} فوز | ❌ {losses} خسارة" for i,(name,points,wins,losses) in enumerate(rows,1)) or "لا توجد نتائج بعد. ابدأ اللعب لتظهر هنا!"
         await q.edit_message_text("🏆 المتصدرون في هذا القروب\n\n"+body, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("game_periods:"):
+        try: chat_id=int(data.split(":",1)[1])
+        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        rows=[[InlineKeyboardButton("📅 المتصدرون هذا الأسبوع", callback_data=f"game_period_scores:{chat_id}:week")],
+              [InlineKeyboardButton("🗓️ المتصدرون هذا الشهر", callback_data=f"game_period_scores:{chat_id}:month")],
+              [InlineKeyboardButton("🏆 الترتيب العام", callback_data=f"game_scores:{chat_id}")],
+              [InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]]
+        await q.edit_message_text("🏆 اختر مدة ترتيب النقاط:", reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("game_period_scores:"):
+        try: _, chat_raw, period = data.split(":",2); chat_id=int(chat_raw)
+        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        if period not in ("week","month") or not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        from datetime import timedelta
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=7 if period=="week" else 30)).isoformat()
+        rows=db.execute("SELECT e.user_id, COALESCE(s.display_name,'عضو'), SUM(e.points) pts FROM game_score_events e LEFT JOIN game_scores s ON s.chat_id=e.chat_id AND s.user_id=e.user_id WHERE e.chat_id=? AND e.created_at>=? GROUP BY e.user_id ORDER BY pts DESC LIMIT 10", (chat_id,cutoff)).fetchall()
+        title="الأسبوع" if period=="week" else "آخر 30 يومًا"
+        body="\n".join(f"{i}. {name} — ⭐ {points}" for i,(_,name,points) in enumerate(rows,1)) or "لا توجد نقاط مسجلة لهذه المدة بعد."
+        await q.edit_message_text(f"🏆 المتصدرون — {title}\n\n{body}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ المدد", callback_data=f"game_periods:{chat_id}")],[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("game_scramble:"):
+        try: chat_id=int(data.split(":",1)[1])
+        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        token=uuid.uuid4().hex[:12]
+        opts=[("ةسردم", "مدرسة"), ("رحب", "بحر"), ("ملق", "قلم"), ("باتك", "كتاب")]
+        scrambled,answer=opts[int(token[:2],16)%len(opts)]
+        db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,created_at) VALUES(?,?,?,?,?)",(token,chat_id,"scramble",answer,now())); db.commit()
+        buttons=[[InlineKeyboardButton(x, callback_data=f"game_round_answer:{token}:{x}")] for x in ["مدرسة","بحر","قلم","كتاب"]]
+        await context.bot.send_message(chat_id, f"🔤 فكّ الكلمة المبعثرة!\n\nالكلمة: {scrambled}\nأول إجابة صحيحة تحصل على نقطتين ⭐", reply_markup=InlineKeyboardMarkup(buttons))
+        await q.edit_message_text("تم نشر تحدي الكلمات في القروب المحدد ✅", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("game_speed:"):
+        try: chat_id=int(data.split(":",1)[1])
+        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        token=uuid.uuid4().hex[:12]
+        db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,created_at) VALUES(?,?,?,?,?)",(token,chat_id,"speed","الرياض",now())); db.commit()
+        buttons=[[InlineKeyboardButton("جدة", callback_data=f"game_round_answer:{token}:جدة"), InlineKeyboardButton("الرياض", callback_data=f"game_round_answer:{token}:الرياض")], [InlineKeyboardButton("أبها", callback_data=f"game_round_answer:{token}:أبها"), InlineKeyboardButton("تبوك", callback_data=f"game_round_answer:{token}:تبوك")]]
+        await context.bot.send_message(chat_id,"⚡ تحدي السرعة!\nما عاصمة المملكة العربية السعودية؟\nأول عضو يضغط الإجابة الصحيحة يحصل على 3 نقاط ⭐",reply_markup=InlineKeyboardMarkup(buttons))
+        await q.edit_message_text("نُشر تحدي السرعة في القروب ⚡",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب",callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("game_round_answer:"):
+        try: _,token,answer=data.split(":",2)
+        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        row=db.execute("SELECT chat_id,kind,answer,completed,created_at FROM game_rounds WHERE token=?",(token,)).fetchone()
+        if not row: await q.answer("انتهت الجولة أو غير موجودة.",show_alert=True); return
+        chat_id,kind,correct,completed,created_at=row
+        if completed: await q.answer("سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
+        if answer != correct: await q.answer("ليست الإجابة الصحيحة، حاول مجددًا.",show_alert=True); return
+        if (datetime.now(timezone.utc)-datetime.fromisoformat(created_at)).total_seconds()>180: await q.answer("انتهى وقت الجولة.",show_alert=True); return
+        db.execute("UPDATE game_rounds SET completed=1 WHERE token=? AND completed=0",(token,))
+        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await q.answer("سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
+        name=q.from_user.full_name or str(uid); points=3 if kind=="speed" else 2
+        db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid,name))
+        db.execute("UPDATE game_scores SET points=points+?,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(points,name,chat_id,uid)); record_game_points(chat_id,uid,points,kind); db.commit()
+        await q.edit_message_text(f"🏆 فاز {name} في {'تحدي السرعة' if kind=='speed' else 'فك الكلمة'} وربح {points} نقاط ⭐")
+        return
+
+    if data.startswith("game_daily:"):
+        try: chat_id=int(data.split(":",1)[1])
+        except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        day=datetime.now(timezone.utc).date().isoformat()
+        existing=db.execute("SELECT completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
+        if existing:
+            await q.answer("تم نشر تحدي اليوم بالفعل في هذا القروب.",show_alert=True); return
+        answer="القمر"; question="ما الشيء الذي يظهر ليلًا ويعكس ضوء الشمس؟"
+        db.execute("INSERT INTO daily_game_challenges(chat_id,challenge_date,answer) VALUES(?,?,?)",(chat_id,day,answer)); db.commit()
+        buttons=[[InlineKeyboardButton(x,callback_data=f"game_daily_answer:{chat_id}:{day}:{x}")] for x in ["الشمس","القمر","السحاب","النجوم"]]
+        try:
+            sent=await context.bot.send_message(chat_id,f"🎯 تحدي اليوم\n\n{question}\nأول إجابة صحيحة تحصل على 5 نقاط ⭐",reply_markup=InlineKeyboardMarkup(buttons))
+            db.execute("UPDATE daily_game_challenges SET message_id=? WHERE chat_id=? AND challenge_date=?",(sent.message_id,chat_id,day)); db.commit()
+        except Exception:
+            db.execute("DELETE FROM daily_game_challenges WHERE chat_id=? AND challenge_date=? AND completed=0",(chat_id,day)); db.commit()
+            await q.answer("تعذر نشر التحدي. تأكد أن البوت يستطيع إرسال الرسائل.",show_alert=True); return
+        await q.edit_message_text("تم نشر تحدي اليوم في القروب 🎯",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب",callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("game_daily_answer:"):
+        try: _,chat_raw,day,answer=data.split(":",3); chat_id=int(chat_raw)
+        except ValueError: await q.answer("بيانات غير صحيحة.",show_alert=True); return
+        row=db.execute("SELECT answer,completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
+        if not row or row[1]: await q.answer("انتهى تحدي اليوم أو فاز به عضو آخر.",show_alert=True); return
+        if answer != row[0]: await q.answer("إجابة غير صحيحة، حاول مرة أخرى.",show_alert=True); return
+        db.execute("UPDATE daily_game_challenges SET completed=1,winner_id=? WHERE chat_id=? AND challenge_date=? AND completed=0",(uid,chat_id,day))
+        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await q.answer("سبق أن فاز عضو آخر.",show_alert=True); return
+        name=q.from_user.full_name or str(uid)
+        db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid,name))
+        db.execute("UPDATE game_scores SET points=points+5,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id,uid,5,"daily"); db.commit()
+        try: await context.bot.send_message(chat_id,f"🎉 مبروك {name}! فزت بتحدي اليوم وربحت 5 نقاط ⭐")
+        except Exception: pass
+        await q.answer("إجابة صحيحة! تم تسجيل نقاطك.",show_alert=True); return
+
+    if data.startswith("game_xo_start:"):
+        try: chat_id=int(data.split(":",1)[1])
+        except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
+        if not await can_access_group(context.bot,uid,chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        token=uuid.uuid4().hex[:12]
+        db.execute("INSERT INTO game_xo(token,chat_id,player_x,board,turn,status,created_at) VALUES(?,?,?,'         ','X','waiting',?)",(token,chat_id,uid,now())); db.commit()
+        try:
+            sent=await context.bot.send_message(chat_id,f"⭕ تحدي إكس أو\nاللاعب الأول: {q.from_user.full_name} (❌)\nمن يرغب بالمنافسة يضغط الانضمام:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🙋 انضم كلاعب ⭕",callback_data=f"xo_join:{token}")]]))
+            db.execute("UPDATE game_xo SET message_id=? WHERE token=?",(sent.message_id,token)); db.commit()
+        except Exception:
+            db.execute("DELETE FROM game_xo WHERE token=?",(token,)); db.commit(); await q.answer("تعذر إرسال اللعبة إلى القروب.",show_alert=True); return
+        await q.edit_message_text("تم نشر تحدي إكس أو في القروب. ينتظر لاعبًا ثانيًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب",callback_data=f"games_group:{chat_id}")]])); return
+
+    if data.startswith("xo_join:"):
+        token=data.split(":",1)[1]; row=db.execute("SELECT chat_id,player_x,player_o,board,turn,status,message_id FROM game_xo WHERE token=?",(token,)).fetchone()
+        if not row: await q.answer("اللعبة غير موجودة.",show_alert=True); return
+        chat_id,px,po,board,turn,status,message_id=row
+        if status!="waiting": await q.answer("اللعبة بدأت أو انتهت.",show_alert=True); return
+        if uid==px: await q.answer("تحتاج لاعبًا ثانيًا.",show_alert=True); return
+        db.execute("UPDATE game_xo SET player_o=?,status='playing' WHERE token=? AND status='waiting'",(uid,token)); db.commit()
+        text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {uid}\nالدور: ❌ اللاعب الأول"
+        try: await q.edit_message_text(text,reply_markup=game_board_markup(token,board))
+        except Exception: await q.answer("تعذر تحديث لوحة اللعبة.",show_alert=True); return
+        return
+
+    if data.startswith("xo_move:"):
+        try: _,token,pos_raw=data.split(":",2); pos=int(pos_raw)
+        except ValueError: await q.answer("حركة غير صحيحة.",show_alert=True); return
+        row=db.execute("SELECT chat_id,player_x,player_o,board,turn,status,message_id FROM game_xo WHERE token=?",(token,)).fetchone()
+        if not row: await q.answer("اللعبة غير موجودة.",show_alert=True); return
+        chat_id,px,po,board,turn,status,message_id=row
+        if status!="playing" or uid not in (px,po): await q.answer("لست لاعبًا في هذه الجولة.",show_alert=True); return
+        if (turn=="X" and uid!=px) or (turn=="O" and uid!=po): await q.answer("ليس دورك الآن.",show_alert=True); return
+        if pos<0 or pos>8 or board[pos]!=" ": await q.answer("هذا المربع غير متاح.",show_alert=True); return
+        symbol=turn; board=board[:pos]+symbol+board[pos+1:]
+        wins_x=((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
+        winner=symbol if any(all(board[i]==symbol for i in line) for line in wins_x) else None
+        draw=not winner and " " not in board
+        if winner or draw:
+            db.execute("UPDATE game_xo SET board=?,status='done' WHERE token=?",(board,token))
+            if winner:
+                winner_id=px if winner=="X" else po; name=q.from_user.full_name or str(uid)
+                db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,winner_id,name))
+                db.execute("UPDATE game_scores SET points=points+3,wins=wins+1,display_name=CASE WHEN user_id=? THEN ? ELSE display_name END WHERE chat_id=? AND user_id=?",(winner_id,name,chat_id,winner_id)); record_game_points(chat_id,winner_id,3,"xo")
+                text=f"🏆 فاز اللاعب {'❌' if winner=='X' else '⭕'}! حصل على 3 نقاط ⭐\n❌ {px} ضد ⭕ {po}"
+            else: text=f"🤝 تعادل!\n❌ {px} ضد ⭕ {po}"
+        else:
+            next_turn="O" if turn=="X" else "X"; db.execute("UPDATE game_xo SET board=?,turn=? WHERE token=?",(board,next_turn))
+            text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {po}\nالدور: {'❌ اللاعب الأول' if next_turn=='X' else '⭕ اللاعب الثاني'}"
+        db.commit()
+        try: await q.edit_message_text(text,reply_markup=None if winner or draw else game_board_markup(token,board))
+        except Exception: await q.answer("تم تسجيل الحركة، لكن تعذر تحديث اللوحة.",show_alert=True)
+        return
 
     if data == "statistics":
         if not can_use_panel(uid): await q.edit_message_text("⛔ ليس لديك صلاحية الإحصائيات."); return
@@ -2205,10 +2423,25 @@ async def callback(update, context):
         rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
         text = "👑 المالكون المفوّضون وصلاحيات النشر\n\n"
         text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in rows) if rows else "لا يوجد مالكون مفوّضون."
-        text += "\n\nاختر مالكًا مفوضًا لإدارة قروبات النشر المسموحة له.\nإضافة: /addowner\nعزل: /delowner USER_ID"
-        buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — صلاحيات النشر", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
+        text += "\n\nاختر مالكًا مفوضًا لإدارة صلاحياته. الإضافة والعزل تتمان من هذه اللوحة في الخاص."
+        buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — الصلاحيات", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
+        buttons.insert(0, [InlineKeyboardButton("➕ إضافة مالك مفوّض", callback_data="delegated_add_start")])
         buttons += [[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
         await q.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "delegated_add_start":
+        if not is_owner(uid):
+            await q.answer("إضافة المالك المفوّض للمالك الأساسي فقط.", show_alert=True)
+            return
+        if q.message.chat.type != ChatType.PRIVATE:
+            await q.answer("افتح اللوحة في الخاص مع البوت.", show_alert=True)
+            return
+        context.user_data["awaiting_delegated_owner_id"] = True
+        await q.edit_message_text(
+            "➕ إضافة مالك مفوّض\n\nأرسل رقم المستخدم (User ID) في هذه المحادثة الخاصة.\nلن تُمنح الصلاحية إلا بعد إدخال الرقم هنا، ولا ترسل رمز البوت أو التوكن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء والعودة", callback_data="delegated_owner")]])
+        )
         return
 
     if data.startswith("delegated_manage:"):
