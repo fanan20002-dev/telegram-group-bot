@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS delegated_owners(
     added_at TEXT
 )
 """)
+# Store a display name when Telegram has made it available.
+cols = {r[1] for r in db.execute("PRAGMA table_info(delegated_owners)").fetchall()}
+if "display_name" not in cols:
+    db.execute("ALTER TABLE delegated_owners ADD COLUMN display_name TEXT DEFAULT ''")
+if "username" not in cols:
+    db.execute("ALTER TABLE delegated_owners ADD COLUMN username TEXT DEFAULT ''")
+db.execute("""
+CREATE TABLE IF NOT EXISTS publish_permissions(
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    granted_by INTEGER NOT NULL,
+    granted_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, chat_id)
+)
+""")
+
 db.execute("""
 CREATE TABLE IF NOT EXISTS protection_managers(
     user_id INTEGER PRIMARY KEY,
@@ -94,6 +110,12 @@ CREATE TABLE IF NOT EXISTS member_activity(
     stars INTEGER NOT NULL DEFAULT 0,
     custom_title TEXT DEFAULT '',
     PRIMARY KEY(chat_id,user_id)
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS welcome_messages(
+    chat_id INTEGER PRIMARY KEY,
+    message TEXT NOT NULL DEFAULT ''
 )
 """)
 db.execute("""
@@ -176,18 +198,63 @@ def log_action(chat_id, user_id, action, details=""):
 def is_owner(uid):
     return bool(OWNER_ID and uid == OWNER_ID)
 
+def user_display_name(user_id):
+    row = db.execute("SELECT display_name, username FROM delegated_owners WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        name, username = row
+        if name:
+            return f"{name} (@{username})" if username else name
+    return f"المستخدم {user_id}"
+
+def remember_delegated_user(user):
+    if not user:
+        return
+    if db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (user.id,)).fetchone():
+        db.execute("UPDATE delegated_owners SET display_name=?, username=? WHERE user_id=?",
+                   (user.full_name or '', user.username or '', user.id))
+        db.commit()
+
+def can_publish_to(uid, chat_id):
+    if is_owner(uid):
+        return True
+    if not is_delegated_owner(uid):
+        return False
+    return bool(db.execute(
+        "SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id IN (?,0) LIMIT 1",
+        (uid, chat_id)
+    ).fetchone())
+
+async def can_publish_to_live(bot, uid, chat_id):
+    """المالك المفوض ينشر فقط في القروبات المسجلة التي هو عضو فيها فعليًا."""
+    if is_owner(uid):
+        return True
+    if not is_delegated_owner(uid):
+        return False
+    if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+        return False
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
+        return member.status not in ("left", "kicked")
+    except Exception as exc:
+        log.warning("تعذر التحقق من عضوية المفوض %s في القروب %s: %s", uid, chat_id, exc)
+        return False
+
 def is_delegated_owner(uid):
     return is_owner(uid) or bool(db.execute(
         "SELECT 1 FROM delegated_owners WHERE user_id=?", (uid,)
     ).fetchone())
 
 def is_general_manager(uid):
-    return is_delegated_owner(uid) or bool(db.execute(
+    # Delegated owners do not inherit administrator permissions automatically.
+    # Only the primary owner or explicitly registered general managers qualify.
+    return is_owner(uid) or bool(db.execute(
         "SELECT 1 FROM managers WHERE user_id=?", (uid,)
     ).fetchone())
 
 def is_protection_manager(uid):
-    return is_delegated_owner(uid) or bool(db.execute(
+    # Delegated owners cannot change protection settings unless separately
+    # assigned an explicit role in the protection_managers table.
+    return is_owner(uid) or bool(db.execute(
         "SELECT 1 FROM protection_managers WHERE user_id=?", (uid,)
     ).fetchone())
 
@@ -195,7 +262,13 @@ def is_manager(uid):
     return is_general_manager(uid)
 
 def can_use_panel(uid):
-    return is_general_manager(uid) or is_protection_manager(uid)
+    if is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+        return True
+    # Delegated owners only get a minimal panel if they have at least one
+    # explicit publish permission. Owner-only controls are never shown to them.
+    return is_delegated_owner(uid) and bool(db.execute(
+        "SELECT 1 FROM publish_permissions WHERE user_id=? LIMIT 1", (uid,)
+    ).fetchone())
 
 def can_manage_security(uid):
     return is_general_manager(uid) or is_protection_manager(uid)
@@ -233,6 +306,13 @@ def register_group(chat):
     db.commit()
 
 def panel_markup(uid):
+    # The delegated owner's panel exposes only the capability explicitly
+    # granted to them: publishing to authorized groups. All role management,
+    # owner names/removal, archive, settings and general admin controls are owner-only.
+    if is_delegated_owner(uid) and not is_owner(uid):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📣 النشر في القروبات المسموحة", callback_data="broadcast_start")]
+        ])
     rows = [
         [InlineKeyboardButton("🛡️ الحماية", callback_data="security"),
          InlineKeyboardButton("🔨 الإدارة", callback_data="administration")],
@@ -241,13 +321,12 @@ def panel_markup(uid):
         [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
          InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
         [InlineKeyboardButton("📢 الإشعارات", callback_data="alerts"),
-         InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")]
+         InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
+        [InlineKeyboardButton("👑 الصلاحيات والرتب", callback_data="permissions"),
+         InlineKeyboardButton("📨 سجل الرسائل الخاص", callback_data="archive")],
+        [InlineKeyboardButton("👑 المالك المفوّض وصلاحيات النشر", callback_data="delegated_owner")],
+        [InlineKeyboardButton("📣 نشر إعلان بالقروبات المحددة", callback_data="broadcast_start")]
     ]
-    if is_owner(uid):
-        rows.append([InlineKeyboardButton("👑 الصلاحيات والرتب", callback_data="permissions"),
-                     InlineKeyboardButton("📨 سجل الرسائل الخاص", callback_data="archive")])
-        rows.append([InlineKeyboardButton("📣 نشر إعلان بالقروبات", callback_data="broadcast_start")])
-        rows.append([InlineKeyboardButton("👑 المالك المفوّض", callback_data="delegated_owner")])
     return InlineKeyboardMarkup(rows)
 
 def settings_page_markup(chat_id, page=0):
@@ -303,7 +382,16 @@ def group_list_markup():
     rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
+def group_list_markup_for(prefix):
+    groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+    rows = [[InlineKeyboardButton(f"👥 {title or chat_id}", callback_data=f"{prefix}:{chat_id}")] for chat_id, title in groups[:30]]
+    if not rows:
+        rows = [[InlineKeyboardButton("لا توجد قروبات مسجلة بعد", callback_data="noop")]]
+    rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
 async def start(update, context):
+    remember_delegated_user(update.effective_user)
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.effective_message.reply_text(
             f"مرحبًا 👋\nرقم حسابك: {update.effective_user.id}\n\n"
@@ -331,7 +419,10 @@ async def help_cmd(update, context):
             "/addmanager — إضافة مدير عام\n/delmanager — إزالة مدير عام\n"
             "/addprotect — إضافة مشرف حماية\n/delprotect — إزالة مشرف حماية\n"
             "/archive_on — تفعيل أرشفة الرسائل بعد إعلانها\n"
-            "/archive_off — إيقاف أرشفة الرسائل\n/archive — عرض سجل الرسائل الخاص"
+            "/archive_off — إيقاف أرشفة الرسائل\n/archive — عرض سجل الرسائل الخاص\n"
+            "/grantpublish USER_ID CHAT_ID — منح صلاحية النشر في قروب\n"
+            "/revokepublish USER_ID CHAT_ID — سحب صلاحية النشر من قروب\n"
+            "استخدم CHAT_ID=all لمنح/سحب صلاحية النشر في كل القروبات المسجلة."
         )
     await update.effective_message.reply_text(text)
 
@@ -360,11 +451,17 @@ async def addowner(update, context):
     if uid == OWNER_ID:
         await update.effective_message.reply_text("هذا الحساب هو المالك الأساسي بالفعل.")
         return
-    db.execute("INSERT OR REPLACE INTO delegated_owners(user_id,added_by,added_at) VALUES(?,?,?)",
-               (uid, update.effective_user.id, now()))
+    name = target.full_name if hasattr(target, "full_name") else ""
+    username = target.username if hasattr(target, "username") and target.username else ""
+    db.execute("""INSERT INTO delegated_owners(user_id,added_by,added_at,display_name,username)
+                  VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET added_by=excluded.added_by,
+                  added_at=excluded.added_at, display_name=CASE WHEN excluded.display_name!='' THEN excluded.display_name ELSE delegated_owners.display_name END,
+                  username=CASE WHEN excluded.username!='' THEN excluded.username ELSE delegated_owners.username END""",
+               (uid, update.effective_user.id, now(), name, username))
     db.commit()
     await update.effective_message.reply_text(
-        f"👑 تم منح العضو صلاحية «مالك مفوّض» ({uid}).\n"
+        f"👑 تم منح {name or 'المستخدم'} صلاحية «مالك مفوّض» (المعرّف: {uid}).\n"
+        "🔐 لا يملك صلاحية النشر إلا في القروبات التي تمنحها له.\n"
         "ملكية البوت الأساسية تبقى عندك."
     )
 
@@ -377,17 +474,89 @@ async def delowner(update, context):
         await update.effective_message.reply_text("استخدمه بالرد على العضو أو /delowner رقم_المستخدم")
         return
     uid = target.id if hasattr(target, "id") else target
+    name = user_display_name(uid)
     db.execute("DELETE FROM delegated_owners WHERE user_id=?", (uid,))
+    db.execute("DELETE FROM publish_permissions WHERE user_id=?", (uid,))
     db.commit()
-    await update.effective_message.reply_text(f"✅ تم إلغاء المالك المفوّض: {uid}")
+    await update.effective_message.reply_text(f"✅ تم عزل {name} وإلغاء جميع صلاحياته وتفويضات النشر.")
+
+async def grantpublish(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ منح صلاحية النشر للمالك الأساسي فقط.")
+        return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("الاستخدام: /grantpublish USER_ID CHAT_ID أو /grantpublish USER_ID all")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("رقم المستخدم غير صحيح.")
+        return
+    if not is_delegated_owner(target_uid) or is_owner(target_uid):
+        await update.effective_message.reply_text("أضف المستخدم أولًا كمالك مفوّض باستخدام /addowner.")
+        return
+    raw_chat = context.args[1].lower()
+    if raw_chat == "all":
+        db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,0,?,?)",
+                   (target_uid, update.effective_user.id, now()))
+        db.commit()
+        await update.effective_message.reply_text(f"✅ مُنحت {user_display_name(target_uid)} صلاحية النشر في جميع القروبات المسجلة حاليًا ومستقبلًا.")
+        return
+    try:
+        chat_id = int(raw_chat)
+    except ValueError:
+        await update.effective_message.reply_text("معرّف القروب غير صحيح. استخدم all أو رقم القروب.")
+        return
+    group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+    if not group:
+        await update.effective_message.reply_text("هذا القروب غير مسجل. أضف البوت إليه ونفّذ /panel داخله أولًا.")
+        return
+    all_granted = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone()
+    if not all_granted:
+        db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)",
+                   (target_uid, chat_id, update.effective_user.id, now()))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ مُنحت {user_display_name(target_uid)} صلاحية النشر في القروب: {group[0] or chat_id}.")
+
+async def revokepublish(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ سحب صلاحية النشر للمالك الأساسي فقط.")
+        return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("الاستخدام: /revokepublish USER_ID CHAT_ID أو /revokepublish USER_ID all")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("رقم المستخدم غير صحيح.")
+        return
+    raw_chat = context.args[1].lower()
+    if raw_chat == "all":
+        db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+    else:
+        try:
+            chat_id = int(raw_chat)
+        except ValueError:
+            await update.effective_message.reply_text("معرّف القروب غير صحيح. استخدم all أو رقم القروب.")
+            return
+        all_granted = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone()
+        if all_granted:
+            db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+            for other_chat_id, in db.execute("SELECT chat_id FROM watched_groups WHERE chat_id!=?", (chat_id,)).fetchall():
+                db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid, other_chat_id, update.effective_user.id, now()))
+        else:
+            db.execute("DELETE FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid, chat_id))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ تم سحب صلاحية النشر المطلوبة من {user_display_name(target_uid)}.")
 
 async def owners_cmd(update, context):
     if not can_use_panel(update.effective_user.id):
         await update.effective_message.reply_text("⛔ ليس لديك صلاحية.")
         return
     rows = db.execute("SELECT user_id FROM delegated_owners ORDER BY user_id").fetchall()
+    named_rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
     text = "👑 المالكون المفوّضون:\n\n"
-    text += "\n".join(f"• {r[0]}" for r in rows) if rows else "لا يوجد مالكون مفوّضون."
+    text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in named_rows) if named_rows else "لا يوجد مالكون مفوّضون."
     text += f"\n\n👑 المالك الأساسي: {OWNER_ID}"
     await update.effective_message.reply_text(text)
 
@@ -949,9 +1118,16 @@ async def new_members(update, context):
         return
     register_group(update.effective_chat)
     s = get_settings(update.effective_chat.id)
+    welcome_row = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
     for member in msg.new_chat_members:
         if not member.is_bot:
             await notify_owners(context, f"👋 دخول عضو جديد\nالمجموعة: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
+            if welcome_row and welcome_row[0]:
+                welcome_text = welcome_row[0].replace("{name}", member.full_name).replace("{group}", update.effective_chat.title or "القروب")
+                try:
+                    await context.bot.send_message(update.effective_chat.id, welcome_text)
+                except Exception as e:
+                    log.warning("Welcome message failed for %s: %s", update.effective_chat.id, e)
     if s["entry"]:
         try:
             await msg.delete()
@@ -977,13 +1153,28 @@ async def broadcast_draft_message(update, context):
     chat = update.effective_chat
     if not msg or not user or not chat or chat.type != ChatType.PRIVATE:
         return
-    if not is_owner(user.id) or not context.user_data.get("awaiting_broadcast"):
+    remember_delegated_user(user)
+    welcome_chat_id = context.user_data.get("awaiting_welcome_chat")
+    if welcome_chat_id and (is_general_manager(user.id) or is_protection_manager(user.id)):
+        body = msg.text or msg.caption
+        if not body:
+            await msg.reply_text("أرسل نص ترحيب أو تعليقًا نصيًا.")
+            return
+        db.execute("INSERT OR REPLACE INTO welcome_messages(chat_id,message) VALUES(?,?)", (welcome_chat_id, body[:1000]))
+        db.commit()
+        log_action(welcome_chat_id, user.id, "welcome_set", "تم تحديث رسالة الترحيب")
+        context.user_data.pop("awaiting_welcome_chat", None)
+        await msg.reply_text("✅ تم حفظ رسالة الترحيب. ستُرسل عند دخول أعضاء جدد إذا كان البوت قادرًا على إرسال الرسائل في القروب.")
+        return
+    if not context.user_data.get("awaiting_broadcast") or not (is_owner(user.id) or is_delegated_owner(user.id)):
         return
     context.user_data["broadcast_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
+    selected = context.user_data.get("broadcast_selected_groups", [])
     await msg.reply_text(
-        "👀 معاينة الإعلان جاهزة. هل تريد نشر هذه الرسالة في جميع القروبات المسجلة؟",
+        "👀 معاينة الإعلان جاهزة. سيتم إرساله فقط إلى القروبات المحددة والمصرح لك بها.\n"
+        f"عدد القروبات المستهدفة: {len(selected)}\nهل تريد المتابعة؟",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تأكيد النشر للجميع", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("✅ تأكيد النشر للقروبات المحددة", callback_data="broadcast_confirm")],
             [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]
         ])
     )
@@ -1138,8 +1329,8 @@ async def callback(update, context):
             await q.edit_message_text("⛔ ليس لديك صلاحية الترحيب.")
             return
         await q.edit_message_text(
-            "👋 الترحيب\n\nيمكن تخصيص رسالة ترحيب لكل قروب من إعدادات الرسائل.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+            "👋 إعداد الترحيب لكل قروب\n\nاختر القروب لتعيين رسالة ترحيب أو عرض الرسالة الحالية.",
+            reply_markup=group_list_markup_for("welcome_group")
         )
         return
 
@@ -1165,18 +1356,63 @@ async def callback(update, context):
             await q.edit_message_text("⛔ ليس لديك صلاحية.")
             return
         chat_id = int(data.split(":")[1])
+        group = db.execute("SELECT title,added_at FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         total = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=?", (chat_id,)).fetchone()[0]
-        deletes = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=? AND action='delete'", (chat_id,)).fetchone()[0]
+        deletes = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=? AND action LIKE '%delete%'", (chat_id,)).fetchone()[0]
         bans = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=? AND action='ban'", (chat_id,)).fetchone()[0]
+        mutes = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=? AND action='mute'", (chat_id,)).fetchone()[0]
+        members = db.execute("SELECT COUNT(*) FROM member_activity WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        messages = db.execute("SELECT COALESCE(SUM(message_count),0) FROM member_activity WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        active = db.execute("SELECT display_name,message_count,stars,custom_title FROM member_activity WHERE chat_id=? ORDER BY message_count DESC LIMIT 5", (chat_id,)).fetchall()
+        s = get_settings(chat_id)
+        welcome = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
+        lines = ["📊 إحصائيات القروب", f"👥 الاسم: {group[0] if group else 'غير معروف'}", f"🆔 المعرّف: {chat_id}", f"🗓️ تاريخ التسجيل: {group[1] if group else 'غير معروف'}", "", f"👤 الأعضاء الذين رصد البوت نشاطهم: {members}", f"💬 الرسائل المرصودة: {messages}", f"📋 العمليات المسجلة: {total}", f"🗑️ عمليات الحذف: {deletes}", f"🚫 عمليات الحظر: {bans}", f"🔇 عمليات التقييد المسجلة: {mutes}", f"👋 الترحيب: {'مفعّل' if welcome and welcome[0] else 'غير مفعّل'}", f"🛡️ قفل الروابط: {'مفعّل' if s.get('links') else 'غير مفعّل'}", "", "⭐ أكثر الأعضاء نشاطًا:"]
+        lines.extend([f"• {n or 'عضو'} — {count} رسالة — ⭐ {stars}" for n,count,stars,title in active] or ["لا توجد بيانات نشاط كافية بعد."])
+        await q.edit_message_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ القروبات", callback_data="statistics")],
+            [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]
+        ]))
+        return
+
+    if data.startswith("welcome_group:"):
+        if not is_general_manager(uid):
+            await q.edit_message_text("⛔ ليس لديك صلاحية إعداد الترحيب.")
+            return
+        chat_id = int(data.split(":", 1)[1])
+        group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+        if not group:
+            await q.edit_message_text("لم يتم العثور على القروب.")
+            return
+        current = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
+        text = current[0] if current and current[0] else "غير مفعّل؛ لم تُحدّد رسالة ترحيب."
         await q.edit_message_text(
-            "📊 إحصائيات القروب\n\n"
-            f"العمليات المسجلة: {total}\nالحذف: {deletes}\nالحظر: {bans}\n"
-            f"رقم القروب: {chat_id}",
+            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {name} لاسم العضو.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ القروبات", callback_data="statistics")],
-                [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]
+                [InlineKeyboardButton("✏️ تعيين رسالة جديدة", callback_data=f"welcome_set:{chat_id}")],
+                [InlineKeyboardButton("🗑️ إيقاف الترحيب", callback_data=f"welcome_off:{chat_id}")],
+                [InlineKeyboardButton("⬅️ القروبات", callback_data="welcome")]
             ])
         )
+        return
+
+    if data.startswith("welcome_set:"):
+        if not is_general_manager(uid):
+            await q.answer("ليس لديك صلاحية", show_alert=True)
+            return
+        chat_id = int(data.split(":", 1)[1])
+        context.user_data["awaiting_welcome_chat"] = chat_id
+        await q.edit_message_text("أرسل رسالة الترحيب الجديدة في الخاص مع البوت. استخدم {name} لاسم العضو و {group} لاسم القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"welcome_group:{chat_id}")]]))
+        return
+
+    if data.startswith("welcome_off:"):
+        if not is_general_manager(uid):
+            await q.answer("ليس لديك صلاحية", show_alert=True)
+            return
+        chat_id = int(data.split(":", 1)[1])
+        db.execute("DELETE FROM welcome_messages WHERE chat_id=?", (chat_id,))
+        db.commit()
+        log_action(chat_id, uid, "welcome_off", "تم إيقاف الترحيب")
+        await q.edit_message_text("✅ تم إيقاف رسالة الترحيب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القروبات", callback_data="welcome")]]))
         return
 
     if data == "permissions":
@@ -1202,52 +1438,105 @@ async def callback(update, context):
         return
 
     if data == "broadcast_start":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك الأساسي أو المالك المفوّض.", show_alert=True)
+            return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        allowed = [(cid, title) for cid, title in groups if await can_publish_to_live(context.bot, uid, cid)]
+        if not allowed:
+            await q.edit_message_text("⛔ لا توجد قروبات ممنوحة لك صلاحية النشر فيها. اطلب من المالك الأساسي منحك الصلاحية.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
+            return
+        # Start with no groups selected to prevent accidental mass publication.
+        context.user_data["broadcast_selected_groups"] = []
+        rows = []
+        for cid, title in allowed[:30]:
+            selected = cid in context.user_data["broadcast_selected_groups"]
+            mark = "✅" if selected else "⬜️"
+            rows.append([InlineKeyboardButton(f"{mark} {title or cid}", callback_data=f"broadcast_toggle:{cid}")])
+        if is_owner(uid):
+            rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات", callback_data="broadcast_select_all")])
+        rows.append([InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")])
+        rows.append([InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")])
+        await q.edit_message_text("📣 نشر إعلان بالقروبات\n\nحدد القروبات التي تريد النشر فيها. المالك المفوّض تظهر له القروبات المسجلة التي هو عضو فيها فقط.", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("broadcast_toggle:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("ليس لديك صلاحية.", show_alert=True)
+            return
+        try:
+            chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("معرّف القروب غير صحيح.", show_alert=True)
+            return
+        if not await can_publish_to_live(context.bot, uid, chat_id):
+            await q.answer("النشر متاح فقط في القروبات المسجلة التي أنت عضو فيها.", show_alert=True)
+            return
+        selected = set(context.user_data.get("broadcast_selected_groups", []))
+        if chat_id in selected: selected.remove(chat_id)
+        else: selected.add(chat_id)
+        context.user_data["broadcast_selected_groups"] = sorted(selected)
+        # Refresh only authorized group options.
+        groups = [(cid, title) for cid, title in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall() if await can_publish_to_live(context.bot, uid, cid)]
+        rows = [[InlineKeyboardButton(("✅ " if cid in selected else "⬜️ ") + (title or str(cid)), callback_data=f"broadcast_toggle:{cid}")] for cid, title in groups[:30]]
+        if is_owner(uid): rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات", callback_data="broadcast_select_all")])
+        rows += [[InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")], [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]]
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "broadcast_select_all":
         if not is_owner(uid):
-            await q.answer("النشر العام للمالك الأساسي فقط.", show_alert=True)
+            await q.answer("هذا الخيار للمالك الأساسي فقط.", show_alert=True)
+            return
+        context.user_data["broadcast_selected_groups"] = [r[0] for r in db.execute("SELECT chat_id FROM watched_groups").fetchall()]
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        rows = [[InlineKeyboardButton("✅ " + (title or str(cid)), callback_data=f"broadcast_toggle:{cid}")] for cid, title in groups[:30]]
+        rows += [[InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")], [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]]
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "broadcast_prepare":
+        selected = context.user_data.get("broadcast_selected_groups", [])
+        selected = [cid for cid in selected if await can_publish_to_live(context.bot, uid, cid)]
+        context.user_data["broadcast_selected_groups"] = selected
+        if not selected:
+            await q.answer("حدد قروبًا واحدًا على الأقل تملك صلاحية النشر فيه.", show_alert=True)
             return
         context.user_data["awaiting_broadcast"] = True
         await q.edit_message_text(
-            "📣 نشر إعلان في القروبات\n\n"
-            "أرسل الآن نص الإعلان أو صورة/فيديو/ملف مع التعليق في الخاص مع البوت.\n"
-            "سأعرض معاينة أولًا، ولن يُنشر شيء حتى تضغط تأكيد النشر.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data="broadcast_cancel")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+            "📣 أرسل الآن الإعلان في الخاص مع البوت (نص أو صورة أو فيديو أو ملف مع تعليق).\n"
+            f"سيتم النشر في {len(selected)} قروب محدد فقط، بعد المعاينة والتأكيد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
         )
         return
 
     if data == "broadcast_cancel":
-        if not is_owner(uid):
-            await q.answer("هذا الخيار للمالك الأساسي فقط.", show_alert=True)
-            return
         context.user_data.pop("awaiting_broadcast", None)
         context.user_data.pop("broadcast_draft", None)
+        context.user_data.pop("broadcast_selected_groups", None)
         await q.edit_message_text("تم إلغاء تجهيز الإعلان.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
         return
 
     if data == "broadcast_confirm":
-        if not is_owner(uid):
-            await q.answer("النشر العام للمالك الأساسي فقط.", show_alert=True)
-            return
         draft = context.user_data.get("broadcast_draft")
-        if not draft:
-            await q.edit_message_text("لا يوجد إعلان جاهز للنشر. ابدأ من جديد من لوحة التحكم.")
+        selected = context.user_data.get("broadcast_selected_groups", [])
+        selected = [cid for cid in selected if await can_publish_to_live(context.bot, uid, cid)]
+        if not (is_owner(uid) or is_delegated_owner(uid)) or not draft or not selected:
+            await q.edit_message_text("⛔ انتهت صلاحية الإعلان أو لا توجد قروبات مصرح بها. ابدأ من جديد.")
             return
-        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
         sent, failed = 0, 0
-        for chat_id, title in groups:
+        for chat_id in selected:
             try:
-                await context.bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=draft["chat_id"],
-                    message_id=draft["message_id"]
-                )
+                await context.bot.copy_message(chat_id=chat_id, from_chat_id=draft["chat_id"], message_id=draft["message_id"])
                 sent += 1
             except Exception as e:
                 failed += 1
                 log.warning("Broadcast failed for %s: %s", chat_id, e)
         context.user_data.pop("broadcast_draft", None)
         context.user_data.pop("awaiting_broadcast", None)
+        context.user_data.pop("broadcast_selected_groups", None)
         await q.edit_message_text(
-            f"✅ انتهى نشر الإعلان.\n\nوصل إلى: {sent} قروب\nتعذر النشر في: {failed} قروب\n\nملاحظة: يجب أن يكون البوت موجودًا في القروب ولديه صلاحية إرسال الرسائل.",
+            f"✅ انتهى النشر.\n\nوصل إلى: {sent} قروب\nتعذر النشر في: {failed} قروب\n\nملاحظة: يجب أن يكون البوت موجودًا في القروب ولديه صلاحية إرسال الرسائل.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إعلان آخر", callback_data="broadcast_start")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
         )
         return
@@ -1284,13 +1573,110 @@ async def callback(update, context):
         if not is_owner(uid):
             await q.edit_message_text("⛔ هذا القسم للمالك الأساسي فقط.")
             return
-        rows = db.execute("SELECT user_id FROM delegated_owners ORDER BY user_id").fetchall()
-        text = "👑 المالكون المفوضون\n\n"
-        text += "\n".join(f"• {r[0]}" for r in rows) if rows else "لا يوجد مالكون مفوضون."
-        text += "\n\nإضافة: /addowner\nحذف: /delowner"
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]
-        ]))
+        rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
+        text = "👑 المالكون المفوّضون وصلاحيات النشر\n\n"
+        text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in rows) if rows else "لا يوجد مالكون مفوّضون."
+        text += "\n\nاختر مالكًا مفوضًا لإدارة قروبات النشر المسموحة له.\nإضافة: /addowner\nعزل: /delowner USER_ID"
+        buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — صلاحيات النشر", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
+        buttons += [[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
+        await q.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("delegated_manage:"):
+        if not is_owner(uid):
+            await q.answer("إدارة صلاحيات المالك المفوض للمالك الأساسي فقط.", show_alert=True)
+            return
+        try: target_uid = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+        if not is_delegated_owner(target_uid) or is_owner(target_uid):
+            await q.edit_message_text("هذا المالك المفوض لم يعد مسجلًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")]])); return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        all_granted = bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone())
+        buttons = [[InlineKeyboardButton(("🌐 سحب صلاحية جميع القروبات" if all_granted else "🌐 منح صلاحية جميع القروبات"), callback_data=f"delegated_all:{target_uid}:{0 if all_granted else 1}")]]
+        for chat_id,title in groups[:30]:
+            granted = all_granted or bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,chat_id)).fetchone())
+            buttons.append([InlineKeyboardButton(("✅ " if granted else "⬜️ ") + (title or str(chat_id)), callback_data=f"pubperm_toggle:{target_uid}:{chat_id}")])
+        buttons += [[InlineKeyboardButton("🛑 عزل هذا المالك المفوض", callback_data=f"delegated_remove_confirm:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة المالكين", callback_data="delegated_owner")]]
+        await q.edit_message_text(f"👑 إدارة صلاحيات النشر\nالمالك المفوض: {user_display_name(target_uid)}\n\n✅ = لديه صلاحية النشر في القروب\n⬜️ = لا يملك صلاحية النشر", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("pubperm_toggle:"):
+        if not is_owner(uid):
+            await q.answer("هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+        try: _, target_raw, chat_raw = data.split(":", 2); target_uid=int(target_raw); chat_id=int(chat_raw)
+        except ValueError:
+            await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        if not is_delegated_owner(target_uid) or is_owner(target_uid):
+            await q.answer("المالك المفوض غير مسجل.", show_alert=True); return
+        group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+        if not group:
+            await q.answer("القروب غير مسجل.", show_alert=True); return
+        all_granted = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone()
+        exists = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,chat_id)).fetchone()
+        if all_granted:
+            # Convert wildcard to explicit grants for every registered group except this one.
+            db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+            for other_chat_id, in db.execute("SELECT chat_id FROM watched_groups WHERE chat_id!=?", (chat_id,)).fetchall():
+                db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,other_chat_id,uid,now()))
+            action = "تم سحب صلاحية النشر"
+        elif exists:
+            db.execute("DELETE FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,chat_id))
+            action = "تم سحب صلاحية النشر"
+        else:
+            db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,chat_id,uid,now()))
+            action = "تم منح صلاحية النشر"
+        db.commit()
+        await q.answer(action)
+        # Re-render permissions page.
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        all_granted = bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone())
+        buttons = [[InlineKeyboardButton(("🌐 سحب صلاحية جميع القروبات" if all_granted else "🌐 منح صلاحية جميع القروبات"), callback_data=f"delegated_all:{target_uid}:{0 if all_granted else 1}")]]
+        for cid,title in groups[:30]:
+            granted = all_granted or bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,cid)).fetchone())
+            buttons.append([InlineKeyboardButton(("✅ " if granted else "⬜️ ") + (title or str(cid)), callback_data=f"pubperm_toggle:{target_uid}:{cid}")])
+        buttons += [[InlineKeyboardButton("🛑 عزل هذا المالك المفوض", callback_data=f"delegated_remove_confirm:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة المالكين", callback_data="delegated_owner")]]
+        await q.edit_message_text(f"👑 إدارة صلاحيات النشر\nالمالك المفوض: {user_display_name(target_uid)}\n\n{action} للقروب: {group[0] or chat_id}\n✅ = لديه صلاحية النشر\n⬜️ = لا يملكها", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("delegated_all:"):
+        if not is_owner(uid):
+            await q.answer("هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+        try: _, target_raw, enable_raw = data.split(":", 2); target_uid=int(target_raw); enable=int(enable_raw)
+        except ValueError:
+            await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        if not is_delegated_owner(target_uid) or is_owner(target_uid):
+            await q.answer("المالك المفوض غير مسجل.", show_alert=True); return
+        if enable:
+            db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,0,?,?)", (target_uid,uid,now()))
+        else:
+            db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+        db.commit()
+        await q.answer("تم تحديث الصلاحية.")
+        # Reuse the management view by re-entering it.
+        await q.edit_message_text("تم تحديث الصلاحيات. افتح إدارة هذا المالك المفوض مجددًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↻ تحديث الصلاحيات", callback_data=f"delegated_manage:{target_uid}")], [InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")]]))
+        return
+
+    if data.startswith("delegated_remove_confirm:"):
+        if not is_owner(uid):
+            await q.answer("عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
+        try: target_uid=int(data.split(":",1)[1])
+        except ValueError:
+            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+        await q.edit_message_text(f"⚠️ هل تريد عزل {user_display_name(target_uid)} وإلغاء كل صلاحياته؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نعم، عزله", callback_data=f"delegated_remove:{target_uid}"), InlineKeyboardButton("لا، رجوع", callback_data=f"delegated_manage:{target_uid}")]]))
+        return
+
+    if data.startswith("delegated_remove:"):
+        if not is_owner(uid):
+            await q.answer("عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
+        try: target_uid=int(data.split(":",1)[1])
+        except ValueError:
+            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+        name = user_display_name(target_uid)
+        db.execute("DELETE FROM delegated_owners WHERE user_id=?", (target_uid,))
+        db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+        db.commit()
+        await q.edit_message_text(f"✅ تم عزل {name} وإلغاء جميع صلاحياته وتفويضات النشر.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
         return
 
     if data == "managers":
@@ -1356,6 +1742,7 @@ def main():
     command_handlers = {
         "start": start, "help": help_cmd, "panel": panel,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
+        "grantpublish": grantpublish, "revokepublish": revokepublish,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
         "addmanager": addmanager, "delmanager": delmanager, "managers": managers,
         "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
