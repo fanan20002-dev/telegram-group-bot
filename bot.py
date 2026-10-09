@@ -66,12 +66,39 @@ CREATE TABLE IF NOT EXISTS protection_managers(
     added_at TEXT
 )
 """)
+db.execute("""
+CREATE TABLE IF NOT EXISTS message_archive(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    chat_title TEXT,
+    user_id INTEGER,
+    username TEXT,
+    display_name TEXT,
+    message_id INTEGER,
+    message_text TEXT,
+    created_at TEXT
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS archive_settings(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS notification_preferences(
+    user_id INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(user_id,event)
+)
+""")
 db.commit()
 
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "games", "repeat",
-    "join_lock", "entry", "add_lock", "notifications", "markdown", "edit"
+    "join_lock", "entry", "add_lock", "notifications", "markdown", "edit", "archive"
 ]
 
 DEFAULTS = {field: 0 for field in SETTING_FIELDS}
@@ -197,12 +224,13 @@ def panel_markup(uid):
         [InlineKeyboardButton("👋 الترحيب", callback_data="welcome"),
          InlineKeyboardButton("🎮 الألعاب", callback_data="games")],
         [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
-         InlineKeyboardButton("👑 الصلاحيات", callback_data="permissions")],
-        [InlineKeyboardButton("📋 السجلات", callback_data="logs"),
-         InlineKeyboardButton("📢 التنبيهات", callback_data="alerts")],
-        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")]
+         InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
+        [InlineKeyboardButton("📢 الإشعارات", callback_data="alerts"),
+         InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")]
     ]
     if is_owner(uid):
+        rows.append([InlineKeyboardButton("👑 الصلاحيات والرتب", callback_data="permissions"),
+                     InlineKeyboardButton("📨 سجل الرسائل الخاص", callback_data="archive")])
         rows.append([InlineKeyboardButton("👑 المالك المفوّض", callback_data="delegated_owner")])
     return InlineKeyboardMarkup(rows)
 
@@ -266,17 +294,26 @@ async def start(update, context):
         await update.effective_message.reply_text("تم تشغيل البوت ✅\nاستخدم /panel للوحة التحكم.")
 
 async def help_cmd(update, context):
-    await update.effective_message.reply_text(
-        "📚 دليل البوت\n\n"
-        "👑 /panel — لوحة التحكم\n"
-        "👑 /addowner — مالك مفوّض (للمالك الأساسي)\n"
-        "🔨 /addmanager — مدير عام\n"
-        "🛡️ /addprotect — مدير حماية\n"
-        "👥 /managers — المدراء العامون\n"
-        "📊 الإحصائيات والتنبيهات من لوحة التحكم\n\n"
-        "أوامر الحماية العربية تعمل كرسائل عادية، مثل:\n"
+    uid = update.effective_user.id if update.effective_user else 0
+    text = (
+        "📚 دليل البوت العربي\n\n"
+        "🏠 /panel — لوحة التحكم (للمصرح لهم)\n"
+        "🆔 /id — عرض رقم حسابك\n"
+        "🆔 /idgroup — عرض رقم المجموعة\n"
+        "📊 الإحصائيات والسجلات من لوحة التحكم\n\n"
+        "أمثلة على أوامر الحماية العربية:\n"
         "منع الروابط\nمنع الصور\nمنع الفيديو\nمنع الملفات\nالسماح بالروابط"
     )
+    if is_owner(uid):
+        text += (
+            "\n\n👑 أوامر المالك الأساسي فقط:\n"
+            "/addowner — إضافة مالك مفوض\n/delowner — إزالة مالك مفوض\n"
+            "/addmanager — إضافة مدير عام\n/delmanager — إزالة مدير عام\n"
+            "/addprotect — إضافة مشرف حماية\n/delprotect — إزالة مشرف حماية\n"
+            "/archive_on — تفعيل أرشفة الرسائل بعد إعلانها\n"
+            "/archive_off — إيقاف أرشفة الرسائل\n/archive — عرض سجل الرسائل الخاص"
+        )
+    await update.effective_message.reply_text(text)
 
 async def panel(update, context):
     if not can_use_panel(update.effective_user.id):
@@ -362,7 +399,7 @@ async def delprotect(update, context):
     await update.effective_message.reply_text(f"✅ تم حذف مدير الحماية: {uid}")
 
 async def permissions_cmd(update, context):
-    if not can_use_panel(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ ليس لديك صلاحية.")
         return
     d = db.execute("SELECT COUNT(*) FROM delegated_owners").fetchone()[0]
@@ -417,6 +454,76 @@ async def managers(update, context):
     if OWNER_ID:
         text += f"\n\n👑 المالك: {OWNER_ID}"
     await update.effective_message.reply_text(text)
+
+async def notify_owners(context, text, event="general"):
+    recipients = {OWNER_ID} if OWNER_ID else set()
+    recipients.update(r[0] for r in db.execute("SELECT user_id FROM delegated_owners").fetchall())
+    for recipient in recipients:
+        pref = db.execute("SELECT enabled FROM notification_preferences WHERE user_id=? AND event=?", (recipient, event)).fetchone()
+        if pref and not pref[0]:
+            continue
+        try:
+            await context.bot.send_message(chat_id=recipient, text=text)
+        except Exception as exc:
+            log.info("تعذر إرسال إشعار إلى %s: %s", recipient, exc)
+
+def archive_is_enabled(chat_id):
+    row = db.execute("SELECT enabled FROM archive_settings WHERE chat_id=?", (chat_id,)).fetchone()
+    return bool(row and row[0])
+
+async def archive_on(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ هذا الأمر للمالك الأساسي فقط.")
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text("استخدم الأمر داخل المجموعة التي تريد تفعيل الأرشفة فيها.")
+        return
+    register_group(chat)
+    db.execute("INSERT OR REPLACE INTO archive_settings(chat_id,enabled) VALUES(?,1)", (chat.id,))
+    db.commit()
+    await update.effective_message.reply_text(
+        "⚠️ تم تفعيل تسجيل الرسائل الجديدة لهذه المجموعة.\n"
+        "يرجى إعلان ذلك لأعضاء المجموعة وفق قواعدها. أرسل /archive_off لإيقاف التسجيل."
+    )
+
+async def archive_off(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ هذا الأمر للمالك الأساسي فقط.")
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text("استخدم الأمر داخل المجموعة.")
+        return
+    db.execute("INSERT OR REPLACE INTO archive_settings(chat_id,enabled) VALUES(?,0)", (chat.id,))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم إيقاف تسجيل الرسائل الجديدة لهذه المجموعة.")
+
+async def archive_cmd(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ سجل الرسائل خاص بالمالك الأساسي فقط.")
+        return
+    if context.args:
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("استخدم: /archive أو /archive رقم_المجموعة")
+            return
+    else:
+        await update.effective_message.reply_text("استخدم /archive رقم_المجموعة لعرض أحدث الرسائل المسجلة. تحصل على رقم المجموعة عبر /idgroup داخلها.")
+        return
+    rows = db.execute(
+        "SELECT chat_title,display_name,username,message_text,created_at FROM message_archive WHERE chat_id=? ORDER BY id DESC LIMIT 20",
+        (chat_id,)
+    ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("لا توجد رسائل مسجلة لهذه المجموعة.")
+        return
+    parts = ["📨 أحدث الرسائل المسجلة (للمالك الأساسي فقط):"]
+    for title, name, username, body, created in rows:
+        parts.append(f"\n📍 {title or chat_id}\n👤 {name or 'عضو'} {('@'+username) if username else ''}\n🕒 {created}\n💬 {(body or '[رسالة غير نصية]')[:500]}")
+    output = "\n".join(parts)
+    await update.effective_message.reply_text(output[:4000])
 
 async def id_cmd(update, context):
     await update.effective_message.reply_text(f"🆔 رقمك: {update.effective_user.id}")
@@ -653,7 +760,15 @@ async def message_filter(update, context):
     if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     uid = msg.from_user.id if msg.from_user else 0
-    # Owners/managers are exempt from automatic content deletion.
+    register_group(chat)
+    if msg.from_user and not msg.from_user.is_bot and archive_is_enabled(chat.id):
+        body = msg.text or msg.caption or "[رسالة غير نصية]"
+        db.execute(
+            "INSERT INTO message_archive(chat_id,chat_title,user_id,username,display_name,message_id,message_text,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (chat.id, chat.title or "", uid, msg.from_user.username or "", msg.from_user.full_name or "", msg.message_id, body[:3000], now())
+        )
+        db.commit()
+    # المدراء معفيون من فلاتر الحذف التلقائي.
     if is_manager(uid):
         return
     s = get_settings(chat.id)
@@ -722,6 +837,13 @@ async def chat_member_handler(update, context):
     s = get_settings(chat_id)
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
+    member = cm.new_chat_member.user
+    if member and old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
+        await notify_owners(context, f"🚪 مغادرة عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
+    if member and member.is_bot and member.id == context.bot.id and old in ("left", "kicked") and new in ("member", "administrator"):
+        await notify_owners(context, f"📡 تمت إضافة البوت إلى مجموعة\nالمجموعة: {cm.chat.title or chat_id}\nالمعرّف: {chat_id}\nالحالة: {new}", "groups")
+    if member and member.is_bot and member.id == context.bot.id and new in ("left", "kicked"):
+        await notify_owners(context, f"⚠️ أُزيل البوت أو حُظر من مجموعة\nالمجموعة: {cm.chat.title or chat_id}\nالمعرّف: {chat_id}", "groups")
     # Welcome / entry message deletion is handled by service messages.
     if s["entry"] and new == "member" and old in ("left", "kicked"):
         # Telegram may not allow deleting every service message in every chat state.
@@ -736,6 +858,9 @@ async def new_members(update, context):
         return
     register_group(update.effective_chat)
     s = get_settings(update.effective_chat.id)
+    for member in msg.new_chat_members:
+        if not member.is_bot:
+            await notify_owners(context, f"👋 دخول عضو جديد\nالمجموعة: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
     if s["entry"]:
         try:
             await msg.delete()
@@ -876,7 +1001,7 @@ async def callback(update, context):
         return
 
     if data == "permissions":
-        if not can_use_panel(uid):
+        if not is_owner(uid):
             await q.edit_message_text("⛔ ليس لديك صلاحية الصلاحيات.")
             return
         d = db.execute("SELECT COUNT(*) FROM delegated_owners").fetchone()[0]
@@ -895,6 +1020,34 @@ async def callback(update, context):
             [InlineKeyboardButton("👑 المالكون المفوضون", callback_data="delegated_owner")],
             [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]
         ]))
+        return
+
+    if data == "archive":
+        if not is_owner(uid):
+            await q.edit_message_text("⛔ سجل الرسائل خاص بالمالك الأساسي فقط.")
+            return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        rows = [[InlineKeyboardButton(f"📨 {title or chat_id}", callback_data=f"archive_group:{chat_id}")] for chat_id, title in groups[:30]]
+        if not rows:
+            rows = [[InlineKeyboardButton("لا توجد مجموعات مسجلة", callback_data="noop")]]
+        rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        await q.edit_message_text("📨 سجل الرسائل الخاص\nاختر مجموعة لعرض آخر الرسائل المسجلة. الأرشفة متوقفة افتراضيًا، وتُفعّل داخل المجموعة بالأمر /archive_on بعد إعلان ذلك للأعضاء.", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("archive_group:"):
+        if not is_owner(uid):
+            await q.answer("هذا السجل للمالك الأساسي فقط.", show_alert=True)
+            return
+        chat_id = int(data.split(":", 1)[1])
+        rows = db.execute("SELECT chat_title,display_name,username,message_text,created_at FROM message_archive WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,)).fetchall()
+        if not rows:
+            text = "لا توجد رسائل مسجلة لهذه المجموعة. تأكد من تفعيل الأرشفة داخلها بالأمر /archive_on بعد إعلام الأعضاء."
+        else:
+            lines = ["📨 أحدث الرسائل المسجلة — للمالك الأساسي فقط"]
+            for title, name, username, body, created in rows:
+                lines.append(f"\n📍 {title or chat_id}\n👤 {name or 'عضو'} {('@'+username) if username else ''}\n🕒 {created}\n💬 {(body or '[رسالة غير نصية]')[:250]}")
+            text = "\n".join(lines)[:3900]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ سجل الرسائل", callback_data="archive")],[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
         return
 
     if data == "delegated_owner":
@@ -977,7 +1130,8 @@ def main():
         "addmanager": addmanager, "delmanager": delmanager, "managers": managers,
         "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
         "kick": kick, "mute": mute, "unmute": unmute, "del": del_cmd, "pin": pin,
-        "alerts": alerts, "logs": logs_cmd, "settings": settings_cmd, "locks": locks
+        "alerts": alerts, "logs": logs_cmd, "settings": settings_cmd, "locks": locks,
+        "archive": archive_cmd, "archive_on": archive_on, "archive_off": archive_off
     }
     for name, fn in command_handlers.items():
         app.add_handler(CommandHandler(name, fn))
@@ -986,6 +1140,7 @@ def main():
         app.add_handler(CommandHandler(cmd, set_lock))
 
     app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members), group=1)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ArabicTextCommand), group=2)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_filter), group=3)
