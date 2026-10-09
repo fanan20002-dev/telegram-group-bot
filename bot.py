@@ -252,14 +252,16 @@ def panel_markup(uid):
 
 def settings_page_markup(chat_id, page=0):
     items = [
-        ("الروابط", "links"), ("الكيبورد", "keyboard"),
+        ("الروابط", "links"), ("الكلايش", "markdown"), ("الكيبورد", "keyboard"),
         ("الأغاني", "audio"), ("المتحركة", "gif"), ("الملفات", "files"),
-        ("الدردشة", "repeat"), ("الفيديو", "videos"), ("الصور", "photos"),
+        ("الدردشة / التكرار", "repeat"), ("الفيديو", "videos"), ("الصور", "photos"),
         ("المعرفات", "username"), ("التاك", "tag"), ("البوتات", "bots"),
         ("الألعاب", "games"), ("الملصقات", "stickers"), ("التعديل", "edit"),
         ("رسائل الدخول", "entry"), ("الإضافة", "add_lock"),
-        ("الإشعارات", "notifications"), ("الماركداون", "markdown"),
-        ("الدخول", "join_lock"), ("إظهار دليل الأوامر للأعضاء", "public_commands"),
+        ("الإشعارات", "notifications"), ("الدخول", "join_lock"),
+        ("التوجيه", "keyboard"), ("الصوت", "audio"), ("الجهات", "username"),
+        ("بصمة فيديو", "videos"), ("التثبيت", "markdown"),
+        ("إظهار دليل الأوامر للأعضاء", "public_commands"),
         ("إظهار نشاط الأعضاء", "public_activity"), ("إظهار أنظمة الحماية للأعضاء", "public_protection")
     ]
     per_page = 12
@@ -788,13 +790,48 @@ async def ArabicTextCommand(update, context):
     if text in {"اعدادات", "إعدادات", "اعدادات البوت", "إعدادات البوت", "مساعدة", "اوامر البوت", "أوامر البوت"}:
         await public_settings(update, context)
         return
-    if not is_manager(update.effective_user.id):
+    # Mass delete: "مسح 1" through "مسح 500". Only authorized roles may execute.
+    match = re.fullmatch(r"مسح\s+(\d{1,3})", text)
+    if match:
+        if not (is_owner(update.effective_user.id) or is_delegated_owner(update.effective_user.id)
+                or is_general_manager(update.effective_user.id) or is_protection_manager(update.effective_user.id)):
+            await update.effective_message.reply_text("⛔ ليس لديك صلاحية مسح الرسائل.")
+            return
+        count = int(match.group(1))
+        if not 1 <= count <= 500:
+            await update.effective_message.reply_text("⚠️ استخدم عددًا من 1 إلى 500، مثل: مسح 50")
+            return
+        chat_id = update.effective_chat.id
+        ids = list(recent_message_ids[chat_id])
+        # Exclude the command message itself, and delete most recent observed messages only.
+        ids = [mid for mid in ids if mid != update.effective_message.message_id][-count:]
+        deleted = 0
+        failed = 0
+        for mid in reversed(ids):
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                deleted += 1
+            except Exception as exc:
+                failed += 1
+                log.info("Bulk delete skipped message %s in %s: %s", mid, chat_id, exc)
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+        try:
+            report = await context.bot.send_message(chat_id, f"🗑️ اكتملت عملية المسح.\nتم حذف: {deleted} رسالة\nتعذر حذف: {failed} رسالة\n\nملاحظة: يستطيع البوت مسح الرسائل التي رصدها منذ تشغيله فقط، ولا يستطيع جلب سجل الرسائل القديم من تيليجرام.")
+        except Exception:
+            report = None
+        log_action(chat_id, update.effective_user.id, "bulk_delete", f"requested={count};deleted={deleted};failed={failed}")
+        return
+    if not (is_general_manager(update.effective_user.id) or is_protection_manager(update.effective_user.id)):
         return
     if text in ARABIC_ALIASES:
         field, value = ARABIC_ALIASES[text]
         await set_lock(update, context, field, value)
 
 recent_messages = defaultdict(lambda: deque(maxlen=6))
+recent_message_ids = defaultdict(lambda: deque(maxlen=500))
 
 def has_link(text):
     return bool(text and re.search(r"(https?://|www\.|t\.me/|telegram\.me/)", text, re.I))
@@ -809,6 +846,8 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
+    # The Bot API cannot read old chat history; retain IDs of messages observed while running.
+    recent_message_ids[chat.id].append(msg.message_id)
     if msg.from_user and not msg.from_user.is_bot:
         db.execute("INSERT INTO member_activity(chat_id,user_id,display_name,message_count,stars,custom_title) VALUES(?,?,?,?,?, '') ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name, message_count=member_activity.message_count+1, stars=CAST((member_activity.message_count+1)/10 AS INTEGER)", (chat.id, uid, msg.from_user.full_name or "عضو", 1, 0))
         db.commit()
@@ -983,6 +1022,7 @@ async def callback(update, context):
                   "🔓 /unban — فك الحظر باستخدام المعرّف",
                   "🔇 /mute و /unmute — تقييد/إلغاء تقييد عضو",
                   "🗑️ /del — حذف رسالة (بالرد عليها)",
+                  "🧹 مسح 1 إلى مسح 500 — مسح الرسائل التي رصدها البوت منذ تشغيله (للمصرح لهم)",
                   "📌 /pin — تثبيت رسالة (بالرد عليها)",
                   "📋 /logs — عرض سجل العمليات للمدير المصرح", "",
                   "🔐 عرض الأوامر لا يمنح صلاحية استخدامها؛ التنفيذ يقتصر على المصرح لهم، وقد يتطلب منح البوت صلاحيات مشرف.",
