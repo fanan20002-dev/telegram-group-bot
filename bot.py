@@ -5,7 +5,7 @@ import threading
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ChatType
@@ -231,12 +231,13 @@ def panel_markup(uid):
     if is_owner(uid):
         rows.append([InlineKeyboardButton("👑 الصلاحيات والرتب", callback_data="permissions"),
                      InlineKeyboardButton("📨 سجل الرسائل الخاص", callback_data="archive")])
+        rows.append([InlineKeyboardButton("📣 نشر إعلان بالقروبات", callback_data="broadcast_start")])
         rows.append([InlineKeyboardButton("👑 المالك المفوّض", callback_data="delegated_owner")])
     return InlineKeyboardMarkup(rows)
 
 def settings_page_markup(chat_id, page=0):
     items = [
-        ("الروابط", "links"), ("الكلايش", "username"), ("الكيبورد", "keyboard"),
+        ("الروابط", "links"), ("الكيبورد", "keyboard"),
         ("الأغاني", "audio"), ("المتحركة", "gif"), ("الملفات", "files"),
         ("الدردشة", "repeat"), ("الفيديو", "videos"), ("الصور", "photos"),
         ("المعرفات", "username"), ("التاك", "tag"), ("البوتات", "bots"),
@@ -834,6 +835,7 @@ async def chat_member_handler(update, context):
     if not cm or not cm.chat:
         return
     chat_id = cm.chat.id
+    register_group(cm.chat)
     s = get_settings(chat_id)
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
@@ -880,11 +882,33 @@ async def service_add_handler(update, context):
         except Exception:
             pass
 
+async def broadcast_draft_message(update, context):
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat or chat.type != ChatType.PRIVATE:
+        return
+    if not is_owner(user.id) or not context.user_data.get("awaiting_broadcast"):
+        return
+    context.user_data["broadcast_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
+    await msg.reply_text(
+        "👀 معاينة الإعلان جاهزة. هل تريد نشر هذه الرسالة في جميع القروبات المسجلة؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأكيد النشر للجميع", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]
+        ])
+    )
+    context.user_data["awaiting_broadcast"] = False
+
 async def callback(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "noop" or data.startswith("noop:"):
+        await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
+        return
 
     if data == "home":
         if not can_use_panel(uid):
@@ -1022,6 +1046,57 @@ async def callback(update, context):
         ]))
         return
 
+    if data == "broadcast_start":
+        if not is_owner(uid):
+            await q.answer("النشر العام للمالك الأساسي فقط.", show_alert=True)
+            return
+        context.user_data["awaiting_broadcast"] = True
+        await q.edit_message_text(
+            "📣 نشر إعلان في القروبات\n\n"
+            "أرسل الآن نص الإعلان أو صورة/فيديو/ملف مع التعليق في الخاص مع البوت.\n"
+            "سأعرض معاينة أولًا، ولن يُنشر شيء حتى تضغط تأكيد النشر.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data="broadcast_cancel")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+        )
+        return
+
+    if data == "broadcast_cancel":
+        if not is_owner(uid):
+            await q.answer("هذا الخيار للمالك الأساسي فقط.", show_alert=True)
+            return
+        context.user_data.pop("awaiting_broadcast", None)
+        context.user_data.pop("broadcast_draft", None)
+        await q.edit_message_text("تم إلغاء تجهيز الإعلان.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
+        return
+
+    if data == "broadcast_confirm":
+        if not is_owner(uid):
+            await q.answer("النشر العام للمالك الأساسي فقط.", show_alert=True)
+            return
+        draft = context.user_data.get("broadcast_draft")
+        if not draft:
+            await q.edit_message_text("لا يوجد إعلان جاهز للنشر. ابدأ من جديد من لوحة التحكم.")
+            return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        sent, failed = 0, 0
+        for chat_id, title in groups:
+            try:
+                await context.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=draft["chat_id"],
+                    message_id=draft["message_id"]
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                log.warning("Broadcast failed for %s: %s", chat_id, e)
+        context.user_data.pop("broadcast_draft", None)
+        context.user_data.pop("awaiting_broadcast", None)
+        await q.edit_message_text(
+            f"✅ انتهى نشر الإعلان.\n\nوصل إلى: {sent} قروب\nتعذر النشر في: {failed} قروب\n\nملاحظة: يجب أن يكون البوت موجودًا في القروب ولديه صلاحية إرسال الرسائل.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إعلان آخر", callback_data="broadcast_start")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+        )
+        return
+
     if data == "archive":
         if not is_owner(uid):
             await q.edit_message_text("⛔ سجل الرسائل خاص بالمالك الأساسي فقط.")
@@ -1116,7 +1191,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 def main():
     if not TOKEN:
@@ -1140,12 +1215,17 @@ def main():
         app.add_handler(CommandHandler(cmd, set_lock))
 
     app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, broadcast_draft_message), group=-1)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members), group=1)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ArabicTextCommand), group=2)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_filter), group=3)
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, edited_filter), group=4)
-    app.add_error_handler(lambda update, context: log.error("Update error: %s", context.error))
+    async def error_handler(update, context):
+        # python-telegram-bot awaits error callbacks; keep this handler async.
+        log.error("Update error: %s", context.error, exc_info=context.error)
+
+    app.add_error_handler(error_handler)
 
     threading.Thread(target=start_health_server, daemon=True).start()
     log.info("Bot started")
