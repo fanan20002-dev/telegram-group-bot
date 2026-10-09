@@ -961,14 +961,33 @@ async def callback(update, context):
         return
 
     if data == "public:commands":
-        await q.edit_message_text(
-            "📚 أوامر البوت المتاحة\n\n"
-            "🆔 /id — عرض رقم حسابك\n"
-            "🆔 /idgroup — عرض رقم القروب\n"
-            "⚙️ /settings — فتح دليل المساعدة\n\n"
-            "🔐 أوامر الإدارة لا تعمل إلا للمصرح لهم.\n"
-            "⬅️ اكتب «اعدادات» للعودة إلى قائمة المساعدة."
-        )
+        chat_id = q.message.chat.id
+        settings = get_settings(chat_id)
+        lines = ["📚 أوامر البوت المتاحة للأعضاء", "", "🆔 /id — عرض رقم حسابك",
+                 "🆔 /idgroup — عرض رقم القروب", "⚙️ /settings — فتح دليل المساعدة", ""]
+        if settings.get("public_protection", 1):
+            lines += ["🛡️ أوامر الحماية (للمصرح لهم فقط):",
+                      "🔗 /locklinks و /unlocklinks — قفل/فتح الروابط",
+                      "🖼️ /lockphoto و /unlockphoto — قفل/فتح الصور",
+                      "🎥 /lockvideo و /unlockvideo — قفل/فتح الفيديو",
+                      "🔊 /lockaudio و /unlockaudio — قفل/فتح الصوت",
+                      "📁 /lockfile و /unlockfile — قفل/فتح الملفات",
+                      "🎭 /lockstickers و /unlockstickers — قفل/فتح الملصقات",
+                      "🎞️ /lockgif و /unlockgif — قفل/فتح الصور المتحركة",
+                      "🏷️ /locktag و /unlocktag — منع/السماح بالإشارات",
+                      "🔁 /lockrepeat و /unlockrepeat — منع/السماح بالتكرار",
+                      "🎮 /lockgames و /unlockgames — قفل/فتح الألعاب", ""]
+        lines += ["👥 أوامر الإدارة (للمصرح لهم فقط):",
+                  "🔨 /kick — طرد عضو (بالرد على رسالته)",
+                  "🚫 /ban — حظر عضو (بالرد أو بالمعرّف)",
+                  "🔓 /unban — فك الحظر باستخدام المعرّف",
+                  "🔇 /mute و /unmute — تقييد/إلغاء تقييد عضو",
+                  "🗑️ /del — حذف رسالة (بالرد عليها)",
+                  "📌 /pin — تثبيت رسالة (بالرد عليها)",
+                  "📋 /logs — عرض سجل العمليات للمدير المصرح", "",
+                  "🔐 عرض الأوامر لا يمنح صلاحية استخدامها؛ التنفيذ يقتصر على المصرح لهم، وقد يتطلب منح البوت صلاحيات مشرف.",
+                  "⬅️ اكتب «اعدادات» للعودة إلى قائمة المساعدة."]
+        await q.edit_message_text("\n".join(lines)[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ اعدادات", callback_data="public:back")]]))
         return
     if data == "public:activity":
         chat_id = q.message.chat.id
