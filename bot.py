@@ -86,6 +86,17 @@ CREATE TABLE IF NOT EXISTS archive_settings(
 )
 """)
 db.execute("""
+CREATE TABLE IF NOT EXISTS member_activity(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    display_name TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    stars INTEGER NOT NULL DEFAULT 0,
+    custom_title TEXT DEFAULT '',
+    PRIMARY KEY(chat_id,user_id)
+)
+""")
+db.execute("""
 CREATE TABLE IF NOT EXISTS notification_preferences(
     user_id INTEGER NOT NULL,
     event TEXT NOT NULL,
@@ -98,11 +109,15 @@ db.commit()
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "games", "repeat",
-    "join_lock", "entry", "add_lock", "notifications", "markdown", "edit", "archive"
+    "join_lock", "entry", "add_lock", "notifications", "markdown", "edit", "archive",
+    "public_commands", "public_activity", "public_protection"
 ]
 
 DEFAULTS = {field: 0 for field in SETTING_FIELDS}
 DEFAULTS["notifications"] = 1
+DEFAULTS["public_commands"] = 1
+DEFAULTS["public_activity"] = 1
+DEFAULTS["public_protection"] = 1
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -244,7 +259,8 @@ def settings_page_markup(chat_id, page=0):
         ("الألعاب", "games"), ("الملصقات", "stickers"), ("التعديل", "edit"),
         ("رسائل الدخول", "entry"), ("الإضافة", "add_lock"),
         ("الإشعارات", "notifications"), ("الماركداون", "markdown"),
-        ("الدخول", "join_lock")
+        ("الدخول", "join_lock"), ("إظهار دليل الأوامر للأعضاء", "public_commands"),
+        ("إظهار نشاط الأعضاء", "public_activity"), ("إظهار أنظمة الحماية للأعضاء", "public_protection")
     ]
     per_page = 12
     pages = max(1, (len(items) + per_page - 1) // per_page)
@@ -302,8 +318,9 @@ async def help_cmd(update, context):
         "🆔 /id — عرض رقم حسابك\n"
         "🆔 /idgroup — عرض رقم المجموعة\n"
         "📊 الإحصائيات والسجلات من لوحة التحكم\n\n"
-        "أمثلة على أوامر الحماية العربية:\n"
-        "منع الروابط\nمنع الصور\nمنع الفيديو\nمنع الملفات\nالسماح بالروابط"
+        "أوامر الأعضاء: /id و /idgroup و /settings.\n"
+        "أوامر الإدارة العربية (للمصرح لهم): منع الروابط، السماح بالروابط، منع الصور، السماح بالصور، منع الفيديو، السماح بالفيديو، منع الملفات، السماح بالملفات، منع الملصقات، السماح بالملصقات، منع التكرار، السماح بالتكرار.\n"
+        "تُعرض الأوامر العامة بحسب إعدادات المجموعة."
     )
     if is_owner(uid):
         text += (
@@ -707,8 +724,35 @@ async def locks(update, context):
         reply_markup=settings_page_markup(update.effective_chat.id, 0)
     )
 
+async def public_settings(update, context):
+    """Public, Arabic help menu for every group member; never exposes admin controls."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text(
+            "📚 دليل البوت العربي\n\n"
+            "⚙️ اكتب «اعدادات» داخل القروب لعرض هذا الدليل.\n"
+            "🛡️ لوحة الإدارة والصلاحيات الخاصة تظهر للمصرح لهم فقط."
+        )
+        return
+    register_group(chat)
+    settings = get_settings(chat.id)
+    buttons = []
+    if settings.get("public_commands", 1):
+        buttons.append(InlineKeyboardButton("📚 أوامر البوت", callback_data="public:commands"))
+    if settings.get("public_activity", 1):
+        buttons.append(InlineKeyboardButton("⭐ نشاط الأعضاء", callback_data="public:activity"))
+    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
+    if settings.get("public_protection", 1):
+        rows.append([InlineKeyboardButton("🛡️ أنظمة الحماية", callback_data="public:protection")])
+    text = "⚙️ إعدادات ومساعدة القروب\n\n👋 أهلًا بك! هذه القائمة متاحة لجميع الأعضاء.\n\n🔐 إدارة القروب وتغيير الإعدادات والصلاحيات محصورة بالمصرح لهم."
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
 async def settings_cmd(update, context):
-    await locks(update, context)
+    # /settings is a public help entry point; admin controls stay behind /panel.
+    await public_settings(update, context)
 
 async def alerts(update, context):
     if not await require_admin(update): return
@@ -740,9 +784,12 @@ async def ArabicTextCommand(update, context):
         return
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
+    text = (update.effective_message.text or "").strip().lower()
+    if text in {"اعدادات", "إعدادات", "اعدادات البوت", "إعدادات البوت", "مساعدة", "اوامر البوت", "أوامر البوت"}:
+        await public_settings(update, context)
+        return
     if not is_manager(update.effective_user.id):
         return
-    text = (update.effective_message.text or "").strip().lower()
     if text in ARABIC_ALIASES:
         field, value = ARABIC_ALIASES[text]
         await set_lock(update, context, field, value)
@@ -762,6 +809,9 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
+    if msg.from_user and not msg.from_user.is_bot:
+        db.execute("INSERT INTO member_activity(chat_id,user_id,display_name,message_count,stars,custom_title) VALUES(?,?,?,?,?, '') ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name, message_count=member_activity.message_count+1, stars=CAST((member_activity.message_count+1)/10 AS INTEGER)", (chat.id, uid, msg.from_user.full_name or "عضو", 1, 0))
+        db.commit()
     if msg.from_user and not msg.from_user.is_bot and archive_is_enabled(chat.id):
         body = msg.text or msg.caption or "[رسالة غير نصية]"
         db.execute(
@@ -908,6 +958,52 @@ async def callback(update, context):
 
     if data == "noop" or data.startswith("noop:"):
         await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
+        return
+
+    if data == "public:commands":
+        await q.edit_message_text(
+            "📚 أوامر البوت المتاحة\n\n"
+            "🆔 /id — عرض رقم حسابك\n"
+            "🆔 /idgroup — عرض رقم القروب\n"
+            "⚙️ /settings — فتح دليل المساعدة\n\n"
+            "🔐 أوامر الإدارة لا تعمل إلا للمصرح لهم.\n"
+            "⬅️ اكتب «اعدادات» للعودة إلى قائمة المساعدة."
+        )
+        return
+    if data == "public:activity":
+        chat_id = q.message.chat.id
+        settings = get_settings(chat_id)
+        if not settings.get("public_activity", 1):
+            await q.edit_message_text("⭐ عرض نشاط الأعضاء غير متاح حاليًا.")
+            return
+        rows = db.execute("SELECT display_name,message_count,stars,custom_title FROM member_activity WHERE chat_id=? ORDER BY message_count DESC, stars DESC LIMIT 15", (chat_id,)).fetchall()
+        if rows:
+            lines = ["⭐ ترتيب نشاط الأعضاء (آخر 15 عضوًا):", ""]
+            for i, (name, count, stars, title) in enumerate(rows, 1):
+                label = title or ("عضو نشط" if count >= 20 else "عضو متفاعل" if count >= 5 else "عضو")
+                lines.append(f"{i}. {name or 'عضو'} — 💬 {count} رسالة — ⭐ {stars} — 🏷️ {label}")
+            text = "\n".join(lines)
+        else:
+            text = "⭐ لا توجد إحصائيات بعد. سيبدأ العد من الرسائل التي يستقبلها البوت من الآن."
+        text += "\n\nℹ️ النجوم والألقاب للتشجيع فقط ولا تمنح صلاحيات إدارية."
+        await q.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ اعدادات", callback_data="public:back")]]))
+        return
+    if data == "public:back":
+        # Rebuild the public menu in the same group.
+        settings = get_settings(q.message.chat.id)
+        buttons = []
+        if settings.get("public_commands", 1): buttons.append(InlineKeyboardButton("📚 أوامر البوت", callback_data="public:commands"))
+        if settings.get("public_activity", 1): buttons.append(InlineKeyboardButton("⭐ نشاط الأعضاء", callback_data="public:activity"))
+        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
+        if settings.get("public_protection", 1): rows.append([InlineKeyboardButton("🛡️ أنظمة الحماية", callback_data="public:protection")])
+        await q.edit_message_text("⚙️ إعدادات ومساعدة القروب\n\n👋 قائمة عامة للأعضاء.\n🔐 إدارة الإعدادات والصلاحيات للمصرح لهم فقط.", reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+        return
+    if data == "public:protection":
+        await q.edit_message_text(
+            "🛡️ أنظمة الحماية\n\n"
+            "يمكن للمصرح لهم ضبط منع الروابط والصور والفيديو والملفات والملصقات والتكرار من لوحة الإدارة.\n"
+            "🔐 لا يستطيع العضو تغيير إعدادات الحماية."
+        )
         return
 
     if data == "home":
