@@ -186,6 +186,95 @@ DEFAULTS["public_commands"] = 1
 DEFAULTS["public_activity"] = 1
 DEFAULTS["public_protection"] = 1
 
+
+# ردود آلية قابلة للتخصيص لكل قروب، محفوظة في SQLite.
+db.execute("""CREATE TABLE IF NOT EXISTS auto_reply_settings(
+    chat_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS auto_replies(
+    chat_id INTEGER NOT NULL, trigger_text TEXT NOT NULL, reply_text TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(chat_id, trigger_text)
+)""")
+db.commit()
+
+DEFAULT_AUTO_REPLIES = [
+    ("شكراً", "العفو، حياك الله 🌹"),
+    ("صباح الخير", "صباح النور والسرور ☀️"),
+    ("مساء الخير", "مساء النور والورد 🌙"),
+    ("جزاك الله خير", "وإياك، بارك الله فيك 🤍"),
+    ("قوانين القروب", "📌 يرجى الالتزام بقوانين القروب واحترام الجميع."),
+    ("مساعدة", "🤖 حياك الله! اكتب /help لمعرفة الأوامر المتاحة."),
+    ("من معاي", "الذكاء الاصطناعي"),
+]
+_auto_reply_last = {}
+_AUTO_REPLY_COOLDOWN_SECONDS = 30
+
+def normalize_auto_reply(text):
+    text = (text or "").strip().lower()
+    text = re.sub(r"[\u064b-\u065f\u0670ـ]", "", text)
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+def ensure_auto_replies(chat_id):
+    db.execute("INSERT OR IGNORE INTO auto_reply_settings(chat_id,enabled) VALUES(?,1)", (chat_id,))
+    for trigger, reply in DEFAULT_AUTO_REPLIES:
+        db.execute("INSERT OR IGNORE INTO auto_replies(chat_id,trigger_text,reply_text,enabled) VALUES(?,?,?,1)", (chat_id, trigger, reply))
+    db.commit()
+
+async def auto_replies_on(update, context):
+    if not await require_admin(update): return
+    chat_id = update.effective_chat.id
+    ensure_auto_replies(chat_id)
+    db.execute("UPDATE auto_reply_settings SET enabled=1 WHERE chat_id=?", (chat_id,)); db.commit()
+    log_action(chat_id, update.effective_user.id, "auto_replies", "enabled")
+    await update.effective_message.reply_text("🤖 تم تشغيل الردود الآلية في هذا القروب.")
+
+async def auto_replies_off(update, context):
+    if not await require_admin(update): return
+    chat_id = update.effective_chat.id
+    ensure_auto_replies(chat_id)
+    db.execute("UPDATE auto_reply_settings SET enabled=0 WHERE chat_id=?", (chat_id,)); db.commit()
+    log_action(chat_id, update.effective_user.id, "auto_replies", "disabled")
+    await update.effective_message.reply_text("⏸️ تم إيقاف الردود الآلية في هذا القروب.")
+
+async def auto_replies_list(update, context):
+    if not await require_admin(update): return
+    chat_id = update.effective_chat.id
+    ensure_auto_replies(chat_id)
+    state = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (chat_id,)).fetchone()
+    rows = db.execute("SELECT trigger_text,reply_text,enabled FROM auto_replies WHERE chat_id=? ORDER BY trigger_text", (chat_id,)).fetchall()
+    lines = ["🤖 الردود الآلية: " + ("مفعّلة" if state and state[0] else "متوقفة"), ""]
+    lines.extend(f"{'✅' if enabled else '⏸️'} {trigger} ← {reply}" for trigger,reply,enabled in rows)
+    lines += ["", "تشغيل: /autoreplies_on | إيقاف: /autoreplies_off", "إضافة: /addreply كلمة | الرد"]
+    await update.effective_message.reply_text("\n".join(lines)[:3900])
+
+async def add_auto_reply(update, context):
+    if not await require_admin(update): return
+    raw = (update.effective_message.text or "").partition(" ")[2].strip()
+    if "|" not in raw:
+        await update.effective_message.reply_text("استخدم: /addreply كلمة أو عبارة | الرد التلقائي"); return
+    trigger, reply = (part.strip() for part in raw.split("|", 1))
+    if not trigger or not reply or len(trigger) > 100 or len(reply) > 1000:
+        await update.effective_message.reply_text("❌ تأكد من كتابة العبارة والرد، وبحد أقصى 100 حرف للعبارة و1000 للرد."); return
+    chat_id = update.effective_chat.id
+    ensure_auto_replies(chat_id)
+    db.execute("INSERT INTO auto_replies(chat_id,trigger_text,reply_text,enabled) VALUES(?,?,?,1) ON CONFLICT(chat_id,trigger_text) DO UPDATE SET reply_text=excluded.reply_text,enabled=1", (chat_id, trigger, reply)); db.commit()
+    log_action(chat_id, update.effective_user.id, "auto_reply_added", trigger)
+    await update.effective_message.reply_text(f"✅ تم حفظ الرد الآلي.\n🗣️ العبارة: {trigger}\n💬 الرد: {reply}")
+
+async def delete_auto_reply(update, context):
+    if not await require_admin(update): return
+    trigger = " ".join(context.args).strip()
+    if not trigger:
+        await update.effective_message.reply_text("استخدم: /delreply العبارة"); return
+    chat_id = update.effective_chat.id
+    cur = db.execute("DELETE FROM auto_replies WHERE chat_id=? AND trigger_text=?", (chat_id, trigger)); db.commit()
+    if cur.rowcount:
+        log_action(chat_id, update.effective_user.id, "auto_reply_deleted", trigger)
+        await update.effective_message.reply_text("🗑️ تم حذف الرد الآلي.")
+    else: await update.effective_message.reply_text("لم أجد عبارة مطابقة. استخدم /autoreplies لعرض الردود.")
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -270,10 +359,10 @@ def can_publish_to(uid, chat_id):
     ).fetchone())
 
 async def can_publish_to_live(bot, uid, chat_id):
-    """المالك المفوض ينشر فقط في القروبات المسجلة التي هو عضو فيها فعليًا."""
+    """النشر للمالك الأساسي، وللمفوّض فقط في القروبات الممنوحة له والمُسجّلة التي هو عضو فيها."""
     if is_owner(uid):
         return True
-    if not is_delegated_owner(uid):
+    if not is_delegated_owner(uid) or not can_publish_to(uid, chat_id):
         return False
     if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
         return False
@@ -518,7 +607,10 @@ async def help_cmd(update, context):
     uid = update.effective_user.id if update.effective_user else 0
     text = (
         "📚 دليل البوت العربي\n\n"
-        "🏠 /panel — لوحة التحكم (للمصرح لهم)\n"
+        "🏠 /panel — لوحة التحكم من الخاص (للمصرح لهم)\n"
+        "🛡️ من الخاص: اختر القروب ثم غيّر إعدادات الحماية.\n"
+        "🔨 من الخاص: اختر القروب ثم نفّذ الحظر والكتم والطرد والحذف والتثبيت برقم المستخدم أو الرسالة.\n"
+        "📣 النشر: اختر القروبات، أرسل المحتوى، ثم راجع المعاينة وأكّد.\n"
         "🆔 /id — عرض رقم حسابك\n"
         "🆔 /idgroup — عرض رقم المجموعة\n"
         "📊 الإحصائيات والسجلات من لوحة التحكم\n\n"
@@ -551,7 +643,7 @@ async def panel(update, context):
     await update.effective_message.reply_text(
         "👑 لوحة التحكم الرئيسية\n\n"
         f"الصلاحية: {role_name(update.effective_user.id)}\n\n"
-        "اختر القسم المطلوب:",
+        "اختر القسم المطلوب. يمكنك إدارة القروبات من الخاص عبر اختيار القروب من القائمة، ثم اختيار الإجراء:",
         reply_markup=panel_markup(update.effective_user.id)
     )
 
@@ -1182,6 +1274,25 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
+    # الردود الآلية: تهيئة الردود الافتراضية مرة واحدة لكل قروب، مع تهدئة لمنع الإزعاج.
+    if msg.from_user and not msg.from_user.is_bot and msg.text and not msg.text.startswith("/"):
+        ensure_auto_replies(chat.id)
+        enabled_row = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (chat.id,)).fetchone()
+        if enabled_row and enabled_row[0]:
+            normalized = normalize_auto_reply(msg.text)
+            rules = db.execute("SELECT trigger_text,reply_text FROM auto_replies WHERE chat_id=? AND enabled=1 ORDER BY LENGTH(trigger_text) DESC", (chat.id,)).fetchall()
+            for trigger, reply in rules:
+                needle = normalize_auto_reply(trigger)
+                if needle and needle in normalized:
+                    key = (chat.id, trigger)
+                    now_ts = __import__("time").monotonic()
+                    if now_ts - _auto_reply_last.get(key, -1e9) >= _AUTO_REPLY_COOLDOWN_SECONDS:
+                        try:
+                            await msg.reply_text(reply)
+                            _auto_reply_last[key] = now_ts
+                        except Exception as exc:
+                            log.info("تعذر إرسال الرد الآلي في %s: %s", chat.id, exc)
+                    break
     # The Bot API cannot read old chat history; retain IDs of messages observed while running.
     recent_message_ids[chat.id].append(msg.message_id)
     if msg.from_user and not msg.from_user.is_bot:
@@ -1358,6 +1469,44 @@ async def broadcast_draft_message(update, context):
     if not msg or not user or not chat or chat.type != ChatType.PRIVATE:
         return
     remember_delegated_user(user)
+    pending_action = context.user_data.get("awaiting_admin_action")
+    if pending_action:
+        raw = (msg.text or "").strip()
+        if not raw.isdigit():
+            await msg.reply_text("أرسل رقمًا صحيحًا فقط، أو افتح لوحة /panel للإلغاء.")
+            return
+        action = pending_action.get("action")
+        target_id = int(raw)
+        chat_id = int(pending_action.get("chat_id"))
+        if not await can_access_group(context.bot, user.id, chat_id):
+            context.user_data.pop("awaiting_admin_action", None)
+            await msg.reply_text("⛔ لم تعد تملك صلاحية إدارة هذا القروب.")
+            return
+        try:
+            if action == "ban":
+                await context.bot.ban_chat_member(chat_id, target_id)
+            elif action == "unban":
+                await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
+            elif action == "kick":
+                await context.bot.ban_chat_member(chat_id, target_id)
+                await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
+            elif action == "mute":
+                await context.bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False))
+            elif action == "unmute":
+                await context.bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+            elif action == "delete":
+                await context.bot.delete_message(chat_id, target_id)
+            elif action == "pin":
+                await context.bot.pin_chat_message(chat_id, target_id)
+            labels = {"ban":"حظر العضو", "unban":"فك حظر العضو", "kick":"طرد العضو", "mute":"كتم العضو", "unmute":"إلغاء كتم العضو", "delete":"حذف الرسالة", "pin":"تثبيت الرسالة"}
+            log_action(chat_id, user.id, action, str(target_id))
+            await msg.reply_text(f"✅ تم تنفيذ: {labels.get(action, action)}\nالقروب: {chat_id}\nالرقم: {target_id}")
+        except Exception as exc:
+            log.warning("Private group action %s failed in %s for %s: %s", action, chat_id, target_id, exc)
+            await msg.reply_text("❌ تعذر تنفيذ الإجراء. تأكد من صحة الرقم، وأن البوت مشرف في القروب ولديه الصلاحية المطلوبة، وأن العضو/الرسالة قابلان لهذا الإجراء.")
+        finally:
+            context.user_data.pop("awaiting_admin_action", None)
+        return
     welcome_chat_id = context.user_data.get("awaiting_welcome_chat")
     if welcome_chat_id and (is_general_manager(user.id) or is_protection_manager(user.id) or is_delegated_owner(user.id)) and await can_access_group(context.bot, user.id, welcome_chat_id):
         body = msg.text or msg.caption
@@ -1576,8 +1725,43 @@ async def callback(update, context):
         if not await can_access_group(context.bot, uid, chat_id):
             await q.answer("لا تملك صلاحية هذا القروب", show_alert=True); return
         title = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
-        await q.edit_message_text(f"🔨 الإشراف — {title[0] if title else chat_id}\n\nنفّذ الأوامر داخل القروب بعد الرد على العضو أو استخدام معرّفه:\n/ban — حظر\n/unban — فك الحظر\n/kick — طرد\n/mute — كتم\n/unmute — فك الكتم\n/del — حذف\n/pin — تثبيت\n/logs — السجلات", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],[InlineKeyboardButton("⬅️ القروبات", callback_data="administration_groups")]]))
+        await q.edit_message_text(
+            f"🔨 إدارة القروب — {title[0] if title else chat_id}\n\n"
+            "اختر الإجراء، ثم أرسل رقم المستخدم أو رقم الرسالة في الخاص. "
+            "تتطلب الإجراءات صلاحيات مشرف البوت المناسبة داخل تيليجرام.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{chat_id}")],
+                [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{chat_id}"), InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{chat_id}")],
+                [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{chat_id}")],
+                [InlineKeyboardButton("🗑️ حذف رسالة برقمها", callback_data=f"admin_action:delete:{chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة برقمها", callback_data=f"admin_action:pin:{chat_id}")],
+                [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],
+                [InlineKeyboardButton("⬅️ القروبات", callback_data="administration_groups")]
+            ])
+        )
         return
+
+    if data.startswith("admin_action:"):
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] not in {"ban", "unban", "kick", "mute", "unmute", "delete", "pin"}:
+            await q.answer("الإجراء غير صحيح.", show_alert=True); return
+        action = parts[1]
+        try: chat_id = int(parts[2])
+        except ValueError: await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id):
+            await q.answer("لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
+        context.user_data["awaiting_admin_action"] = {"action": action, "chat_id": chat_id}
+        labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها"}
+        action_group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+        action_group_title = action_group[0] if action_group and action_group[0] else str(chat_id)
+        await q.edit_message_text(
+            f"✍️ الإجراء: {labels[action]}\nالقروب: {action_group_title}\n\n"
+            "أرسل الرقم فقط في الخاص. لن ينفّذ البوت أي إجراء إلا بعد استلام الرقم، ويمكنك الإلغاء من الزر أدناه.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="admin_action_cancel")], [InlineKeyboardButton("⬅️ قائمة القروب", callback_data=f"admin_group:{chat_id}")]])
+        ); return
+
+    if data == "admin_action_cancel":
+        context.user_data.pop("awaiting_admin_action", None)
+        await q.edit_message_text("تم إلغاء الإجراء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
     if data == "welcome":
         if not (is_owner(uid) or is_general_manager(uid) or is_delegated_owner(uid)):
@@ -2198,7 +2382,9 @@ def main():
         "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
         "kick": kick, "mute": mute, "unmute": unmute, "del": del_cmd, "pin": pin,
         "alerts": alerts, "logs": logs_cmd, "settings": settings_cmd, "locks": locks,
-        "archive": archive_cmd, "archive_on": archive_on, "archive_off": archive_off
+        "archive": archive_cmd, "archive_on": archive_on, "archive_off": archive_off,
+        "autoreplies": auto_replies_list, "autoreplies_on": auto_replies_on,
+        "autoreplies_off": auto_replies_off, "addreply": add_auto_reply, "delreply": delete_auto_reply
     }
     for name, fn in command_handlers.items():
         app.add_handler(CommandHandler(name, fn))
