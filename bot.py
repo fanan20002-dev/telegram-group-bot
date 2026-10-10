@@ -177,6 +177,18 @@ db.execute("""CREATE TABLE IF NOT EXISTS game_score_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
     points INTEGER NOT NULL, event_type TEXT NOT NULL, created_at TEXT NOT NULL
 )""")
+# ألعاب طويلة المدى: التقدم محفوظ في SQLite ويستمر بعد إعادة تشغيل البوت.
+db.execute("""CREATE TABLE IF NOT EXISTS persistent_game_state(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, game_key TEXT NOT NULL,
+    progress INTEGER NOT NULL DEFAULT 0, coins INTEGER NOT NULL DEFAULT 0,
+    last_claim_epoch INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,user_id,game_key)
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS persistent_game_flags(
+    chat_id INTEGER NOT NULL, game_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(chat_id,game_key)
+)""")
+db.commit()
 db.execute("""CREATE TABLE IF NOT EXISTS game_rounds(
     token TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, kind TEXT NOT NULL,
     answer TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
@@ -1784,6 +1796,9 @@ async def callback(update, context):
             [InlineKeyboardButton("🧩 فك الكلمات المبعثرة", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")],
             [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")],
             [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}")],
+            [InlineKeyboardButton("🌍 مملكة القروب", callback_data=f"persistent_game:kingdom:{chat_id}"), InlineKeyboardButton("⚔️ مغامرة البطل", callback_data=f"persistent_game:hero:{chat_id}")],
+            [InlineKeyboardButton("🃏 ألبوم المقتنيات", callback_data=f"persistent_game:cards:{chat_id}"), InlineKeyboardButton("🏰 تحالفات القروب", callback_data=f"persistent_game:alliance:{chat_id}")],
+            [InlineKeyboardButton("🕵️ ملف القضية", callback_data=f"persistent_game:case:{chat_id}"), InlineKeyboardButton("🏆 موسم التحديات", callback_data=f"persistent_game:season:{chat_id}")],
             [InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")]
         ]
         await q.edit_message_text("🎮 مركز الألعاب والتحديات\n\nاختر اللعبة التي تريد المشاركة فيها:", reply_markup=InlineKeyboardMarkup(rows))
@@ -2043,11 +2058,88 @@ async def callback(update, context):
             [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")],
             [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")],
         ]
+        if is_owner(uid) or is_delegated_owner(uid):
+            feature_names = [("kingdom","🌍 المملكة"),("hero","⚔️ البطل"),("cards","🃏 المقتنيات"),("alliance","🏰 التحالفات"),("case","🕵️ القضية"),("season","🏆 الموسم")]
+            feature_buttons = []
+            for feature, label in feature_names:
+                flag = db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?", (chat_id, feature)).fetchone()
+                active = flag[0] if flag else 1
+                feature_buttons.append(InlineKeyboardButton(("🟢 " if active else "🔴 ")+label, callback_data=f"game_feature_toggle:{chat_id}:{feature}"))
+            rows += [feature_buttons[i:i+2] for i in range(0, len(feature_buttons), 2)]
         if is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid):
             rows.append([InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")])
         rows.append([InlineKeyboardButton("⬅️ القروبات", callback_data="games")])
         await q.edit_message_text(f"🎮 الألعاب والتحديات\n👥 القروب: {title}\nحالة الألعاب: {'مفعّلة' if cfg[0] else 'متوقفة'}\nتحدي الخاسر: {'مفعّل' if cfg[1] else 'متوقف'}\n\nاختر لعبة:", reply_markup=InlineKeyboardMarkup(rows))
         return
+
+    if data.startswith("game_feature_toggle:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("إيقاف الألعاب وتشغيلها متاح للمالك والمالك المفوض فقط.", show_alert=True); return
+        try:
+            _, chat_raw, feature = data.split(":", 2)
+            chat_id = int(chat_raw)
+        except (ValueError, TypeError):
+            await q.answer("تعذر قراءة إعداد اللعبة.", show_alert=True); return
+        allowed_features = {"kingdom","hero","cards","alliance","case","season"}
+        if feature not in allowed_features or not await can_access_group(context.bot, uid, chat_id):
+            await q.answer("لا تملك صلاحية تعديل هذه اللعبة.", show_alert=True); return
+        row = db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?", (chat_id, feature)).fetchone()
+        new_value = 0 if (row and row[0]) else 1
+        db.execute("INSERT INTO persistent_game_flags(chat_id,game_key,enabled) VALUES(?,?,?) ON CONFLICT(chat_id,game_key) DO UPDATE SET enabled=excluded.enabled", (chat_id, feature, new_value)); db.commit()
+        await q.answer("تم إيقاف اللعبة." if not new_value else "تم تشغيل اللعبة.")
+        # Refresh the management page to show the new state.
+        title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
+        cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        rows = [
+            [InlineKeyboardButton("🧠 أسئلة ثقافية وذكاء", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")],
+            [InlineKeyboardButton("🧩 فك الكلمات المبعثرة", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")],
+            [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")],
+            [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")],
+            [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")],
+        ]
+        feature_names = [("kingdom","🌍 المملكة"),("hero","⚔️ البطل"),("cards","🃏 المقتنيات"),("alliance","🏰 التحالفات"),("case","🕵️ القضية"),("season","🏆 الموسم")]
+        feature_buttons=[]
+        for f, label in feature_names:
+            flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,f)).fetchone(); active=flag[0] if flag else 1
+            feature_buttons.append(InlineKeyboardButton(("🟢 " if active else "🔴 ")+label,callback_data=f"game_feature_toggle:{chat_id}:{f}"))
+        rows += [feature_buttons[i:i+2] for i in range(0,len(feature_buttons),2)]
+        rows.append([InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"),callback_data=f"game_toggle:{chat_id}"),InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"),callback_data=f"game_challenge_toggle:{chat_id}")])
+        rows.append([InlineKeyboardButton("⬅️ القروبات",callback_data="games")])
+        await q.edit_message_text(f"🎮 إدارة الألعاب والتحديات\n👥 القروب: {title}\nحالة الألعاب العامة: {'مفعّلة' if cfg[0] else 'متوقفة'}\n\n🟢 اللعبة متاحة | 🔴 اللعبة متوقفة\nاختر لعبة لتغيير حالتها:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("persistent_game:"):
+        try:
+            _, game_key, chat_raw = data.split(":", 2); chat_id = int(chat_raw)
+        except (ValueError, TypeError):
+            await q.answer("بيانات اللعبة غير صحيحة.", show_alert=True); return
+        game_names = {
+            "kingdom": ("🌍 مملكة القروب", "طوّر مملكتك واجمع الموارد وافتح مناطق جديدة."),
+            "hero": ("⚔️ مغامرة البطل", "درّب بطلك وارفع مستواه وواصل التقدم."),
+            "cards": ("🃏 ألبوم المقتنيات", "اجمع مقتنيات يومية وأكمل مجموعاتك."),
+            "alliance": ("🏰 تحالفات القروب", "ساهم في تقدم قروبك واجمع نقاط التعاون."),
+            "case": ("🕵️ ملف القضية", "حل لغز اليوم واختر الإجابة الصحيحة."),
+            "season": ("🏆 موسم التحديات", "أنجز مهمة اليوم وواصل سلسلة إنجازاتك.")
+        }
+        if game_key not in game_names or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone():
+            await q.answer("اللعبة أو القروب غير متاح.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
+        flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
+        if (cfg and not cfg[0]) or (flag and not flag[0]):
+            await q.answer("هذه الألعاب متوقفة حاليًا من لوحة الإدارة.",show_alert=True); return
+        uid_player=q.from_user.id; display=q.from_user.full_name or "عضو"; epoch=int(time.time())
+        row=db.execute("SELECT progress,coins,last_claim_epoch FROM persistent_game_state WHERE chat_id=? AND user_id=? AND game_key=?",(chat_id,uid_player,game_key)).fetchone()
+        progress,coins,last_claim=row if row else (0,0,0)
+        title,description=game_names[game_key]
+        if epoch-last_claim < 86400:
+            remaining=86400-(epoch-last_claim); hours=remaining//3600; minutes=(remaining%3600)//60
+            await q.answer(f"أنجزت مكافأة اليوم. عد بعد {hours} س و{minutes} د.",show_alert=True); return
+        # تقدم يومي محفوظ؛ القصة/المهمة تتطور على مدى الأيام بدل جولة تنتهي مرة واحدة.
+        progress += 1; reward = 3 if game_key in ("kingdom","hero","alliance") else 2; coins += reward
+        db.execute("INSERT INTO persistent_game_state(chat_id,user_id,game_key,progress,coins,last_claim_epoch,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,game_key) DO UPDATE SET progress=excluded.progress,coins=excluded.coins,last_claim_epoch=excluded.last_claim_epoch,updated_at=excluded.updated_at",(chat_id,uid_player,game_key,progress,coins,epoch,now()))
+        db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid_player,display))
+        db.execute("UPDATE game_scores SET points=points+?,display_name=? WHERE chat_id=? AND user_id=?",(reward,display,chat_id,uid_player)); record_game_points(chat_id,uid_player,reward,game_key); db.commit()
+        milestone="\n🎉 إنجاز جديد! وصلت إلى 7 أيام." if progress==7 else ("\n🏅 إنجاز جديد! وصلت إلى 30 يومًا." if progress==30 else "")
+        await q.edit_message_text(f"{title}\n\n{description}\n\n📈 تقدمك: {progress} يوم\n🪙 رصيد اللعبة: {coins}\n⭐ نقاطك المضافة اليوم: {reward}{milestone}\n\nعد غدًا لمتابعة تقدمك. تقدمك محفوظ حتى بعد إعادة تشغيل البوت.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 العودة للألعاب",callback_data=f"member_games:{chat_id}")],[InlineKeyboardButton("🏆 لوحة المتصدرين",callback_data=f"game_scores:{chat_id}")]])); return
 
     if data.startswith("game_toggle:") or data.startswith("game_challenge_toggle:"):
         try: chat_id = int(data.split(":",1)[1])
@@ -2064,7 +2156,15 @@ async def callback(update, context):
         # Return to the group games page.
         cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
-        rows = [[InlineKeyboardButton("🧠 أسئلة ثقافية", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")], [InlineKeyboardButton("🧩 فك الكلمات", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")], [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")], [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")], [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")], [InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")], [InlineKeyboardButton("⬅️ القروبات", callback_data="games")]]
+        rows = [[InlineKeyboardButton("🧠 أسئلة ثقافية", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")], [InlineKeyboardButton("🧩 فك الكلمات", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")], [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")], [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")], [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")]]
+        if is_owner(uid) or is_delegated_owner(uid):
+            feature_names = [("kingdom","🌍 المملكة"),("hero","⚔️ البطل"),("cards","🃏 المقتنيات"),("alliance","🏰 التحالفات"),("case","🕵️ القضية"),("season","🏆 الموسم")]
+            feature_buttons=[]
+            for f,label in feature_names:
+                flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,f)).fetchone(); active=flag[0] if flag else 1
+                feature_buttons.append(InlineKeyboardButton(("🟢 " if active else "🔴 ")+label,callback_data=f"game_feature_toggle:{chat_id}:{f}"))
+            rows += [feature_buttons[i:i+2] for i in range(0,len(feature_buttons),2)]
+        rows += [[InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")], [InlineKeyboardButton("⬅️ القروبات", callback_data="games")]]
         await q.edit_message_text(f"🎮 الألعاب والتحديات\n👥 القروب: {title}\nحالة الألعاب: {'مفعّلة' if cfg[0] else 'متوقفة'}\nتحدي الخاسر: {'مفعّل' if cfg[1] else 'متوقف'}\n\nاختر لعبة:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("game_quiz:"):
