@@ -7,6 +7,7 @@ import logging
 import tempfile
 import uuid
 import time
+import random
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -161,6 +162,12 @@ CREATE TABLE IF NOT EXISTS game_config(
     chat_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 1,
     challenge_enabled INTEGER NOT NULL DEFAULT 1
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS media_config(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1
 )
 """)
 db.execute("""
@@ -327,6 +334,100 @@ def game_board_markup(token, board):
     for start in (0, 3, 6):
         rows.append([InlineKeyboardButton(cells[i], callback_data=f"xo_move:{token}:{i}") for i in range(start, start+3)])
     return InlineKeyboardMarkup(rows)
+
+# بنك مسابقات متعدد المجالات والمراحل؛ يمكن توسيعه دون تغيير بنية قاعدة البيانات.
+QUIZ_CATEGORIES = {
+    "general": ("🌐 معلومات عامة", [
+        ("ما الكوكب المعروف بالكوكب الأحمر؟", ["الأرض", "المريخ", "زحل", "الزهرة"], 1, "يبدو المريخ أحمر بسبب أكاسيد الحديد على سطحه."),
+        ("كم عدد أضلاع الشكل السداسي؟", ["خمسة", "ستة", "سبعة", "ثمانية"], 1, "للشكل السداسي ستة أضلاع."),
+        ("ما أكبر حيوان معروف على الأرض؟", ["الفيل الإفريقي", "الحوت الأزرق", "الزرافة", "القرش الأبيض"], 1, "الحوت الأزرق أكبر الحيوانات المعروفة."),
+        ("ما اللغة الرسمية في البرازيل؟", ["الإسبانية", "البرتغالية", "الفرنسية", "الإنجليزية"], 1, "يتحدث سكان البرازيل البرتغالية."),
+        ("كم دقيقة في ساعتين؟", ["60", "90", "120", "180"], 2, "الساعتان تساويان 120 دقيقة."),
+        ("ما الحيوان المعروف بسفينة الصحراء؟", ["الحصان", "الجمل", "اللاما", "الغزال"], 1, "الجمل متكيف مع البيئات الصحراوية."),
+        ("ما المعدن السائل في درجة حرارة الغرفة؟", ["الحديد", "الزئبق", "النحاس", "الألمنيوم"], 1, "الزئبق معدن سائل في الظروف المعتادة."),
+        ("كم عدد ألوان قوس قزح التقليدية؟", ["خمسة", "ستة", "سبعة", "ثمانية"], 2, "تقسم ألوان قوس قزح تقليديًا إلى سبعة."),
+    ]),
+    "science": ("🔬 العلوم", [
+        ("ما الغاز الذي تمتصه النباتات من الهواء؟", ["الأكسجين", "ثاني أكسيد الكربون", "النيتروجين", "الهيدروجين"], 1, "تستخدم النباتات ثاني أكسيد الكربون في البناء الضوئي."),
+        ("ما أقرب نجم إلى الأرض؟", ["الشعرى اليمانية", "الشمس", "النجم القطبي", "سيريوس ب"], 1, "الشمس أقرب نجم إلى الأرض."),
+        ("ما وحدة قياس القوة؟", ["الجول", "الواط", "النيوتن", "الأمبير"], 2, "تقاس القوة بوحدة النيوتن."),
+        ("كم عدد حجرات قلب الإنسان؟", ["حجرتان", "ثلاث", "أربع", "خمس"], 2, "يتكون القلب من أذينين وبطينين."),
+        ("ما الجزء الذي يحمل المعلومات الوراثية؟", ["DNA", "النشا", "الهيموغلوبين", "الكالسيوم"], 0, "يحمل الحمض النووي DNA معظم المعلومات الوراثية."),
+        ("عند أي درجة مئوية يتجمد الماء النقي تقريبًا؟", ["0", "10", "50", "100"], 0, "يتجمد الماء النقي عند صفر مئوية في الضغط المعتاد."),
+        ("أي عضو يضخ الدم؟", ["الرئة", "القلب", "الكبد", "المعدة"], 1, "يضخ القلب الدم إلى أنحاء الجسم."),
+        ("ما الكوكب الأكبر في المجموعة الشمسية؟", ["الأرض", "المشتري", "نبتون", "عطارد"], 1, "المشتري هو أكبر كواكب المجموعة الشمسية."),
+    ]),
+    "geography": ("🗺️ الجغرافيا", [
+        ("ما عاصمة اليابان؟", ["كيوتو", "طوكيو", "أوساكا", "ناغويا"], 1, "طوكيو عاصمة اليابان."),
+        ("ما أكبر محيط في العالم؟", ["الأطلسي", "الهندي", "الهادئ", "المتجمد الشمالي"], 2, "المحيط الهادئ هو الأكبر مساحة."),
+        ("في أي قارة تقع الأرجنتين؟", ["آسيا", "أوروبا", "أمريكا الجنوبية", "إفريقيا"], 2, "تقع الأرجنتين في أمريكا الجنوبية."),
+        ("ما عاصمة المملكة العربية السعودية؟", ["جدة", "مكة المكرمة", "الرياض", "الدمام"], 2, "الرياض عاصمة المملكة العربية السعودية."),
+        ("أي نهر يمر بمدينة القاهرة؟", ["الفرات", "النيل", "دجلة", "الأردن"], 1, "يمر نهر النيل بالقاهرة."),
+        ("ما أكبر قارة من حيث المساحة؟", ["إفريقيا", "آسيا", "أوروبا", "أستراليا"], 1, "آسيا أكبر قارات العالم مساحة."),
+        ("ما البحر الذي يقع غرب المملكة العربية السعودية؟", ["بحر العرب", "البحر الأحمر", "بحر قزوين", "البحر الأسود"], 1, "يقع البحر الأحمر غرب المملكة."),
+        ("ما عاصمة مصر؟", ["الإسكندرية", "القاهرة", "الأقصر", "أسوان"], 1, "القاهرة عاصمة مصر."),
+    ]),
+    "history": ("🏺 التاريخ", [
+        ("في أي دولة تقع الأهرامات الشهيرة في الجيزة؟", ["السودان", "مصر", "العراق", "المغرب"], 1, "تقع أهرامات الجيزة في مصر."),
+        ("ما الحضارة القديمة التي نشأت بين دجلة والفرات؟", ["حضارة بلاد الرافدين", "حضارة المايا", "الحضارة الإغريقية", "حضارة الإنكا"], 0, "نشأت حضارات بلاد الرافدين بين نهري دجلة والفرات."),
+        ("ما اسم الطريق التجاري التاريخي الذي ربط الشرق بالغرب؟", ["طريق الحرير", "طريق التوابل فقط", "طريق القوافل الشمالية", "طريق الذهب"], 0, "كان طريق الحرير شبكة طرق للتجارة والتبادل الثقافي."),
+        ("في أي مدينة يقع الكولوسيوم؟", ["أثينا", "روما", "إسطنبول", "باريس"], 1, "يقع الكولوسيوم في روما بإيطاليا."),
+        ("ما اسم الكتابة المصرية القديمة؟", ["المسمارية", "الهيروغليفية", "اللاتينية", "السنسكريتية"], 1, "استُخدمت الكتابة الهيروغليفية في مصر القديمة."),
+        ("أين بدأت الألعاب الأولمبية القديمة؟", ["اليونان", "الصين", "مصر", "روما"], 0, "بدأت الألعاب الأولمبية القديمة في اليونان."),
+        ("ما الحضارة التي بنت مدينة ماتشو بيتشو؟", ["الإنكا", "الرومان", "الفراعنة", "الفينيقيون"], 0, "ترتبط ماتشو بيتشو بحضارة الإنكا في الأنديز."),
+        ("ما المدينة التي كانت مركزًا مهمًا للحضارة الأندلسية؟", ["قرطبة", "لندن", "برلين", "أوسلو"], 0, "كانت قرطبة مركزًا علميًا وثقافيًا بارزًا في الأندلس."),
+    ]),
+    "islamic": ("📚 الثقافة الإسلامية", [
+        ("كم عدد أركان الإسلام؟", ["أربعة", "خمسة", "ستة", "سبعة"], 1, "أركان الإسلام خمسة."),
+        ("ما الشهر الذي يصومه المسلمون؟", ["شعبان", "رمضان", "شوال", "محرم"], 1, "يصوم المسلمون شهر رمضان."),
+        ("ما قبلة المسلمين في الصلاة؟", ["المسجد الأقصى", "الكعبة المشرفة", "المسجد النبوي", "جبل عرفات"], 1, "الكعبة المشرفة قبلة المسلمين في الصلاة."),
+        ("كم عدد الصلوات المفروضة في اليوم والليلة؟", ["ثلاث", "أربع", "خمس", "ست"], 2, "الصلوات المفروضة خمس."),
+        ("ما اسم الكتاب الذي أُنزل على النبي محمد ﷺ؟", ["التوراة", "الزبور", "الإنجيل", "القرآن الكريم"], 3, "القرآن الكريم أُنزل على النبي محمد ﷺ."),
+        ("في أي مدينة يوجد المسجد النبوي؟", ["مكة المكرمة", "المدينة المنورة", "القدس", "الطائف"], 1, "يقع المسجد النبوي في المدينة المنورة."),
+        ("ما اسم الليلة التي هي خير من ألف شهر؟", ["ليلة النصف من شعبان", "ليلة القدر", "ليلة العيد", "ليلة الإسراء"], 1, "ورد فضل ليلة القدر في سورة القدر."),
+        ("ما السورة التي تُقرأ في كل ركعة من الصلاة؟", ["الفاتحة", "الإخلاص فقط", "الناس", "الكوثر"], 0, "قراءة الفاتحة ركن في الصلاة عند جمهور العلماء."),
+    ]),
+    "sports": ("⚽ الرياضة", [
+        ("كم لاعبًا يبدأ به فريق كرة القدم داخل الملعب؟", ["9", "10", "11", "12"], 2, "يتكون الفريق من 11 لاعبًا داخل الملعب عادةً."),
+        ("كم عدد الحلقات في شعار الألعاب الأولمبية؟", ["أربع", "خمس", "ست", "سبع"], 1, "يتضمن الشعار خمس حلقات متداخلة."),
+        ("في أي رياضة تُستخدم الريشة؟", ["التنس", "الريشة الطائرة", "الاسكواش", "البيسبول"], 1, "تُستخدم الريشة في لعبة الريشة الطائرة."),
+        ("كم نقطة تُحتسب للرمية الحرة في كرة السلة؟", ["نقطة واحدة", "نقطتان", "ثلاث نقاط", "أربع نقاط"], 0, "تُحتسب الرمية الحرة الناجحة بنقطة واحدة."),
+        ("ما الرياضة التي يُستخدم فيها مصطلح ضربة إرسال؟", ["التنس", "المصارعة", "الجري", "رفع الأثقال"], 0, "ضربة الإرسال بداية النقطة في التنس."),
+        ("كم شوطًا في مباراة كرة القدم العادية قبل الوقت الإضافي؟", ["شوط واحد", "شوطان", "ثلاثة", "أربعة"], 1, "المباراة تتكون من شوطين أساسيين."),
+        ("ما الأداة الأساسية في لعبة الغولف لضرب الكرة؟", ["مضرب الغولف", "مضرب بيسبول", "مجداف", "مضرب تنس الطاولة"], 0, "تُستخدم مضارب مخصصة لضرب كرة الغولف."),
+        ("في أي رياضة يوجد المسبح ومسارات السباحة؟", ["السباحة", "الرماية", "الفروسية", "الجودو"], 0, "تقام مسابقات السباحة في أحواض مخصصة."),
+    ]),
+    "tech": ("💻 التقنية", [
+        ("ما وظيفة نظام GPS الأساسية؟", ["تحديد الموقع", "طباعة الأوراق", "تبريد الجهاز", "تحرير الفيديو فقط"], 0, "يُستخدم GPS لتحديد الموقع والملاحة."),
+        ("ماذا تعني WWW في عناوين الويب؟", ["الشبكة العالمية", "نظام التشغيل", "ذاكرة عشوائية", "بريد إلكتروني"], 0, "WWW اختصار World Wide Web."),
+        ("أي مما يلي كلمة مرور أقوى؟", ["123456", "password", "اسمك فقط", "عبارة طويلة وفريدة"], 3, "العبارة الطويلة والفريدة أصعب في التخمين عادةً."),
+        ("ما الجهاز الذي يربط الشبكة المنزلية بالإنترنت غالبًا؟", ["الموجّه Router", "الطابعة", "الماسح الضوئي", "السماعة"], 0, "يوجه الموجّه حركة البيانات بين الشبكات."),
+        ("ما المقصود بالنسخ الاحتياطي؟", ["إنشاء نسخة لاستعادة البيانات", "حذف الملفات", "زيادة سطوع الشاشة", "إيقاف الإنترنت"], 0, "يساعد النسخ الاحتياطي على استعادة البيانات عند فقدها."),
+        ("أي مما يلي مثال على مصادقة متعددة العوامل؟", ["كلمة مرور فقط", "كلمة مرور ورمز تحقق", "اسم المستخدم فقط", "إعادة تشغيل الجهاز"], 1, "تجمع المصادقة متعددة العوامل بين أكثر من طريقة تحقق."),
+        ("ما الامتداد الشائع لملفات الصور؟", [".jpg", ".mp3", ".exe", ".py"], 0, "JPG امتداد شائع للصور."),
+        ("ما فائدة تحديث البرامج؟", ["إصلاح أخطاء وتحسين الأمان", "إلغاء كل الملفات دائمًا", "تعطيل الشاشة", "زيادة حجم الجهاز"], 0, "تتضمن التحديثات إصلاحات وتحسينات أمنية ووظيفية."),
+    ]),
+}
+
+async def send_quiz_stage(context, chat_id, category, stage):
+    """ينشر مرحلة من مسابقة من خمس مراحل مع تصحيح محفوظ في قاعدة البيانات."""
+    if category not in QUIZ_CATEGORIES or stage < 1 or stage > 5:
+        return None
+    title, questions = QUIZ_CATEGORIES[category]
+    question_index = random.randrange(len(questions))
+    question, options, correct_index, explanation = questions[question_index]
+    token = uuid.uuid4().hex[:10]
+    answer_data = f"{category}|{stage}|{question_index}|{correct_index}"
+    db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,completed,created_at) VALUES(?,?,?,?,0,?)",
+               (token, chat_id, "quiz_stage", answer_data, now()))
+    db.commit()
+    rows = [[InlineKeyboardButton(f"{chr(65+i)}. {option}", callback_data=f"game_stage_answer:{token}:{i}")]
+            for i, option in enumerate(options)]
+    rows.append([InlineKeyboardButton("🎮 قائمة الألعاب", callback_data=f"member_games:{chat_id}")])
+    await context.bot.send_message(chat_id,
+        f"🏁 المسابقة متعددة المراحل — {title}\nالمرحلة {stage} من 5\n\n{question}\n\nاختر الإجابة الصحيحة لتحصل على نقاط وتفتح المرحلة التالية.",
+        reply_markup=InlineKeyboardMarkup(rows))
+    return token
 
 def ensure_settings(chat_id):
     cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
@@ -546,21 +647,23 @@ def panel_markup(uid):
     # واجهة موحدة بعناوين وأيقونات مرتبة؛ الصلاحيات الحساسة للمالك الأساسي فقط.
     if is_delegated_owner(uid) and not is_owner(uid):
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛡️ الحماية", callback_data="security_groups"), InlineKeyboardButton("🔨 الإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("📣 النشر", callback_data="broadcast_start"), InlineKeyboardButton("👋 الترحيب", callback_data="welcome")],
-            [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋 السجلات", callback_data="logs")],
-            [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("📢 التنبيهات", callback_data="alerts")],
-            [InlineKeyboardButton("👥 الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("💚 صحة البوت", callback_data="health")],
+            [InlineKeyboardButton("📡 الرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("🧰 أدوات الإشراف", callback_data="administration_groups")],
+            [InlineKeyboardButton("📢 مركز النشر", callback_data="broadcast_start"), InlineKeyboardButton("🎉 الترحيب الذكي", callback_data="welcome")],
+            [InlineKeyboardButton("📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("🧾 سجل العمليات", callback_data="logs")],
+            [InlineKeyboardButton("🕹️ عالم الألعاب", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
+            [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
+            [InlineKeyboardButton("🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
         ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ الحماية", callback_data="security"), InlineKeyboardButton("🔨 إدارة الأعضاء", callback_data="administration")],
-        [InlineKeyboardButton("📣 النشر", callback_data="broadcast_start"), InlineKeyboardButton("👋 الترحيب", callback_data="welcome")],
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
-        [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("📢 التنبيهات", callback_data="alerts")],
-        [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("👥 الرتب الإدارية", callback_data="roles_groups")],
-        [InlineKeyboardButton("💚 صحة البوت", callback_data="health"), InlineKeyboardButton("👑 إدارة المالكين المفوضين", callback_data="delegated_owner")],
-        [InlineKeyboardButton("📨 سجل الرسائل الخاص (للمالك)", callback_data="archive")],
-        [InlineKeyboardButton("💾 النسخ الاحتياطي (للمالك)", callback_data="owner_backup"), InlineKeyboardButton("⚙️ النظام الأعلى (للمالك)", callback_data="owner_system")],
+        [InlineKeyboardButton("📡 الرادار الأمني", callback_data="security"), InlineKeyboardButton("🧰 إدارة الأعضاء", callback_data="administration")],
+        [InlineKeyboardButton("📢 مركز النشر", callback_data="broadcast_start"), InlineKeyboardButton("🎉 الترحيب الذكي", callback_data="welcome")],
+        [InlineKeyboardButton("📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("🧾 سجل العمليات", callback_data="logs")],
+        [InlineKeyboardButton("🕹️ عالم الألعاب", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
+        [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
+        [InlineKeyboardButton("🎛️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🎖️ الرتب الإدارية", callback_data="roles_groups")],
+        [InlineKeyboardButton("🩺 صحة البوت", callback_data="health"), InlineKeyboardButton("👑 إدارة المالك المفوّض", callback_data="delegated_owner")],
+        [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive")],
+        [InlineKeyboardButton("🗄️ النسخ الاحتياطي", callback_data="owner_backup"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ])
 
 def settings_page_markup(chat_id, page=0):
@@ -1242,8 +1345,9 @@ async def public_settings(update, context):
         buttons.append(InlineKeyboardButton("🏆 لوحة نشاط الأعضاء", callback_data="public:activity"))
     rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
     # واجهة الأعضاء تعرض خدمات عامة فقط؛ لا تعرض أي خيارات تشغيلية أو تحديثات النظام.
-    rows.append([InlineKeyboardButton("🎮 مركز الألعاب والتحديات", callback_data=f"member_games:{chat.id}")])
-    rows.append([InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat.id}")])
+    rows.append([InlineKeyboardButton("🕹️ عالم الألعاب والمغامرات", callback_data=f"member_games:{chat.id}")])
+    rows.append([InlineKeyboardButton("🎬 مركز الوسائط والصور والتنزيلات", callback_data=f"member_media:{chat.id}")])
+    rows.append([InlineKeyboardButton("🗓️ مهمة اليوم", callback_data=f"game_daily:{chat.id}")])
     if settings.get("public_protection", 1):
         rows.append([InlineKeyboardButton("🛡️ معلومات الحماية", callback_data="public:protection")])
     text = "🤖 مركز الأعضاء\n\n📚 دليل البوت • 🏆 لوحة المتصدرين • 🎮 الألعاب • 🎯 تحدي اليوم\n\n🔒 لوحة الإدارة وإعدادات النظام مخصصة للمصرّح لهم فقط."
@@ -1636,7 +1740,7 @@ async def broadcast_draft_message(update, context):
             f"✅ تم تسجيل المعرّف {target_uid} كمالك مفوّض.\n"
             "✅ لديه صلاحيات الإدارة التشغيلية والحماية والنشر في جميع القروبات المسجلة التي يوجد فيها البوت.\n"
             "🔐 إدارة المالكين والأرشيف الخاص والنسخ الاحتياطي وإعدادات النظام العليا تبقى للمالك الأساسي.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالكين المفوضين", callback_data="delegated_owner")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالك المفوّض", callback_data="delegated_owner")]])
         )
         return
     pending_action = context.user_data.get("awaiting_admin_action")
@@ -1774,6 +1878,72 @@ async def callback(update, context):
 
     if data == "noop" or data.startswith("noop:"):
         await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
+        return
+
+    if data == "media_admin":
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
+            await q.edit_message_text("⛔ التحكم بالوسائط متاح للإشراف والمدراء والمالك فقط.")
+            return
+        groups = await accessible_groups(context.bot, uid)
+        rows = [[InlineKeyboardButton(f"🎵 {title or cid}", callback_data=f"media_group:{cid}")] for cid,title in groups[:30]]
+        rows.append([InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")])
+        await q.edit_message_text("🎵 إدارة الوسائط والتنزيلات\n\nاختر القروب لتفعيل المركز أو إيقافه. الخدمة مفعّلة افتراضيًا للأعضاء.", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("media_group:"):
+        try: chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
+            await q.answer("التعطيل متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id):
+            await q.answer("لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
+        db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,)); db.commit()
+        enabled = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+        title = title_row[0] if title_row else str(chat_id)
+        label = "🔴 إيقاف الوسائط للأعضاء" if enabled else "🟢 تشغيل الوسائط للأعضاء"
+        await q.edit_message_text(f"🎵 إعدادات الوسائط\nالقروب: {title}\nالحالة: {'مفعّلة' if enabled else 'متوقفة'}\n\nالأعضاء يستطيعون استخدام المركز عند تفعيله.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"media_toggle:{chat_id}")],[InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="media_admin")]]))
+        return
+
+    if data.startswith("media_toggle:"):
+        try: chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
+            await q.answer("لا تملك صلاحية تعطيل الوسائط.", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id):
+            await q.answer("لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
+        db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,))
+        current = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        db.execute("UPDATE media_config SET enabled=? WHERE chat_id=?", (0 if current else 1, chat_id)); db.commit()
+        await q.answer("تم إيقاف مركز الوسائط." if current else "تم تشغيل مركز الوسائط للأعضاء.")
+        # Return to the group control page with current state.
+        enabled = 0 if current else 1
+        title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
+        label = "🔴 إيقاف الوسائط للأعضاء" if enabled else "🟢 تشغيل الوسائط للأعضاء"
+        await q.edit_message_text(f"🎵 إعدادات الوسائط\nالقروب: {title}\nالحالة: {'مفعّلة' if enabled else 'متوقفة'}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"media_toggle:{chat_id}")],[InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="media_admin")]]))
+        return
+
+    if data.startswith("member_media:"):
+        try: chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await q.answer("هذا القروب غير مسجل.", show_alert=True); return
+        db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,)); db.commit()
+        enabled = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        if not enabled:
+            await q.edit_message_text("🎵 مركز الوسائط متوقف حاليًا بقرار من الإشراف. يمكن للأعضاء استخدامه عند إعادة تفعيله.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")]])); return
+        rows = [
+            [InlineKeyboardButton("🎵 البحث عن الأغاني", url="https://open.spotify.com/search")],
+            [InlineKeyboardButton("🎬 البحث عن الفيديوهات", url="https://www.youtube.com/results?search_query=")],
+            [InlineKeyboardButton("📱 البحث عن مقاطع TikTok", url="https://www.tiktok.com/search")],
+            [InlineKeyboardButton("🖼️ البحث عن الصور", url="https://images.google.com/")],
+            [InlineKeyboardButton("⬇️ مصادر تنزيل الملفات المسموح بها", url="https://commons.wikimedia.org/wiki/Main_Page")],
+            [InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")]
+        ]
+        await q.edit_message_text("🎵 مركز الوسائط والصور والتنزيلات\n\nمتاح لجميع الأعضاء افتراضيًا ما لم يوقفه الإشراف. اختر نوع المحتوى ثم افتح مصدر البحث. يمكنك حفظ أو تنزيل المحتوى الذي يتيح مصدره ذلك قانونيًا؛ لا يتجاوز البوت قيود الحماية أو حقوق النشر.", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("member_games:"):
@@ -2058,7 +2228,7 @@ async def callback(update, context):
             [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🎯 تحدي الخاسر", callback_data=f"game_challenge:{chat_id}")],
             [InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}"), InlineKeyboardButton("📅 أسبوعي/شهري", callback_data=f"game_periods:{chat_id}")],
         ]
-        if is_owner(uid) or is_delegated_owner(uid):
+        if is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
             feature_names = [("kingdom","🌍 المملكة"),("hero","⚔️ البطل"),("cards","🃏 المقتنيات"),("alliance","🏰 التحالفات"),("case","🕵️ القضية"),("season","🏆 الموسم")]
             feature_buttons = []
             for feature, label in feature_names:
@@ -2073,15 +2243,15 @@ async def callback(update, context):
         return
 
     if data.startswith("game_feature_toggle:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("إيقاف الألعاب وتشغيلها متاح للمالك والمالك المفوض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
+            await q.answer("إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
         try:
             _, chat_raw, feature = data.split(":", 2)
             chat_id = int(chat_raw)
         except (ValueError, TypeError):
             await q.answer("تعذر قراءة إعداد اللعبة.", show_alert=True); return
         allowed_features = {"kingdom","hero","cards","alliance","case","season"}
-        if feature not in allowed_features or not await can_access_group(context.bot, uid, chat_id):
+        if feature not in allowed_features or not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)) or not await can_access_group(context.bot, uid, chat_id):
             await q.answer("لا تملك صلاحية تعديل هذه اللعبة.", show_alert=True); return
         row = db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?", (chat_id, feature)).fetchone()
         new_value = 0 if (row and row[0]) else 1
@@ -2133,19 +2303,31 @@ async def callback(update, context):
         if epoch-last_claim < 86400:
             remaining=86400-(epoch-last_claim); hours=remaining//3600; minutes=(remaining%3600)//60
             await q.answer(f"أنجزت مكافأة اليوم. عد بعد {hours} س و{minutes} د.",show_alert=True); return
-        # تقدم يومي محفوظ؛ القصة/المهمة تتطور على مدى الأيام بدل جولة تنتهي مرة واحدة.
-        progress += 1; reward = 3 if game_key in ("kingdom","hero","alliance") else 2; coins += reward
+        # تقدم يومي محفوظ مع فصول متدرجة ومهام مختلفة لكل نمط لعب.
+        progress += 1
+        reward = 5 if progress % 7 == 0 else (3 if game_key in ("kingdom","hero","alliance") else 2)
+        coins += reward
+        story_steps = {
+            "kingdom": ["تأسيس القرية وجمع الخشب", "بناء السوق وفتح المزارع", "ترميم الأسوار وحماية المملكة", "استكشاف الوادي وجمع الأحجار", "فتح بوابة المدينة الجديدة"],
+            "hero": ["التدريب في ساحة المبتدئين", "الحصول على أول أداة", "اجتياز اختبار المهارة", "مواجهة حارس الكهف", "فتح مهارة بطولية جديدة"],
+            "cards": ["اكتشاف بطاقة جديدة", "إكمال أول مجموعة مصغرة", "فتح صندوق مقتنيات", "العثور على بطاقة نادرة", "ترقية ألبومك وفتح صفحة جديدة"],
+            "alliance": ["المساهمة في مهمة الفريق", "جمع موارد للتحالف", "اجتياز تحدي التعاون", "دعم حصن التحالف", "فتح إنجاز جماعي جديد"],
+            "case": ["العثور على الدليل الأول", "مقارنة أقوال الشهود", "كشف تناقض في الأدلة", "تحديد المشتبه به الأقرب", "حل فصل من القضية"],
+            "season": ["إنجاز مهمة الموسم", "اجتياز تحدي المعرفة", "جمع شارة الموسم", "فتح مرحلة أصعب", "تحقيق إنجاز موسمي"]
+        }
+        story = story_steps.get(game_key, [description])[min((progress - 1) % 5, len(story_steps.get(game_key, [description])) - 1)]
+        chapter = (progress - 1) // 5 + 1
         db.execute("INSERT INTO persistent_game_state(chat_id,user_id,game_key,progress,coins,last_claim_epoch,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id,user_id,game_key) DO UPDATE SET progress=excluded.progress,coins=excluded.coins,last_claim_epoch=excluded.last_claim_epoch,updated_at=excluded.updated_at",(chat_id,uid_player,game_key,progress,coins,epoch,now()))
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid_player,display))
         db.execute("UPDATE game_scores SET points=points+?,display_name=? WHERE chat_id=? AND user_id=?",(reward,display,chat_id,uid_player)); record_game_points(chat_id,uid_player,reward,game_key); db.commit()
-        milestone="\n🎉 إنجاز جديد! وصلت إلى 7 أيام." if progress==7 else ("\n🏅 إنجاز جديد! وصلت إلى 30 يومًا." if progress==30 else "")
-        await q.edit_message_text(f"{title}\n\n{description}\n\n📈 تقدمك: {progress} يوم\n🪙 رصيد اللعبة: {coins}\n⭐ نقاطك المضافة اليوم: {reward}{milestone}\n\nعد غدًا لمتابعة تقدمك. تقدمك محفوظ حتى بعد إعادة تشغيل البوت.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 العودة للألعاب",callback_data=f"member_games:{chat_id}")],[InlineKeyboardButton("🏆 لوحة المتصدرين",callback_data=f"game_scores:{chat_id}")]])); return
+        milestone="\n🎉 إنجاز جديد! وصلت إلى 7 أيام." if progress==7 else ("\n🏅 إنجاز جديد! وصلت إلى 30 يومًا." if progress==30 else ("\n🌟 مكافأة أسبوعية إضافية!" if progress % 7 == 0 else ""))
+        await q.edit_message_text(f"{title}\n\n{description}\n\n📖 الفصل: {chapter}\n🧭 مهمة اليوم: {story}\n📈 تقدمك: {progress} يوم\n🪙 رصيد اللعبة: {coins}\n⭐ نقاطك اليوم: {reward}{milestone}\n\nتتغير المهمة مع تقدمك، وتُحفظ بياناتك بعد إعادة تشغيل البوت. عد غدًا لمتابعة الفصل التالي.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 العودة للألعاب",callback_data=f"member_games:{chat_id}")],[InlineKeyboardButton("🏆 لوحة المتصدرين",callback_data=f"game_scores:{chat_id}")]])); return
 
     if data.startswith("game_toggle:") or data.startswith("game_challenge_toggle:"):
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid)):
-            await q.answer("تغيير إعدادات الألعاب غير مسموح لك.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
+            await q.answer("إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
             await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
@@ -2170,14 +2352,71 @@ async def callback(update, context):
     if data.startswith("game_quiz:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
-        question="ما الكوكب المعروف بالكوكب الأحمر؟"; opts=[("🌍 الأرض",0),("🔴 المريخ",1),("🪐 زحل",0),("🌟 الزهرة",0)]
-        rows=[[InlineKeyboardButton(label, callback_data=f"game_answer:{chat_id}:{correct}")] for label,correct in opts]
-        rows.append([InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")])
-        await context.bot.send_message(chat_id, f"🧠 سؤال ثقافي وذكاء\n\n{question}\n\nاختر الإجابة الصحيحة:", reply_markup=InlineKeyboardMarkup(rows))
-        await q.edit_message_text("تم نشر السؤال في القروب 🧠", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
+        rows = [[InlineKeyboardButton(title, callback_data=f"game_quiz_cat:{chat_id}:{key}")]
+                for key,(title,_questions) in QUIZ_CATEGORIES.items()]
+        rows.append([InlineKeyboardButton("🎯 مسابقة متنوعة من 5 مراحل", callback_data=f"game_quiz_cat:{chat_id}:mixed")])
+        rows.append([InlineKeyboardButton("⬅️ الألعاب", callback_data=f"member_games:{chat_id}")])
+        await q.edit_message_text("🧠 المسابقات والمعلومات المتنوعة\n\nاختر المجال، أو ابدأ مسابقة متنوعة من خمس مراحل. كل إجابة صحيحة تمنح نقاطًا، وتظهر معلومة مختصرة بعد الإجابة.", reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("game_quiz_cat:"):
+        try: _,chat_raw,category=data.split(":",2); chat_id=int(chat_raw)
+        except ValueError: await q.answer("بيانات المسابقة غير صحيحة.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await q.answer("القروب غير مسجل.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if category == "mixed": category=random.choice(list(QUIZ_CATEGORIES.keys()))
+        if category not in QUIZ_CATEGORIES: await q.answer("هذا المجال غير متاح.", show_alert=True); return
+        await q.answer("بدأت المسابقة!")
+        await send_quiz_stage(context, chat_id, category, 1)
+        await q.edit_message_text("🚀 بدأت المسابقة في القروب! انتقل إلى القروب للإجابة، ثم أكمل المراحل الخمس.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 مركز الألعاب", callback_data=f"member_games:{chat_id}")]])); return
+
+    if data.startswith("game_stage_answer:"):
+        try: _,token,choice_raw=data.split(":",2); choice=int(choice_raw)
+        except ValueError: await q.answer("الإجابة غير صالحة.", show_alert=True); return
+        row=db.execute("SELECT chat_id,answer,completed FROM game_rounds WHERE token=? AND kind='quiz_stage'", (token,)).fetchone()
+        if not row: await q.answer("انتهت هذه الجولة؛ ابدأ مسابقة جديدة.", show_alert=True); return
+        chat_id,answer_data,completed=row
+        if q.message.chat.id != chat_id: await q.answer("هذه الجولة تخص قروبًا آخر.", show_alert=True); return
+        if completed: await q.answer("تم حسم هذه المرحلة بالفعل.", show_alert=True); return
+        try: category,stage_raw,question_raw,correct_raw=answer_data.split("|"); stage=int(stage_raw); question_index=int(question_raw); correct=int(correct_raw)
+        except ValueError: await q.answer("تعذر قراءة بيانات المرحلة.", show_alert=True); return
+        title,questions=QUIZ_CATEGORIES[category]; question,options,correct_index,explanation=questions[question_index]
+        if choice != correct:
+            await q.answer("❌ ليست الإجابة الصحيحة؛ جرّب مرة أخرى.", show_alert=True); return
+        changed=db.execute("UPDATE game_rounds SET completed=1 WHERE token=? AND completed=0", (token,)).rowcount
+        if not changed: await q.answer("تم حسم هذه المرحلة بالفعل.", show_alert=True); return
+        name=q.from_user.full_name or "عضو"
+        db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
+        db.execute("UPDATE game_scores SET points=points+5,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?", (name,chat_id,uid))
+        record_game_points(chat_id,uid,5,"quiz_stage")
+        db.commit()
+        rows=[]
+        if stage < 5:
+            rows.append([InlineKeyboardButton(f"➡️ المرحلة التالية ({stage+1}/5)", callback_data=f"game_stage_next:{chat_id}:{category}:{stage+1}")])
+        else:
+            rows.append([InlineKeyboardButton("🏆 عرض المتصدرين", callback_data=f"game_scores:{chat_id}")])
+        rows.append([InlineKeyboardButton("🎮 الألعاب", callback_data=f"member_games:{chat_id}")])
+        await q.edit_message_text(f"✅ إجابة صحيحة يا {name}!\n⭐ ربحت 5 نقاط.\n\n💡 معلومة: {explanation}\n\n{'🎉 أكملت المراحل الخمس! يمكنك بدء مسابقة جديدة.' if stage==5 else 'أصبحت جاهزًا للمرحلة التالية.'}", reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("game_stage_next:"):
+        try: _,chat_raw,category,stage_raw=data.split(":",3); chat_id=int(chat_raw); stage=int(stage_raw)
+        except ValueError: await q.answer("بيانات المرحلة غير صحيحة.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await q.answer("القروب غير مسجل.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("أوقف الإشراف الألعاب في هذا القروب.", show_alert=True); return
+        if category not in QUIZ_CATEGORIES or stage < 2 or stage > 5:
+            await q.answer("المرحلة غير متاحة.", show_alert=True); return
+        await q.answer(f"المرحلة {stage} بدأت")
+        await send_quiz_stage(context,chat_id,category,stage)
+        try: await q.edit_message_text(f"🚀 نُشرت المرحلة {stage} من 5 في القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 مركز الألعاب", callback_data=f"member_games:{chat_id}")]]))
+        except Exception: pass
+        return
 
     if data.startswith("game_answer:"):
         try: _,chat_raw,correct_raw=data.split(":",2); chat_id=int(chat_raw); correct=int(correct_raw)
@@ -2195,7 +2434,7 @@ async def callback(update, context):
     if data.startswith("game_word:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         rows=[[InlineKeyboardButton("👋 مرحبا", callback_data=f"game_word_answer:{chat_id}:1"), InlineKeyboardButton("🏫 مدرسة", callback_data=f"game_word_answer:{chat_id}:0")], [InlineKeyboardButton("🌊 بحر", callback_data=f"game_word_answer:{chat_id}:0"), InlineKeyboardButton("✏️ قلم", callback_data=f"game_word_answer:{chat_id}:0")], [InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]]
@@ -2217,7 +2456,7 @@ async def callback(update, context):
     if data.startswith("game_rps:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         import random
@@ -2229,7 +2468,7 @@ async def callback(update, context):
     if data.startswith("game_rps_pick:"):
         try: _,chat_raw,choice=data.split(":",2); chat_id=int(chat_raw)
         except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         bot_choice=context.user_data.pop(f"rps:{chat_id}", None)
         if not bot_choice: await q.answer("انتهت الجولة؛ ابدأ لعبة جديدة.", show_alert=True); return
         wins={"حجر":"مقص","ورقة":"حجر","مقص":"ورقة"}
@@ -2248,7 +2487,7 @@ async def callback(update, context):
     if data.startswith("game_challenge:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         if cfg and (not cfg[0] or not cfg[1]): await q.answer("تحدي الخاسر غير مفعّل.", show_alert=True); return
         import random
@@ -2269,7 +2508,7 @@ async def callback(update, context):
             await q.answer("هذا التحدي مخصص للعضو الذي استلمه.", show_alert=True); return
         if completed:
             await q.answer("تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("UPDATE game_challenges SET completed=1 WHERE token=? AND completed=0", (challenge_token,))
         if db.execute("SELECT changes()").fetchone()[0] != 1:
@@ -2281,7 +2520,7 @@ async def callback(update, context):
     if data.startswith("game_scores:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         rows=db.execute("SELECT display_name,points,wins,losses FROM game_scores WHERE chat_id=? ORDER BY points DESC,wins DESC LIMIT 10",(chat_id,)).fetchall()
         body="\n".join(f"{i}. {name or 'عضو'} — ⭐ {points} | 🏆 {wins} فوز | ❌ {losses} خسارة" for i,(name,points,wins,losses) in enumerate(rows,1)) or "لا توجد نتائج بعد. ابدأ اللعب لتظهر هنا!"
         await q.edit_message_text("🏆 المتصدرون في هذا القروب\n\n"+body, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
@@ -2289,7 +2528,7 @@ async def callback(update, context):
     if data.startswith("game_periods:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         rows=[[InlineKeyboardButton("📅 المتصدرون هذا الأسبوع", callback_data=f"game_period_scores:{chat_id}:week")],
               [InlineKeyboardButton("🗓️ المتصدرون هذا الشهر", callback_data=f"game_period_scores:{chat_id}:month")],
               [InlineKeyboardButton("🏆 الترتيب العام", callback_data=f"game_scores:{chat_id}")],
@@ -2310,7 +2549,7 @@ async def callback(update, context):
     if data.startswith("game_scramble:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
@@ -2324,7 +2563,7 @@ async def callback(update, context):
     if data.startswith("game_speed:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
@@ -2389,7 +2628,7 @@ async def callback(update, context):
     if data.startswith("game_xo_start:"):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
-        if not await can_access_group(context.bot,uid,chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.",show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
         token=uuid.uuid4().hex[:12]
