@@ -1,10 +1,12 @@
 import os
 import re
+import asyncio
 import sqlite3
 import threading
 import logging
 import tempfile
 import uuid
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -189,13 +191,17 @@ db.execute("""CREATE TABLE IF NOT EXISTS game_xo(
     player_o INTEGER, board TEXT NOT NULL DEFAULT '         ', turn TEXT NOT NULL DEFAULT 'X',
     status TEXT NOT NULL DEFAULT 'waiting', message_id INTEGER, created_at TEXT NOT NULL
 )""")
+db.execute("""CREATE TABLE IF NOT EXISTS pending_verifications(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,user_id)
+)""")
 db.commit()
 
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "games", "repeat",
     "join_lock", "entry", "add_lock", "notifications", "markdown", "edit", "archive",
-    "public_commands", "public_activity", "public_protection"
+    "public_commands", "public_activity", "public_protection", "flood", "verify_new_members"
 ]
 
 DEFAULTS = {field: 0 for field in SETTING_FIELDS}
@@ -525,48 +531,38 @@ def register_group(chat):
     db.commit()
 
 def panel_markup(uid):
-    # لوحة المالك المفوض تشمل الإدارة التشغيلية، وتُفلتر كل مجموعة حسب عضويته.
-    # تبقى إدارة المالكين والأرشيف الخاص والتحكم بالصلاحيات للمالك الأساسي فقط.
+    # واجهة موحدة بعناوين وأيقونات مرتبة؛ الصلاحيات الحساسة للمالك الأساسي فقط.
     if is_delegated_owner(uid) and not is_owner(uid):
         return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛡️ الحماية", callback_data="security_groups"), InlineKeyboardButton("🔨 الإشراف", callback_data="administration_groups")],
             [InlineKeyboardButton("📣 النشر", callback_data="broadcast_start"), InlineKeyboardButton("👋 الترحيب", callback_data="welcome")],
-            [InlineKeyboardButton("📊 إحصائيات القروبات", callback_data="statistics"), InlineKeyboardButton("📋 السجلات", callback_data="logs")],
-            [InlineKeyboardButton("🛡️ الحماية وإعدادات القروبات", callback_data="security_groups"), InlineKeyboardButton("🔨 أوامر الإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("👥 توزيع الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("📢 الدخول والخروج والتنبيهات", callback_data="alerts")],
-            [InlineKeyboardButton("🎮🏆 مركز الألعاب والتحديات", callback_data="games")],
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋 السجلات", callback_data="logs")],
+            [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("📢 التنبيهات", callback_data="alerts")],
+            [InlineKeyboardButton("👥 الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("💚 صحة البوت", callback_data="health")],
         ])
-    rows = [
-        [InlineKeyboardButton("🛡️ الحماية", callback_data="security"),
-         InlineKeyboardButton("🔨 الإدارة", callback_data="administration")],
-        [InlineKeyboardButton("👋 الترحيب", callback_data="welcome"),
-         InlineKeyboardButton("🎮🏆 مركز الألعاب", callback_data="games")],
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
-         InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
-        [InlineKeyboardButton("📢 الإشعارات", callback_data="alerts"),
-         InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
-        [InlineKeyboardButton("👑 الصلاحيات العليا", callback_data="permissions"),
-         InlineKeyboardButton("📨 سجل الرسائل الخاص", callback_data="archive")],
-        [InlineKeyboardButton("👥 توزيع الرتب داخل القروبات", callback_data="roles_groups")],
-        [InlineKeyboardButton("👑 المالك المفوّض وصلاحيات النشر", callback_data="delegated_owner")],
-        [InlineKeyboardButton("📣 نشر إعلان بالقروبات المحددة", callback_data="broadcast_start")],
-        [InlineKeyboardButton("💾 النسخ الاحتياطي (للمالك فقط)", callback_data="owner_backup"),
-         InlineKeyboardButton("⚙️ إعدادات النظام العليا", callback_data="owner_system")]
-    ]
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛡️ الحماية", callback_data="security"), InlineKeyboardButton("🔨 إدارة الأعضاء", callback_data="administration")],
+        [InlineKeyboardButton("📣 النشر", callback_data="broadcast_start"), InlineKeyboardButton("👋 الترحيب", callback_data="welcome")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
+        [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("📢 التنبيهات", callback_data="alerts")],
+        [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("👥 الرتب الإدارية", callback_data="roles_groups")],
+        [InlineKeyboardButton("💚 صحة البوت", callback_data="health"), InlineKeyboardButton("👑 إدارة المالكين المفوضين", callback_data="delegated_owner")],
+        [InlineKeyboardButton("📨 سجل الرسائل الخاص (للمالك)", callback_data="archive")],
+        [InlineKeyboardButton("💾 النسخ الاحتياطي (للمالك)", callback_data="owner_backup"), InlineKeyboardButton("⚙️ النظام الأعلى (للمالك)", callback_data="owner_system")],
+    ])
 
 def settings_page_markup(chat_id, page=0):
     items = [
-        ("الروابط", "links"), ("تنسيق النصوص", "markdown"), ("الكيبورد", "keyboard"),
-        ("الأغاني", "audio"), ("صور GIF المتحركة", "gif"), ("الملفات", "files"),
-        ("الرسائل المتكررة", "repeat"), ("الفيديو", "videos"), ("الصور", "photos"),
+        ("منع الروابط", "links"), ("الكيبورد", "keyboard"),
+        ("الصوت", "audio"), ("صور GIF المتحركة", "gif"), ("الملفات", "files"),
+        ("منع تكرار الرسائل", "repeat"), ("الفيديو", "videos"), ("الصور", "photos"),
         ("أسماء المستخدمين", "username"), ("الإشارات للأعضاء", "tag"), ("البوتات", "bots"),
-        ("الألعاب", "games"), ("الملصقات", "stickers"), ("التعديل", "edit"),
-        ("رسائل الدخول", "entry"), ("الإضافة", "add_lock"),
-        ("الإشعارات", "notifications"), ("الدخول", "join_lock"),
-        ("إعادة توجيه الرسائل", "keyboard"), ("الصوت", "audio"), ("مشاركة جهات الاتصال", "username"),
-        ("رسائل الفيديو الدائرية", "videos"), ("تثبيت الرسائل", "markdown"),
+        ("الألعاب", "games"), ("الملصقات", "stickers"), ("حذف الرسائل المعدلة", "edit"),
+        ("رسائل الدخول", "entry"), ("منع إضافة الأعضاء", "add_lock"),
+        ("إشعارات البوت", "notifications"),
         ("إظهار دليل الأوامر للأعضاء", "public_commands"),
-        ("إظهار نشاط الأعضاء", "public_activity"), ("إظهار أنظمة الحماية للأعضاء", "public_protection")
+        ("إظهار نشاط الأعضاء", "public_activity"), ("إظهار معلومات الحماية للأعضاء", "public_protection"),
+        ("🧯 الحماية من إغراق الرسائل", "flood"), ("👤 التحقق من الأعضاء الجدد", "verify_new_members")
     ]
     per_page = 12
     pages = max(1, (len(items) + per_page - 1) // per_page)
@@ -615,6 +611,41 @@ def group_list_markup_for(prefix):
     rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
+async def report_cmd(update, context):
+    """بلاغ خاص للمشرفين عن رسالة بالقروب دون نشر البلاغ في العلن."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text("استخدم /report بالرد على الرسالة داخل القروب للإبلاغ عنها بسرية.")
+        return
+    if not msg.reply_to_message:
+        await msg.reply_text("ℹ️ للإبلاغ بسرية، ردّ على الرسالة المخالفة واكتب /report.")
+        return
+    target = msg.reply_to_message
+    body = (target.text or target.caption or "[رسالة غير نصية]")[:800]
+    reporter_name = user.full_name or "عضو"
+    target_user = target.from_user
+    target_name = target_user.full_name if target_user else "مرسل غير معروف"
+    report_text = (
+        "🚩 بلاغ عضو جديد\n"
+        f"القروب: {chat.title or chat.id} (ID: {chat.id})\n"
+        f"المبلّغ: {reporter_name} (ID: {user.id})\n"
+        f"عن العضو: {target_name} (ID: {target_user.id if target_user else 'غير متاح'})\n"
+        f"رقم الرسالة: {target.message_id}\n"
+        f"المحتوى: {body}"
+    )
+    await notify_owners(context, report_text, "reports")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id=chat.id, text="✅ وصل بلاغك للمشرفين بسرية. شكرًا لمساعدتك في حماية القروب.")
+    log_action(chat.id, user.id, "member_report", f"reported message {target.message_id}; target={target_user.id if target_user else 0}")
+
+
 async def start(update, context):
     remember_delegated_user(update.effective_user)
     if update.effective_chat.type == ChatType.PRIVATE:
@@ -635,6 +666,7 @@ async def help_cmd(update, context):
         "🎮 الألعاب والتحديات متاحة من قائمة الأعضاء داخل القروب.\n"
         "🆔 /id — عرض رقم حسابك\n"
         "🆔 /idgroup — عرض رقم المجموعة\n"
+        "🚩 /report — بلاغ سري (بالرد على الرسالة)\n"
         "📊 الإحصائيات والسجلات من لوحة التحكم\n\n"
         "أوامر الأعضاء: /id و /idgroup و /settings.\n"
         "أوامر الإدارة العربية (للمصرح لهم): منع الروابط، السماح بالروابط، منع الصور، السماح بالصور، منع الفيديو، السماح بالفيديو، منع الملفات، السماح بالملفات، منع الملصقات، السماح بالملصقات، منع التكرار، السماح بالتكرار.\n"
@@ -1285,6 +1317,9 @@ async def ArabicTextCommand(update, context):
 
 recent_messages = defaultdict(lambda: deque(maxlen=6))
 recent_message_ids = defaultdict(lambda: deque(maxlen=500))
+# حماية اختيارية من الإغراق: لا تعمل إلا عند تفعيلها من لوحة الحماية.
+flood_message_times = defaultdict(deque)
+flood_notice_last = {}
 
 def has_link(text):
     return bool(text and re.search(r"(https?://|www\.|t\.me/|telegram\.me/)", text, re.I))
@@ -1367,6 +1402,24 @@ async def message_filter(update, context):
     if is_manager(uid) or is_delegated_owner(uid) or is_protection_manager(uid):
         return
     s = get_settings(chat.id)
+    if s.get("flood", 0) and msg.from_user and not msg.from_user.is_bot:
+        key = (chat.id, uid)
+        now_mono = time.monotonic()
+        times = flood_message_times[key]
+        while times and now_mono - times[0] > 8:
+            times.popleft()
+        times.append(now_mono)
+        if len(times) >= 7:
+            try:
+                await msg.delete()
+                log_action(chat.id, uid, "anti_flood", f"7+ messages within 8 seconds; message {msg.message_id}")
+            except Exception as exc:
+                log.info("تعذر حذف رسالة الإغراق في %s: %s", chat.id, exc)
+            last_notice = flood_notice_last.get(key, 0)
+            if now_mono - last_notice >= 60:
+                flood_notice_last[key] = now_mono
+                await notify_owners(context, f"🧯 رصد إغراق رسائل\nالقروب: {chat.title or chat.id}\nالعضو: {msg.from_user.full_name} (ID: {uid})\nالإجراء: حذف الرسالة بعد رصد 7 رسائل خلال 8 ثوانٍ.", "security")
+            return
     delete = False
     reason = ""
 
@@ -1452,6 +1505,25 @@ async def chat_member_handler(update, context):
         except Exception:
             pass
 
+async def verification_timeout(bot, chat_id, user_id):
+    """إزالة العضو الذي لم يكمل التحقق خلال دقيقتين؛ تعمل فقط عند نجاح التقييد أولًا."""
+    await asyncio.sleep(120)
+    row = db.execute("SELECT 1 FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    if not row:
+        return
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        db.execute("DELETE FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        db.commit()
+        log_action(chat_id, user_id, "verification_timeout", "لم يكمل التحقق خلال 120 ثانية")
+        try:
+            await bot.send_message(chat_id, f"🚫 تمت إزالة العضو {user_id} لعدم إكمال التحقق خلال دقيقتين.")
+        except Exception:
+            pass
+    except Exception as exc:
+        log.warning("تعذر إزالة عضو لم يكمل التحقق %s في %s: %s", user_id, chat_id, exc)
+
+
 async def new_members(update, context):
     msg = update.message
     if not msg or not msg.new_chat_members:
@@ -1468,6 +1540,29 @@ async def new_members(update, context):
                     await context.bot.send_message(update.effective_chat.id, welcome_text)
                 except Exception as e:
                     log.warning("Welcome message failed for %s: %s", update.effective_chat.id, e)
+            if s.get("verify_new_members", 0):
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat_id=update.effective_chat.id, user_id=member.id,
+                        permissions=ChatPermissions(can_send_messages=False, can_send_audios=False,
+                            can_send_documents=False, can_send_photos=False, can_send_videos=False,
+                            can_send_video_notes=False, can_send_voice_notes=False, can_send_polls=False,
+                            can_send_other_messages=False, can_add_web_page_previews=False)
+                    )
+                    db.execute("INSERT OR REPLACE INTO pending_verifications(chat_id,user_id,created_at) VALUES(?,?,?)",
+                               (update.effective_chat.id, member.id, now()))
+                    db.commit()
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"👤 أهلًا {member.full_name}! أكمل التحقق خلال دقيقتين للمشاركة في القروب.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ أنا إنسان — تحقق", callback_data=f"verify_member:{update.effective_chat.id}:{member.id}")]])
+                    )
+                    context.application.create_task(verification_timeout(context.bot, update.effective_chat.id, member.id))
+                except Exception as exc:
+                    db.execute("DELETE FROM pending_verifications WHERE chat_id=? AND user_id=?", (update.effective_chat.id, member.id))
+                    db.commit()
+                    log.warning("تعذر بدء التحقق للعضو %s في %s: %s", member.id, update.effective_chat.id, exc)
+                    await notify_owners(context, f"⚠️ تعذر بدء التحقق من عضو جديد\nالقروب: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name} (ID: {member.id})\nتحقق من صلاحيات البوت كمشرف.", "security")
     if s["entry"]:
         try:
             await msg.delete()
@@ -1601,6 +1696,69 @@ async def callback(update, context):
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "health":
+        if not can_use_panel(uid):
+            await q.edit_message_text("⛔ هذا القسم للمصرّح لهم فقط.")
+            return
+        try:
+            groups_count = db.execute("SELECT COUNT(*) FROM watched_groups").fetchone()[0]
+            delegated_count = db.execute("SELECT COUNT(*) FROM delegated_owners").fetchone()[0] if is_owner(uid) else None
+            logs_count = db.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+            pending_count = db.execute("SELECT COUNT(*) FROM pending_verifications").fetchone()[0]
+            db_status = "🟢 متصلة"
+        except Exception:
+            log.exception("Health panel database check failed")
+            groups_count, logs_count, pending_count = 0, 0, 0
+            db_status = "🔴 تعذر الفحص"
+        health_lines = [
+            "💚 مؤشر صحة البوت",
+            "",
+            f"🗄️ قاعدة البيانات: {db_status}",
+            f"👥 القروبات المسجلة: {groups_count}",
+            f"📋 العمليات المسجلة: {logs_count}",
+            f"🕵️ طلبات التحقق المعلقة: {pending_count}",
+            "🌐 فحص الاستضافة: نقطة HTTP مفعّلة عند تشغيل الخدمة.",
+            "",
+            "ℹ️ هذه قراءة داخلية للحالة، ولا تؤكد وحدها أن Telegram API أو كل صلاحيات البوت تعمل دون أخطاء.",
+        ]
+        if delegated_count is not None:
+            health_lines.insert(4, f"🤝 المالكـون المفوضون: {delegated_count}")
+        await q.edit_message_text("\n".join(health_lines), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 تحديث الحالة", callback_data="health")],
+            [InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")],
+        ]))
+        return
+
+    if data.startswith("verify_member:"):
+        try:
+            _, chat_raw, user_raw = data.split(":", 2)
+            chat_id, target_uid = int(chat_raw), int(user_raw)
+        except ValueError:
+            await q.answer("بيانات التحقق غير صحيحة.", show_alert=True)
+            return
+        if uid != target_uid:
+            await q.answer("زر التحقق مخصص للعضو الجديد فقط.", show_alert=True)
+            return
+        if not db.execute("SELECT 1 FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat_id, target_uid)).fetchone():
+            await q.answer("تم التحقق مسبقًا أو انتهت المهلة.", show_alert=True)
+            return
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id, user_id=target_uid,
+                permissions=ChatPermissions(can_send_messages=True, can_send_audios=True,
+                    can_send_documents=True, can_send_photos=True, can_send_videos=True,
+                    can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
+                    can_send_other_messages=True, can_add_web_page_previews=True)
+            )
+            db.execute("DELETE FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat_id, target_uid))
+            db.commit()
+            log_action(chat_id, target_uid, "verification_complete", "اكتمل التحقق")
+            await q.edit_message_text("✅ تم التحقق بنجاح، أهلًا بك في القروب!")
+        except Exception as exc:
+            log.warning("تعذر إكمال التحقق للعضو %s في %s: %s", target_uid, chat_id, exc)
+            await q.answer("تعذر إكمال التحقق. أبلغ مشرف القروب ليتأكد من صلاحيات البوت.", show_alert=True)
+        return
 
     if data == "noop" or data.startswith("noop:"):
         await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
@@ -2331,7 +2489,7 @@ async def callback(update, context):
             rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات المتاحة لي", callback_data="broadcast_select_all")])
         rows.append([InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")])
         rows.append([InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")])
-        await q.edit_message_text("📣 نشر إعلان بالقروبات\n\nحدد القروبات التي تريد النشر فيها. المالك المفوّض تظهر له القروبات المسجلة التي هو عضو فيها فقط.", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("📣 نشر إعلان بالقروبات\n\nحدد القروبات التي تريد النشر فيها. المالك المالك المفوّض يمكنه النشر إلى القروبات المسجلة التي يوجد فيها البوت.", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("broadcast_toggle:"):
@@ -2635,7 +2793,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel,
+        "start": start, "help": help_cmd, "panel": panel, "report": report_cmd,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
         "grantpublish": grantpublish, "revokepublish": revokepublish,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
