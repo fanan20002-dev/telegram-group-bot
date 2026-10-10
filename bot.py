@@ -9,6 +9,7 @@ import uuid
 import time
 import random
 import json
+import html
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -176,6 +177,31 @@ db.execute("""
 CREATE TABLE IF NOT EXISTS archive_settings(
     chat_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS weekly_message_activity(
+    chat_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(chat_id, week_start, user_id)
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS weekly_membership_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_at TEXT NOT NULL
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS weekly_stats_sent(
+    chat_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, week_start)
 )
 """)
 db.execute("""
@@ -627,22 +653,30 @@ async def can_publish_to_live(bot, uid, chat_id):
         db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
     )
 
-async def can_access_group(bot, uid, chat_id):
-    """المالك المفوّض يملك صلاحيات الإدارة التشغيلية في كل قروب مسجل للبوت؛ الصلاحيات العليا تبقى للمالك الأساسي."""
-    if is_owner(uid):
-        return True
-    if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-        return False
-    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
-        return True
-    if not group_role(chat_id, uid):
-        return False
+async def is_telegram_group_admin(bot, uid, chat_id):
+    """تحقق فعلي من أن المستخدم مالك/مشرف في هذا القروب عبر Telegram."""
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
-        return member.status not in ("left", "kicked")
+        return member.status in ("creator", "administrator")
     except Exception as exc:
-        log.warning("تعذر التحقق من عضوية المستخدم %s في القروب %s: %s", uid, chat_id, exc)
+        log.info("تعذر التحقق من مشرف القروب %s في %s: %s", uid, chat_id, exc)
         return False
+
+async def can_access_group(bot, uid, chat_id):
+    """الوصول لقروب محدد فقط؛ مشرف Telegram يدير قروبه ولا يرث صلاحيات مالك البوت."""
+    if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+        return False
+    if is_owner(uid):
+        return True
+    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+        return True
+    if group_role(chat_id, uid):
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
+            return member.status not in ("left", "kicked")
+        except Exception:
+            return False
+    return await is_telegram_group_admin(bot, uid, chat_id)
 
 async def accessible_groups(bot, uid):
     groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
@@ -769,6 +803,7 @@ def panel_markup(uid):
             [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
+            [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
@@ -777,12 +812,13 @@ def panel_markup(uid):
         [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
+        [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية (للمالك فقط)", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ])
 
-def settings_page_markup(chat_id, page=0):
+def settings_page_markup(chat_id, page=0, back_callback="home"):
     items = [
         ("منع الروابط", "links"), ("الكيبورد", "keyboard"),
         ("الصوت", "audio"), ("صور GIF المتحركة", "gif"), ("الملفات", "files"),
@@ -813,7 +849,7 @@ def settings_page_markup(chat_id, page=0):
         nav.append(InlineKeyboardButton("التالي", callback_data=f"settings_page:{chat_id}:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="home")])
+    rows.append([InlineKeyboardButton("⬅️ لوحة القروب" if back_callback.startswith("group_panel_home:") else "⬅️ القائمة الرئيسية", callback_data=back_callback)])
     return InlineKeyboardMarkup(rows)
 
 def settings_text(page):
@@ -1378,13 +1414,56 @@ async def start(update, context):
         )
     else:
         register_group(update.effective_chat)
+        chat = update.effective_chat
+        owner_tag = "مالك القروب"
+        try:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            creator = next((a.user for a in admins if a.status == "creator"), None)
+            if creator:
+                owner_tag = f'<a href="tg://user?id={creator.id}">{html.escape(creator.full_name or "مالك القروب")}</a>'
+        except Exception as exc:
+            log.info("تعذر جلب مالك القروب للتنبيه: %s", exc)
+        try:
+            bot_user = await context.bot.get_me()
+            bot_tag = f'@{bot_user.username}' if bot_user.username else 'البوت'
+        except Exception:
+            bot_tag = 'البوت'
         await update.effective_message.reply_text(
-            "تم تشغيل البوت ✅\n"
+            f"تم تشغيل {html.escape(bot_tag)} ✅\n"
+            f"👑 مالك القروب: {owner_tag}\n\n"
             "🤖 الردود الآلية مفعّلة افتراضيًا في هذا القروب.\n"
-            "🛡️ جرّب كتابة: شكراً، صباح الخير، أو مناداة البوت بكلمة (بوت).\n"
-            "ملاحظة: لقراءة رسائل الأعضاء العادية، اجعل البوت مشرفًا أو عطّل وضع الخصوصية له من BotFather.\n"
-            "استخدم /panel للوحة التحكم."
+            "🛡️ لوحة التحكم هنا تخص هذا القروب فقط، وتظهر لمالك القروب ومشرفيه في Telegram.\n"
+            "🔒 لا تفتح هذه اللوحة صلاحيات مالك البوت أو إعدادات قروبات أخرى.\n"
+            "استخدم /panel لفتح لوحة القروب.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛡️ فتح لوحة هذا القروب", callback_data=f"group_panel_home:{chat.id}")],
+                [InlineKeyboardButton("🎮 الألعاب والمراجعات والتحديات", callback_data=f"member_games:{chat.id}")],
+                [InlineKeyboardButton("🕹️ مركز الأعضاء", callback_data=f"public:back")],
+            ]),
         )
+
+async def games_cmd(update, context):
+    """فتح ألعاب ومراجعات القروب مباشرة بأمر /games."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
+        return
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        register_group(chat)
+        db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat.id,))
+        db.commit()
+        await msg.reply_text(
+            "🎮 الألعاب والمراجعات والتحديات\nاختر لفتح القائمة والمشاركة:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 فتح الألعاب والمراجعات", callback_data=f"member_games:{chat.id}")], [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat.id}")]])
+        )
+        return
+    groups = await accessible_groups(context.bot, update.effective_user.id if update.effective_user else 0)
+    if not groups:
+        await msg.reply_text("لا توجد قروبات مسجلة تستطيع الوصول إليها. افتح /start داخل القروب ثم جرّب /games.")
+        return
+    rows = [[InlineKeyboardButton(f"🎮 {title or cid}", callback_data=f"member_games:{cid}")] for cid, title in groups[:30]]
+    await msg.reply_text("🎮 اختر القروب لفتح الألعاب والمراجعات:", reply_markup=InlineKeyboardMarkup(rows))
 
 async def help_cmd(update, context):
     uid = update.effective_user.id if update.effective_user else 0
@@ -1393,7 +1472,7 @@ async def help_cmd(update, context):
         "🏠 /panel — لوحة التحكم من الخاص (للمصرح لهم)\n"
         "🛡️ من الخاص: اختر القروب ثم غيّر إعدادات الحماية.\n"
         "🔨 من الخاص: اختر القروب ثم نفّذ الحظر والكتم والطرد والحذف والتثبيت برقم المستخدم أو الرسالة.\n"
-        "🎮 الألعاب والتحديات متاحة من قائمة الأعضاء داخل القروب.\n"
+        "🎮 /games — فتح الألعاب والمراجعات والتحديات داخل القروب.\n"
         "🆔 /id — عرض رقم حسابك\n"
         "🆔 /idgroup — عرض رقم المجموعة\n"
         "🚩 /report — بلاغ سري (بالرد على الرسالة)\n"
@@ -1418,26 +1497,59 @@ async def help_cmd(update, context):
         )
     await update.effective_message.reply_text(text)
 
+def group_owner_panel_markup(chat_id):
+    """لوحة محدودة لقروب واحد؛ لا تتضمن إدارة المالكين أو إعدادات النظام العليا."""
+    s = get_settings(chat_id)
+    link_label = "🔴 فتح الروابط" if s.get("links") else "🔒 إغلاق الروابط"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"group_panel_settings:{chat_id}")],
+        [InlineKeyboardButton(link_label, callback_data=f"group_panel_toggle_links:{chat_id}"), InlineKeyboardButton("📣 استدعاء أعضاء القروب", callback_data=f"group_panel_tag:{chat_id}")],
+        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"), InlineKeyboardButton("🪪 إدارة الرتب والصلاحيات", callback_data=f"group_panel_roles:{chat_id}")],
+        [InlineKeyboardButton("📋 سجلات هذا القروب", callback_data=f"group_panel_logs:{chat_id}"),
+         InlineKeyboardButton("📊 إحصائيات هذا القروب", callback_data=f"group_panel_stats:{chat_id}")],
+        [InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")],
+    ])
+
 async def panel(update, context):
-    if not can_use_panel(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ ليس لديك صلاحية لوحة الإدارة.")
+    uid = update.effective_user.id
+    chat = update.effective_chat
+    # داخل القروب: مشرف Telegram يحصل على لوحة لهذا القروب فقط، دون لوحة مالك البوت.
+    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not is_owner(uid) and not is_delegated_owner(uid) and not is_general_manager(uid) and not is_protection_manager(uid):
+        if not await is_telegram_group_admin(context.bot, uid, chat.id):
+            await update.effective_message.reply_text("⛔ لوحة القروب متاحة لمالك القروب ومشرفيه في Telegram فقط.")
+            return
+        register_group(chat)
+        await update.effective_message.reply_text(
+            f"🛡️ لوحة إدارة القروب: {html.escape(chat.title or str(chat.id))}\n"
+            "هذه اللوحة تخص هذا القروب فقط. لا تمنحك صلاحيات مالك البوت أو الوصول إلى قروبات أخرى.",
+            reply_markup=group_owner_panel_markup(chat.id),
+        )
         return
-    if update.effective_chat and update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        register_group(update.effective_chat)
-    is_primary_owner = is_owner(update.effective_user.id)
+    if not can_use_panel(uid):
+        # في الخاص: اعرض فقط القروبات التي ثبت أن المستخدم مشرف فيها.
+        groups = await accessible_groups(context.bot, uid)
+        if not groups:
+            await update.effective_message.reply_text("⛔ لا توجد قروبات مسجلة أنت مالكها أو مشرف فيها. أضف البوت إلى قروبك، امنحه صلاحيات المشرف المطلوبة، ثم أرسل /start داخل القروب.")
+            return
+        rows = [[InlineKeyboardButton(f"🛡️ {title or chat_id}", callback_data=f"group_panel_home:{chat_id}")] for chat_id, title in groups[:30]]
+        await update.effective_message.reply_text(
+            "🛡️ لوحة قروباتك\nاختر قروبًا لإدارة صلاحياته المحددة فقط. لا تظهر هنا صلاحيات مالك البوت.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        register_group(chat)
+    is_primary_owner = is_owner(uid)
     panel_intro = (
         "👑 لوحة التحكم الرئيسية\n\n"
-        f"الصلاحية: {role_name(update.effective_user.id)}\n\n"
+        f"الصلاحية: {role_name(uid)}\n\n"
         "🛡️ الحماية والإشراف: إدارة القروبات والأعضاء وإعدادات الحماية.\n"
         "📊 المتابعة: الإحصائيات والسجلات والتنبيهات وحالة البوت.\n"
         "🎮 الخدمات: الألعاب والتحديات ومركز الوسائط.\n"
         + ("👑 إدارة النظام: الردود الآلية والمفوّضون والنسخ الاحتياطي والأرشيف والإعدادات العليا.\n\n" if is_primary_owner else "\n")
         + "اختر القسم المطلوب. تُعرض الخيارات بحسب صلاحيتك، وتُفحص الصلاحية أيضًا عند تنفيذ كل إجراء."
     )
-    await update.effective_message.reply_text(
-        panel_intro,
-        reply_markup=panel_markup(update.effective_user.id)
-    )
+    await update.effective_message.reply_text(panel_intro, reply_markup=panel_markup(uid))
 
 async def addowner(update, context):
     if not is_owner(update.effective_user.id):
@@ -1721,10 +1833,13 @@ async def group_role_command(update, context):
     user = update.effective_user
     if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
+    # مالك البوت/المفوّض يدير رتب البوت، كما يمكن لمالك القروب ومشرفيه
+    # إدارة الرتب المحلية داخل قروبهم فقط بعد التحقق من صلاحيات Telegram.
     if not (is_owner(user.id) or is_delegated_owner(user.id)):
-        await msg.reply_text("⛔ رفع الرتب داخل البوت للمالك الأساسي أو المالك المفوّض فقط.")
-        return
-    if is_delegated_owner(user.id) and not is_owner(user.id):
+        if not await is_telegram_group_admin(context.bot, user.id, chat.id):
+            await msg.reply_text("⛔ إدارة الرتب متاحة لمالك القروب ومشرفيه فقط.")
+            return
+    elif is_delegated_owner(user.id) and not is_owner(user.id):
         if not await can_access_group(context.bot, user.id, chat.id):
             await msg.reply_text("⛔ يجب أن تكون عضوًا في القروب لإدارة رتب البوت فيه.")
             return
@@ -2066,6 +2181,96 @@ def has_link(text):
 def has_tag(text):
     return bool(text and re.search(r"(?<!\w)@\w{3,}", text))
 
+def _riyadh_now():
+    return datetime.now(ZoneInfo("Asia/Riyadh"))
+
+def _week_start(dt=None):
+    dt = dt or _riyadh_now()
+    monday = (dt - __import__("datetime").timedelta(days=dt.weekday())).date()
+    return monday.isoformat()
+
+async def group_stats_cmd(update, context):
+    chat = update.effective_chat
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text("استخدم الأمر داخل القروب لعرض إحصائيته.")
+        return
+    register_group(chat)
+    week = _week_start()
+    row = db.execute("SELECT COALESCE(SUM(message_count),0), COUNT(*) FROM weekly_message_activity WHERE chat_id=? AND week_start=?", (chat.id, week)).fetchone()
+    messages, active = row or (0, 0)
+    known = db.execute("SELECT COUNT(*) FROM member_activity WHERE chat_id=?", (chat.id,)).fetchone()[0]
+    joins = db.execute("SELECT COUNT(*) FROM weekly_membership_events WHERE chat_id=? AND event_type='join' AND substr(event_at,1,10)>=?", (chat.id, week)).fetchone()[0]
+    leaves = db.execute("SELECT COUNT(*) FROM weekly_membership_events WHERE chat_id=? AND event_type='leave' AND substr(event_at,1,10)>=?", (chat.id, week)).fetchone()[0]
+    rate = (active / known * 100) if known else 0
+    top_rows = db.execute(
+        "SELECT COALESCE(ma.display_name,'عضو'), wa.message_count FROM weekly_message_activity wa "
+        "LEFT JOIN member_activity ma ON ma.chat_id=wa.chat_id AND ma.user_id=wa.user_id "
+        "WHERE wa.chat_id=? AND wa.week_start=? ORDER BY wa.message_count DESC LIMIT 5", (chat.id, week)
+    ).fetchall()
+    top_text = "\n".join(f"{idx}. {name} — {count} رسالة" for idx, (name, count) in enumerate(top_rows, 1)) or "لا توجد بيانات كافية"
+    await update.effective_message.reply_text(
+        f"📊 إحصائية القروب لهذا الأسبوع\n👥 القروب: {chat.title or chat.id}\n"
+        f"💬 الرسائل المرصودة: {messages:,}\n🗣️ الأعضاء المتفاعلون: {active:,}\n"
+        f"📈 نسبة التفاعل التقديرية: {rate:.1f}% من الأعضاء المسجلين لدى البوت\n"
+        f"🆕 الأعضاء المنضمون المرصودون: {joins}\n🚪 المغادرون المرصودون: {leaves}\n"
+        f"👤 الأعضاء المسجلون في قاعدة البوت: {known}\n🏆 أكثر 5 أعضاء نشاطًا:\n{top_text}\n\n"
+        "ℹ️ الإحصاءات تبدأ من وقت تفعيل الرصد، ولا تمثل سجلًا تاريخيًا كاملًا لتيليجرام."
+    )
+
+async def weekly_stats_worker(app):
+    """Publish weekly reports on Sundays at 20:00 Riyadh time, once per week/group."""
+    while True:
+        try:
+            now_local = _riyadh_now()
+            # Sunday is weekday 6. If Sunday's 20:00 has passed, schedule next Sunday.
+            days_until_sunday = (6 - now_local.weekday()) % 7
+            target = now_local.replace(hour=20, minute=0, second=0, microsecond=0) + __import__("datetime").timedelta(days=days_until_sunday)
+            if target <= now_local:
+                target += __import__("datetime").timedelta(days=7)
+            await asyncio.sleep(max(30, (target - now_local).total_seconds()))
+            now_local = _riyadh_now()
+            current_week = _week_start(now_local)
+            # Report the completed week, Monday-Sunday; sent marker prevents duplicates on restarts.
+            previous_week = (now_local.date() - __import__("datetime").timedelta(days=7)).isoformat()
+            previous_week = (now_local.date() - __import__("datetime").timedelta(days=now_local.weekday()+7)).isoformat()
+            groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+            for chat_id, title in groups:
+                sent = db.execute("SELECT 1 FROM weekly_stats_sent WHERE chat_id=? AND week_start=?", (chat_id, previous_week)).fetchone()
+                if sent:
+                    continue
+                stats = db.execute("SELECT COALESCE(SUM(message_count),0), COUNT(*) FROM weekly_message_activity WHERE chat_id=? AND week_start=?", (chat_id, previous_week)).fetchone()
+                messages, active = stats or (0, 0)
+                known = db.execute("SELECT COUNT(*) FROM member_activity WHERE chat_id=?", (chat_id,)).fetchone()[0]
+                joins = db.execute("SELECT COUNT(*) FROM weekly_membership_events WHERE chat_id=? AND event_type='join' AND substr(event_at,1,10)>=? AND substr(event_at,1,10)<?", (chat_id, previous_week, current_week)).fetchone()[0]
+                leaves = db.execute("SELECT COUNT(*) FROM weekly_membership_events WHERE chat_id=? AND event_type='leave' AND substr(event_at,1,10)>=? AND substr(event_at,1,10)<?", (chat_id, previous_week, current_week)).fetchone()[0]
+                rate = active / known * 100 if known else 0
+                top_rows = db.execute(
+                    "SELECT COALESCE(ma.display_name,'عضو'), wa.message_count FROM weekly_message_activity wa "
+                    "LEFT JOIN member_activity ma ON ma.chat_id=wa.chat_id AND ma.user_id=wa.user_id "
+                    "WHERE wa.chat_id=? AND wa.week_start=? ORDER BY wa.message_count DESC LIMIT 5",
+                    (chat_id, previous_week)
+                ).fetchall()
+                top_text = "\n".join(f"{idx}. {html.escape(name)} — {count} رسالة" for idx, (name, count) in enumerate(top_rows, 1)) or "لا توجد بيانات كافية"
+                report = (f"📊 التقرير الأسبوعي للقروب\n👥 {html.escape(title or str(chat_id))}\n"
+                    f"📅 الأسبوع المنتهي يوم السبت\n💬 الرسائل المرصودة: {messages:,}\n"
+                    f"🗣️ الأعضاء المتفاعلون: {active:,}\n📈 نسبة التفاعل التقديرية: {rate:.1f}%\n"
+                    f"🆕 المنضمون المرصودون: {joins}\n🚪 المغادرون المرصودون: {leaves}\n"
+                    f"👤 الأعضاء المسجلون لدى البوت: {known}\n"
+                    f"🏆 أكثر 5 أعضاء نشاطًا:\n{top_text}\n"
+                    "✨ مؤشرات إضافية: ترتيب النشاط، حركة الانضمام والمغادرة، ومتوسط الرسائل لكل عضو متفاعل.\n"
+                    "ℹ️ الأرقام تُحسب من وقت تشغيل الرصد، وعدد الأعضاء المسجلين ليس بالضرورة العدد الحالي الكامل.")
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML")
+                    db.execute("INSERT OR IGNORE INTO weekly_stats_sent(chat_id,week_start,sent_at) VALUES(?,?,?)", (chat_id, previous_week, now()))
+                    db.commit()
+                except Exception as exc:
+                    log.warning("تعذر إرسال التقرير الأسبوعي للقروب %s: %s", chat_id, exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("خطأ في عامل الإحصائيات الأسبوعية: %s", exc)
+            await asyncio.sleep(60)
+
 async def message_filter(update, context):
     msg = update.effective_message
     chat = update.effective_chat
@@ -2073,6 +2278,10 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
+    if msg.from_user and not msg.from_user.is_bot:
+        week_key = _week_start()
+        db.execute("INSERT INTO weekly_message_activity(chat_id,week_start,user_id,message_count) VALUES(?,?,?,1) ON CONFLICT(chat_id,week_start,user_id) DO UPDATE SET message_count=weekly_message_activity.message_count+1", (chat.id, week_key, msg.from_user.id))
+        db.commit()
     # الردود الآلية: تهيئة الردود الافتراضية مرة واحدة لكل قروب، مع تهدئة لمنع الإزعاج.
     if msg.from_user and not msg.from_user.is_bot and msg.text and not msg.text.startswith("/"):
         ensure_auto_replies(chat.id)
@@ -2267,6 +2476,13 @@ async def chat_member_handler(update, context):
         return
     chat_id = cm.chat.id
     register_group(cm.chat)
+    if member and not member.is_bot:
+        if old in ("left", "kicked") and new in ("member", "administrator", "restricted"):
+            db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "join", _riyadh_now().isoformat()))
+            db.commit()
+        elif old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
+            db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
+            db.commit()
     s = get_settings(chat_id)
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
@@ -2284,6 +2500,13 @@ async def chat_member_handler(update, context):
             log.warning("تعذر فرض منع العودة للعضو %s في %s: %s", member.id, chat_id, exc)
             await notify_owners(context, f"⚠️ تعذر منع عضو من العودة تلقائيًا\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف الثابت: {member.id}\nالسبب: {exc}", "membership")
     elif member and old in ("left", "kicked") and new in ("member", "administrator", "restricted") and not member.is_bot:
+        db.execute(
+            "INSERT INTO member_activity(chat_id,user_id,display_name,message_count,stars,custom_title,username) "
+            "VALUES(?,?,?,0,0,'',?) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "display_name=excluded.display_name, username=excluded.username",
+            (chat_id, member.id, member.full_name or "عضو", member.username or "")
+        )
+        db.commit()
         log_action(chat_id, member.id, "member_join", member.full_name)
         await notify_owners(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
     if member and member.is_bot and member.id == context.bot.id and old in ("left", "kicked") and new in ("member", "administrator"):
@@ -2326,6 +2549,13 @@ async def new_members(update, context):
     welcome_row = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
     for member in msg.new_chat_members:
         if not member.is_bot:
+            db.execute(
+                "INSERT INTO member_activity(chat_id,user_id,display_name,message_count,stars,custom_title,username) "
+                "VALUES(?,?,?,0,0,'',?) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+                "display_name=excluded.display_name, username=excluded.username",
+                (update.effective_chat.id, member.id, member.full_name or "عضو", member.username or "")
+            )
+            db.commit()
             await notify_owners(context, f"👋 دخول عضو جديد\nالمجموعة: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
             if welcome_row and welcome_row[0]:
                 welcome_text = welcome_row[0].replace("{name}", member.full_name).replace("{group}", update.effective_chat.title or "القروب")
@@ -2489,6 +2719,206 @@ async def callback(update, context):
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    # استدعاء التاق: المالك الأساسي والمفوّض لهما الصلاحية نفسها على القروبات المسجلة.
+    if data.startswith(("owner_tag_groups", "owner_tag_toggle:", "owner_tag_all", "owner_tag_send")):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذه الميزة للمالك الأساسي والمفوّض فقط.", show_alert=True)
+            return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        if data == "owner_tag_groups":
+            context.user_data["owner_tag_selected"] = []
+            rows = [[InlineKeyboardButton(f"⬜ {title or cid}", callback_data=f"owner_tag_toggle:{cid}")] for cid, title in groups[:50]]
+            rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات", callback_data="owner_tag_all")])
+            rows.append([InlineKeyboardButton("📣 منشن الأعضاء في القروبات المحددة", callback_data="owner_tag_send")])
+            rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+            await q.edit_message_text("📣 المنشن الجماعي للأعضاء\nاختر قروبًا أو عدة قروبات، أو حدّد جميع القروبات المسجلة. سيُمنشن الأعضاء الذين حفظ البوت معرّفاتهم في قاعدة البيانات فقط؛ تيليجرام لا يتيح للبوت جلب قائمة كاملة بكل أعضاء القروب مباشرةً.", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data.startswith("owner_tag_toggle:"):
+            try:
+                cid = int(data.split(":",1)[1])
+            except ValueError:
+                await q.answer("معرّف قروب غير صحيح.", show_alert=True); return
+            if not any(row[0] == cid for row in groups):
+                await q.answer("القروب غير مسجل.", show_alert=True); return
+            selected = context.user_data.setdefault("owner_tag_selected", [])
+            if cid in selected: selected.remove(cid)
+            else: selected.append(cid)
+            rows = [[InlineKeyboardButton(("✅ " if gid in selected else "⬜ ") + (title or str(gid)), callback_data=f"owner_tag_toggle:{gid}")] for gid, title in groups[:50]]
+            rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات", callback_data="owner_tag_all")])
+            rows.append([InlineKeyboardButton(f"📣 إرسال التاق ({len(selected)})", callback_data="owner_tag_send")])
+            rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data == "owner_tag_all":
+            context.user_data["owner_tag_selected"] = [cid for cid, _ in groups]
+            rows = [[InlineKeyboardButton("✅ " + (title or str(cid)), callback_data=f"owner_tag_toggle:{cid}")] for cid, title in groups[:50]]
+            rows.append([InlineKeyboardButton("📣 إرسال التاق للجميع", callback_data="owner_tag_send")])
+            rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data == "owner_tag_send":
+            selected = context.user_data.get("owner_tag_selected", [])
+            selected = [cid for cid in selected if any(row[0] == cid for row in groups)]
+            if not selected:
+                await q.answer("حدد قروبًا واحدًا على الأقل.", show_alert=True); return
+            sent_groups = failed_groups = mentioned_total = 0
+            empty_groups = 0
+            for cid in selected:
+                members = db.execute(
+                    "SELECT user_id,display_name FROM member_activity WHERE chat_id=? ORDER BY display_name COLLATE NOCASE",
+                    (cid,)
+                ).fetchall()
+                # Telegram limits a message to 4096 characters; split mentions into safe chunks.
+                mentions = []
+                seen_ids = set()
+                for member_id, display_name in members:
+                    if not member_id or member_id in seen_ids:
+                        continue
+                    seen_ids.add(member_id)
+                    label = html.escape((display_name or "عضو").replace("\n", " ")[:80])
+                    mentions.append(f'<a href="tg://user?id={member_id}">{label}</a>')
+                if not mentions:
+                    empty_groups += 1
+                    continue
+                chunks, current = [], "📣 استدعاء أعضاء القروب\n"
+                for mention in mentions:
+                    addition = mention + "  "
+                    if len(current) + len(addition) > 3500 and current.strip():
+                        chunks.append(current.rstrip())
+                        current = "📣 استدعاء أعضاء القروب (تابع)\n"
+                    current += addition
+                if current.strip():
+                    chunks.append(current.rstrip())
+                try:
+                    for chunk in chunks:
+                        await context.bot.send_message(chat_id=cid, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+                        await asyncio.sleep(0.08)
+                    sent_groups += 1
+                    mentioned_total += len(mentions)
+                except Exception as exc:
+                    failed_groups += 1
+                    log.warning("Mass mention failed for group %s: %s", cid, exc)
+            context.user_data.pop("owner_tag_selected", None)
+            await q.edit_message_text(
+                "📣 انتهت محاولة المنشن الجماعي.\n"
+                f"✅ القروبات التي وصلها المنشن: {sent_groups}\n"
+                f"👤 إجمالي المنشنات المرسلة: {mentioned_total}\n"
+                f"⚠️ قروبات تعذر الإرسال فيها: {failed_groups}\n"
+                f"ℹ️ قروبات بلا أعضاء مسجلين في قاعدة البيانات: {empty_groups}\n\n"
+                "ملاحظة: المنشن يشمل الأعضاء الذين يعرفهم البوت من قاعدة بياناته، وليس بالضرورة جميع أعضاء القروب الحاليين.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 استدعاء آخر", callback_data="owner_tag_groups")],[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+            )
+            return
+
+    # لوحة القروب المحلية: كل callback يعيد التحقق من كون المستخدم مشرف Telegram في القروب نفسه.
+    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:")):
+        try:
+            action, chat_raw = data.split(":", 1)
+            group_chat_id = int(chat_raw)
+        except (ValueError, TypeError):
+            await q.answer("بيانات القروب غير صحيحة.", show_alert=True)
+            return
+        if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
+            await q.answer("هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
+            return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
+            await q.answer("القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
+            return
+        if action == "group_panel_toggle_links":
+            current = get_settings(group_chat_id).get("links", 0)
+            set_setting(group_chat_id, "links", 0 if current else 1)
+            log_action(group_chat_id, uid, "setting", f"links={0 if current else 1}")
+            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+            await q.edit_message_text(
+                f"🛡️ لوحة إدارة القروب: {html.escape((title_row[0] if title_row else str(group_chat_id)) or str(group_chat_id))}\n\n"
+                f"تم {'فتح' if current else 'تفعيل منع'} الروابط.\n"
+                "ملاحظة: يجب أن يكون البوت مشرفًا مع صلاحية حذف الرسائل ليحذف الروابط المخالفة.",
+                parse_mode="HTML", reply_markup=group_owner_panel_markup(group_chat_id))
+            return
+        if action == "group_panel_tag":
+            members = db.execute(
+                "SELECT user_id,display_name FROM member_activity WHERE chat_id=? ORDER BY display_name COLLATE NOCASE",
+                (group_chat_id,)
+            ).fetchall()
+            mentions, seen_ids = [], set()
+            for member_id, display_name in members:
+                if not member_id or member_id in seen_ids:
+                    continue
+                seen_ids.add(member_id)
+                label = html.escape((display_name or "عضو").replace("\n", " ")[:80])
+                mentions.append(f'<a href="tg://user?id={member_id}">{label}</a>')
+            if not mentions:
+                await q.answer("لا توجد معرّفات أعضاء مسجلة لهذا القروب بعد.", show_alert=True)
+                return
+            chunks, current = [], "📣 استدعاء أعضاء القروب\n"
+            for mention in mentions:
+                addition = mention + "  "
+                if len(current) + len(addition) > 3500 and current.strip():
+                    chunks.append(current.rstrip())
+                    current = "📣 استدعاء أعضاء القروب (تابع)\n"
+                current += addition
+            if current.strip(): chunks.append(current.rstrip())
+            sent = 0
+            try:
+                for chunk in chunks:
+                    await context.bot.send_message(chat_id=group_chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+                    sent += 1
+                    await asyncio.sleep(0.08)
+            except Exception as exc:
+                log.warning("Local group mass mention failed for %s: %s", group_chat_id, exc)
+                await q.answer("تعذر إكمال الإرسال. تحقق من صلاحيات البوت وحدود تيليجرام.", show_alert=True)
+                return
+            await q.answer(f"تم إرسال {len(mentions)} منشن مسجل.", show_alert=True)
+            return
+        if action == "group_panel_home":
+            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+            await q.edit_message_text(
+                f"🛡️ لوحة القروب: {html.escape((title_row[0] if title_row else str(group_chat_id)) or str(group_chat_id))}\n\n"
+                "هذه لوحة محلية بصلاحيات القروب فقط؛ لا تتيح إدارة مالك البوت أو القروبات الأخرى.",
+                parse_mode="HTML", reply_markup=group_owner_panel_markup(group_chat_id))
+            return
+        if action == "group_panel_settings":
+            await q.edit_message_text(settings_text(0), reply_markup=settings_page_markup(group_chat_id, 0, f"group_panel_home:{group_chat_id}"))
+            return
+        if action == "group_panel_roles":
+            await q.edit_message_text(
+                "🪪 إدارة الرتب والصلاحيات لهذا القروب فقط\n\n"
+                "لترقية عضو: أرسل أمرًا بالرد على رسالته داخل القروب، مثل:\n"
+                "• رفع مشرف\n• رفع مشرف عام\n• رفع مدير\n• رفع مدير عام\n\n"
+                "لإزالة رتبته: رد على رسالة العضو واكتب: تنزيل رتبة\n\n"
+                "الرتب محلية داخل هذا البوت ولا تغيّر صلاحيات تيليجرام الأصلية. "
+                "لا يمكن منح رتبة مالك البوت أو المالك المفوّض من خلال هذه الأوامر.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]])
+            )
+            return
+        if action == "group_panel_admin":
+            await q.edit_message_text(
+                "👥 إدارة أعضاء هذا القروب فقط\nاختر إجراءً. سيطلب البوت رقم المستخدم أو رقم الرسالة في الخاص، ولا ينفّذ الإجراء إلا إذا كانت صلاحياته في Telegram تسمح بذلك.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{group_chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{group_chat_id}")],
+                    [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{group_chat_id}"), InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{group_chat_id}")],
+                    [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{group_chat_id}")],
+                    [InlineKeyboardButton("🗑️ حذف رسالة", callback_data=f"admin_action:delete:{group_chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة", callback_data=f"admin_action:pin:{group_chat_id}")],
+                    [InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")],
+                ]))
+            return
+        if action == "group_panel_logs":
+            rows = db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20", (group_chat_id,)).fetchall()
+            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+            body = "\n".join(f"• {created} — {action}: {details or ''}" for action, details, created in rows) or "لا توجد عمليات مسجلة بعد."
+            await q.edit_message_text(f"📋 سجلات القروب: {title_row[0] if title_row else group_chat_id}\n\n{body}"[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]]))
+            return
+        if action == "group_panel_stats":
+            total = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=?", (group_chat_id,)).fetchone()[0]
+            members = db.execute("SELECT COUNT(*) FROM member_activity WHERE chat_id=?", (group_chat_id,)).fetchone()[0]
+            try: member_count = await context.bot.get_chat_member_count(group_chat_id)
+            except Exception: member_count = "غير متاح"
+            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+            await q.edit_message_text(
+                f"📊 إحصائيات القروب: {title_row[0] if title_row else group_chat_id}\n\n👥 عدد الأعضاء: {member_count}\n👤 أعضاء تم رصد نشاطهم: {members}\n📋 العمليات المسجلة: {total}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]]))
+            return
 
     if data == "assistant_ai_help":
         await q.message.reply_text("ℹ️ المحادثة بالذكاء الاصطناعي أزيلت من هذا الإصدار. يمكنك استخدام خدمات الملاحظات والمهام والتذكيرات والمصاريف والجدول الدراسي والاختبارات.")
@@ -2925,7 +3355,8 @@ async def callback(update, context):
         except ValueError: await q.answer("بيانات الإعدادات غير صحيحة", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
             await q.answer("لا تملك صلاحية إعدادات هذا القروب.", show_alert=True); return
-        await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page))
+        back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
+        await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
         return
 
     if data.startswith("toggle:"):
@@ -2940,7 +3371,8 @@ async def callback(update, context):
         new_value = 0 if s[field] else 1
         set_setting(chat_id, field, new_value)
         log_action(chat_id, uid, "setting", f"{field}={new_value}")
-        await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page))
+        back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
+        await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
         return
 
     if data in ("security", "security_groups"):
@@ -2977,7 +3409,7 @@ async def callback(update, context):
                 [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{chat_id}")],
                 [InlineKeyboardButton("🗑️ حذف رسالة برقمها", callback_data=f"admin_action:delete:{chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة برقمها", callback_data=f"admin_action:pin:{chat_id}")],
                 [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],
-                [InlineKeyboardButton("⬅️ القروبات", callback_data="administration_groups")]
+                [InlineKeyboardButton("⬅️ لوحة القروب" if not can_use_panel(uid) else "⬅️ القروبات", callback_data=f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "administration_groups")]
             ])
         )
         return
@@ -3002,7 +3434,10 @@ async def callback(update, context):
         ); return
 
     if data == "admin_action_cancel":
-        context.user_data.pop("awaiting_admin_action", None)
+        pending = context.user_data.pop("awaiting_admin_action", None) or {}
+        pending_chat = pending.get("chat_id")
+        if pending_chat and not can_use_panel(uid) and await is_telegram_group_admin(context.bot, uid, pending_chat):
+            await q.edit_message_text("تم إلغاء الإجراء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_admin:{pending_chat}")]])); return
         await q.edit_message_text("تم إلغاء الإجراء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
     if data == "welcome":
@@ -4017,6 +4452,7 @@ def start_health_server():
 async def post_init(app):
     """Start long-running assistant workers only after PTB has initialized its event loop."""
     app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
+    app.create_task(weekly_stats_worker(app), name="weekly-group-stats-worker")
 
 
 def main():
@@ -4025,7 +4461,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel, "report": report_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
