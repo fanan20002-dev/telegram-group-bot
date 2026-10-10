@@ -8,12 +8,17 @@ import tempfile
 import uuid
 import time
 import random
+import json
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ChatType
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, ChatMemberHandler
@@ -23,11 +28,49 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 BOOTSTRAP_CODE = os.environ.get("BOOTSTRAP_CODE", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+AI_API_URL = os.environ.get("AI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("groupbot")
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
+# Additive assistant tables. Existing group/panel/reentry tables are preserved.
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_users(
+    user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', display_name TEXT DEFAULT '',
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, ai_requests INTEGER DEFAULT 0,
+    reminders_count INTEGER DEFAULT 0, notes_count INTEGER DEFAULT 0
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_preferences(
+    user_id INTEGER PRIMARY KEY, ai_enabled INTEGER NOT NULL DEFAULT 1,
+    privacy_notice_seen INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_notes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    note TEXT NOT NULL, created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_reminders(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    reminder_text TEXT NOT NULL, remind_at TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_chat_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
+)""")
+# Additional personal-assistant features; additive schema only.
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_tasks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    task_text TEXT NOT NULL, created_at TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS assistant_expenses(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    amount REAL NOT NULL, description TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'SAR',
+    created_at TEXT NOT NULL
+)""")
+db.commit()
 db.execute("""
 CREATE TABLE IF NOT EXISTS managers(
     user_id INTEGER PRIMARY KEY,
@@ -829,12 +872,424 @@ async def report_cmd(update, context):
     log_action(chat.id, user.id, "member_report", f"reported message {target.message_id}; target={target_user.id if target_user else 0}")
 
 
+def _assistant_now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def remember_assistant_user(user):
+    if not user:
+        return
+    now = _assistant_now()
+    db.execute("""INSERT INTO assistant_users(user_id,username,display_name,first_seen,last_seen)
+        VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+        display_name=excluded.display_name,last_seen=excluded.last_seen""",
+        (user.id, user.username or "", user.full_name or "", now, now))
+    db.execute("INSERT OR IGNORE INTO assistant_preferences(user_id) VALUES(?)", (user.id,))
+    db.commit()
+
+
+def assistant_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 اسأل المساعد الذكي", callback_data="assistant_ai_help")],
+        [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("⏰ تذكير جديد", callback_data="assistant_reminder_help")],
+        [InlineKeyboardButton("📋 مهامي", callback_data="assistant_tasks_help"), InlineKeyboardButton("💰 مصاريفي", callback_data="assistant_expenses_help")],
+        [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تعليمي", callback_data="assistant_quiz_help")],
+        [InlineKeyboardButton("📊 استخدامي وخصوصيتي", callback_data="assistant_privacy")],
+        [InlineKeyboardButton("🛡️ لوحة حماية القروبات", callback_data="assistant_group_panel")]
+    ])
+
+
+async def assistant_ai_request(user_id, user_text):
+    if not OPENAI_API_KEY:
+        return "⚠️ خدمة الذكاء الاصطناعي غير مفعّلة بعد. يضيف مالك البوت OPENAI_API_KEY في Environment Variables داخل Render، ثم يعيد النشر."
+    rows = db.execute("SELECT role,content FROM assistant_chat_history WHERE user_id=? ORDER BY id DESC LIMIT 10", (user_id,)).fetchall()
+    messages = [{"role":"system","content":"أنت مساعد شخصي عربي مفيد وآمن. أجب بوضوح واختصار مناسب. لا تدّع تنفيذ تذكير أو حفظ شيء ما لم ينفذ فعليًا. لا تطلب كلمات مرور أو مفاتيح سرية."}]
+    for role, content in reversed(rows):
+        if role in ("user", "assistant"):
+            messages.append({"role":role,"content":content})
+    messages.append({"role":"user","content":user_text[:6000]})
+    payload = json.dumps({"model":OPENAI_MODEL,"messages":messages,"temperature":0.5,"max_tokens":900}).encode("utf-8")
+    req = urllib.request.Request(AI_API_URL, data=payload, headers={"Authorization":"Bearer "+OPENAI_API_KEY,"Content-Type":"application/json"}, method="POST")
+    def call_api():
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    try:
+        result = await asyncio.to_thread(call_api)
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not answer:
+            return "ما قدرت أجهز إجابة الآن. جرّب مرة ثانية بعد قليل."
+        now = _assistant_now()
+        db.execute("INSERT INTO assistant_chat_history(user_id,role,content,created_at) VALUES(?,?,?,?)", (user_id,"user",user_text[:6000],now))
+        db.execute("INSERT INTO assistant_chat_history(user_id,role,content,created_at) VALUES(?,?,?,?)", (user_id,"assistant",answer[:8000],now))
+        db.execute("DELETE FROM assistant_chat_history WHERE user_id=? AND id NOT IN (SELECT id FROM assistant_chat_history WHERE user_id=? ORDER BY id DESC LIMIT 20)", (user_id,user_id))
+        db.execute("UPDATE assistant_users SET ai_requests=ai_requests+1,last_seen=? WHERE user_id=?", (now,user_id))
+        db.commit()
+        return answer[:4000]
+    except urllib.error.HTTPError as exc:
+        log.warning("AI API returned HTTP %s", exc.code)
+        if exc.code in (401,403):
+            return "⚠️ تعذر الاتصال بخدمة الذكاء الاصطناعي؛ راجع مفتاح API وإعدادات الخدمة في Render."
+        if exc.code == 429:
+            return "وصلنا إلى حد الطلبات أو الرصيد المتاح لخدمة الذكاء الاصطناعي. حاول لاحقًا أو راجع حساب الخدمة."
+        return "تعذر الاتصال بالمساعد الذكي حاليًا. حاول مرة أخرى لاحقًا."
+    except Exception as exc:
+        log.warning("AI request failed: %s", type(exc).__name__)
+        return "تعذر الاتصال بالمساعد الذكي حاليًا. تحقق من إعدادات الخدمة والاتصال ثم جرّب مجددًا."
+
+
+async def assistant_note_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.effective_message.reply_text("📝 لحفظ ملاحظة اكتب:\n/note نص الملاحظة\n\nلعرض آخر ملاحظاتك: /notes")
+        return
+    db.execute("INSERT INTO assistant_notes(user_id,note,created_at) VALUES(?,?,?)", (user.id,text[:2000],_assistant_now()))
+    db.execute("UPDATE assistant_users SET notes_count=notes_count+1 WHERE user_id=?", (user.id,))
+    db.commit()
+    await update.effective_message.reply_text("✅ حفظت الملاحظة في حسابك الخاص.")
+
+
+async def assistant_notes_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    rows = db.execute("SELECT id,note,created_at FROM assistant_notes WHERE user_id=? ORDER BY id DESC LIMIT 10", (user.id,)).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("ما عندك ملاحظات محفوظة. استخدم /note ثم اكتب ملاحظتك.")
+        return
+    body = "📝 آخر ملاحظاتك:\n\n" + "\n".join(f"{i}. {note} — {created[:10]}" for i,(note,created) in enumerate([(r[1],r[2]) for r in rows],1))
+    await update.effective_message.reply_text(body[:4000])
+
+
+async def assistant_remind_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    raw = " ".join(context.args).strip()
+    if "|" not in raw:
+        await update.effective_message.reply_text("⏰ لإنشاء تذكير اكتب بهذا الشكل (بتوقيت السعودية):\n/remind 2026-10-12 18:30 | نص التذكير\nمثال: /remind 2026-10-12 18:30 | مراجعة المحاضرة")
+        return
+    when_text, reminder_text = [x.strip() for x in raw.split("|", 1)]
+    if not reminder_text:
+        await update.effective_message.reply_text("اكتب نص التذكير بعد علامة |.")
+        return
+    try:
+        local_dt = datetime.strptime(when_text, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Riyadh"))
+        if local_dt <= datetime.now(ZoneInfo("Asia/Riyadh")):
+            raise ValueError("past")
+    except ValueError:
+        await update.effective_message.reply_text("صيغة التاريخ أو الوقت غير صحيحة، أو أن الموعد مضى. استخدم YYYY-MM-DD HH:MM بتوقيت السعودية.")
+        return
+    utc_dt = local_dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    db.execute("INSERT INTO assistant_reminders(user_id,reminder_text,remind_at,created_at) VALUES(?,?,?,?)", (user.id,reminder_text[:1000],utc_dt,_assistant_now()))
+    db.execute("UPDATE assistant_users SET reminders_count=reminders_count+1 WHERE user_id=?", (user.id,))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ تم حفظ التذكير.\n📅 {local_dt.strftime('%Y-%m-%d %H:%M')} بتوقيت السعودية\n📝 {reminder_text[:1000]}")
+
+
+async def assistant_reminders_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    rows = db.execute("SELECT id,reminder_text,remind_at FROM assistant_reminders WHERE user_id=? AND sent=0 ORDER BY remind_at LIMIT 20", (user.id,)).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("لا توجد تذكيرات قادمة. لإنشاء تذكير استخدم /remind.")
+        return
+    lines = ["⏰ تذكيراتك القادمة:"]
+    for rid, text, when in rows:
+        try:
+            local = datetime.fromisoformat(when).astimezone(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            local = when
+        lines.append(f"#{rid} — {local}\n{text}")
+    lines.append("\nلحذف تذكير: /delreminder رقم_التذكير")
+    await update.effective_message.reply_text("\n\n".join(lines)[:4000])
+
+
+async def assistant_delreminder_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("استخدم: /delreminder رقم_التذكير (من /reminders).")
+        return
+    rid = int(context.args[0])
+    cur = db.execute("DELETE FROM assistant_reminders WHERE id=? AND user_id=? AND sent=0", (rid,user.id))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم حذف التذكير." if cur.rowcount else "لم أجد تذكيرًا قادمًا بهذا الرقم في حسابك.")
+
+
+async def assistant_reminder_worker(app):
+    while True:
+        try:
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            due = db.execute("SELECT id,user_id,reminder_text FROM assistant_reminders WHERE sent=0 AND remind_at<=? ORDER BY remind_at LIMIT 50", (now,)).fetchall()
+            for rid, user_id, reminder_text in due:
+                try:
+                    await app.bot.send_message(chat_id=user_id, text="⏰ تذكيرك:\n" + reminder_text[:3500])
+                    db.execute("UPDATE assistant_reminders SET sent=1 WHERE id=?", (rid,))
+                except (Forbidden, BadRequest) as exc:
+                    # Telegram has rejected delivery permanently (for example, the user blocked the bot).
+                    log.warning("Reminder cannot be delivered to user %s (%s); marking it handled", user_id, type(exc).__name__)
+                    db.execute("UPDATE assistant_reminders SET sent=1 WHERE id=?", (rid,))
+                except Exception as exc:
+                    # Keep it pending after transient/network errors so the next worker cycle can retry.
+                    log.warning("Temporary reminder delivery failure for user %s (%s); will retry", user_id, type(exc).__name__)
+            if due:
+                db.commit()
+        except Exception as exc:
+            log.warning("Reminder worker error: %s", type(exc).__name__)
+        await asyncio.sleep(30)
+
+
+async def assistant_usage_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    row = db.execute("SELECT ai_requests,notes_count,first_seen,last_seen FROM assistant_users WHERE user_id=?", (user.id,)).fetchone()
+    await update.effective_message.reply_text(
+        "📊 معلومات استخدامك\n"
+        f"طلبات الذكاء الاصطناعي: {row[0]}\nالملاحظات المحفوظة: {row[1]}\n"
+        f"أول استخدام: {row[2]}\nآخر استخدام: {row[3]}\n\n"
+        "🔒 تحفظ بيانات الاستخدام الأساسية لتحسين الخدمة وإحصاء النشاط. محادثاتك ليست معروضة في لوحة المالك تلقائيًا. استخدم /clear_ai لحذف سجل محادثة المساعد الخاص بك."
+    )
+
+
+async def assistant_stats_cmd(update, context):
+    user = update.effective_user
+    if not user or not is_owner(user.id):
+        await update.effective_message.reply_text("⛔ هذه الإحصائيات للمالك العام فقط.")
+        return
+    users = db.execute("SELECT COUNT(*) FROM assistant_users").fetchone()[0]
+    active7 = db.execute("SELECT COUNT(*) FROM assistant_users WHERE last_seen >= ?", ((datetime.now().astimezone().replace(microsecond=0) - __import__("datetime").timedelta(days=7)).isoformat(),)).fetchone()[0]
+    requests = db.execute("SELECT COALESCE(SUM(ai_requests),0) FROM assistant_users").fetchone()[0]
+    notes = db.execute("SELECT COUNT(*) FROM assistant_notes").fetchone()[0]
+    reminders = db.execute("SELECT COUNT(*) FROM assistant_reminders WHERE sent=0").fetchone()[0]
+    groups = db.execute("SELECT COUNT(*) FROM watched_groups").fetchone()[0]
+    tasks = db.execute("SELECT COUNT(*) FROM assistant_tasks").fetchone()[0]
+    expenses = db.execute("SELECT COUNT(*) FROM assistant_expenses").fetchone()[0]
+    await update.effective_message.reply_text(
+        "📊 إحصائيات المساعد والبوت (للمالك العام)\n\n"
+        f"👤 مستخدمو المساعد المسجلون: {users}\n"
+        f"🟢 المستخدمون خلال آخر 7 أيام: {active7}\n"
+        f"🧠 طلبات الذكاء الاصطناعي الناجحة: {requests}\n"
+        f"📝 الملاحظات المحفوظة: {notes}\n"
+        f"⏰ التذكيرات القادمة: {reminders}\n"
+        f"📋 المهام المسجلة: {tasks}\n"
+        f"💰 سجلات المصروفات: {expenses}\n"
+        f"🛡️ القروبات المسجلة للحماية: {groups}\n\n"
+        "لا يعرض هذا التقرير محتوى محادثات المستخدمين."
+    )
+
+
+async def assistant_clear_ai_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    db.execute("DELETE FROM assistant_chat_history WHERE user_id=?", (user.id,))
+    db.commit()
+    await update.effective_message.reply_text("✅ حُذف سجل محادثة المساعد الذكي الخاص بك.")
+
+
+async def assistant_task_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    remember_assistant_user(user)
+    task_text = " ".join(context.args).strip()
+    if not task_text:
+        await update.effective_message.reply_text("📋 لإضافة مهمة: /task نص المهمة\nلعرض المهام: /tasks\nلإنجاز مهمة: /donetask رقم\nلحذف مهمة: /deltask رقم")
+        return
+    cur = db.execute("INSERT INTO assistant_tasks(user_id,task_text,created_at) VALUES(?,?,?)", (user.id, task_text[:1000], _assistant_now()))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ أُضيفت المهمة رقم #{cur.lastrowid}:\n{task_text[:1000]}")
+
+
+async def assistant_tasks_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    rows = db.execute("SELECT id,task_text,created_at FROM assistant_tasks WHERE user_id=? AND completed=0 ORDER BY id DESC LIMIT 30", (user.id,)).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("ما عندك مهام مفتوحة. أضف مهمة باستخدام /task نص المهمة")
+        return
+    await update.effective_message.reply_text("📋 مهامك المفتوحة:\n\n" + "\n".join(f"#{rid} — {task} ({created[:10]})" for rid,task,created in rows) + "\n\nلإنجاز مهمة: /donetask رقم | لحذفها: /deltask رقم")
+
+
+async def assistant_done_task_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("استخدم: /donetask رقم_المهمة")
+        return
+    cur = db.execute("UPDATE assistant_tasks SET completed=1 WHERE id=? AND user_id=? AND completed=0", (int(context.args[0]),user.id))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم تعليم المهمة كمكتملة." if cur.rowcount else "لم أجد مهمة مفتوحة بهذا الرقم في حسابك.")
+
+
+async def assistant_delete_task_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("استخدم: /deltask رقم_المهمة")
+        return
+    cur = db.execute("DELETE FROM assistant_tasks WHERE id=? AND user_id=?", (int(context.args[0]),user.id))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم حذف المهمة." if cur.rowcount else "لم أجد مهمة بهذا الرقم في حسابك.")
+
+
+async def assistant_expense_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    raw = " ".join(context.args).strip()
+    if "|" not in raw:
+        await update.effective_message.reply_text("💰 سجّل مصروفًا هكذا:\n/expense المبلغ | وصف المصروف\nمثال: /expense 35.5 | قهوة\nلعرض آخر المصاريف: /expenses")
+        return
+    amount_raw, description = [x.strip() for x in raw.split("|",1)]
+    try:
+        amount = float(amount_raw.replace(",", "."))
+        if amount <= 0 or amount > 100000000:
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text("المبلغ غير صحيح. اكتب مبلغًا موجبًا مثل: /expense 35.5 | قهوة")
+        return
+    if not description:
+        await update.effective_message.reply_text("اكتب وصف المصروف بعد علامة |.")
+        return
+    cur = db.execute("INSERT INTO assistant_expenses(user_id,amount,description,created_at) VALUES(?,?,?,?)", (user.id,amount,description[:300],_assistant_now()))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ تم تسجيل المصروف #{cur.lastrowid}\n💵 {amount:.2f} ريال\n🧾 {description[:300]}")
+
+
+async def assistant_expenses_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    rows = db.execute("SELECT id,amount,description,created_at FROM assistant_expenses WHERE user_id=? ORDER BY id DESC LIMIT 20", (user.id,)).fetchall()
+    total = db.execute("SELECT COALESCE(SUM(amount),0) FROM assistant_expenses WHERE user_id=? AND created_at>=?", (user.id,datetime.now().astimezone().replace(day=1,hour=0,minute=0,second=0,microsecond=0).isoformat(timespec="seconds"))).fetchone()[0]
+    if not rows:
+        await update.effective_message.reply_text("لا توجد مصاريف مسجلة. أضف أول مصروف باستخدام /expense المبلغ | الوصف")
+        return
+    lines = [f"💰 آخر مصاريفك (حتى 20 سجلًا)\nإجمالي المسجل منذ بداية الشهر: {total:.2f} ريال\n"]
+    lines.extend(f"#{rid} — {amount:.2f} ريال — {desc} ({created[:10]})" for rid,amount,desc,created in rows)
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
+
+async def assistant_summarize_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    source = " ".join(context.args).strip()
+    if not source:
+        await update.effective_message.reply_text("📄 اكتب /summarize ثم النص الذي تريد تلخيصه. ويمكنك إرسال ملف PDF أو DOCX أو TXT إلى الخاص مع البوت.\nتنبيه: عند استخدام الذكاء الاصطناعي قد يُرسل النص إلى مزود الخدمة لإنتاج الملخص.")
+        return
+    await update.effective_message.reply_text("📄 جارٍ تلخيص النص...")
+    answer = await assistant_ai_request(user.id, "لخّص النص التالي بالعربية في نقاط واضحة، مع الحفاظ على المعلومات المهمة وعدم اختلاق تفاصيل:\n\n" + source[:12000])
+    await update.effective_message.reply_text(answer[:4000])
+
+
+async def assistant_private_document(update, context):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or update.effective_chat.type != ChatType.PRIVATE or not msg.document:
+        return
+    # Do not intercept media used by existing owner workflows such as broadcast drafts.
+    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation"):
+        return
+    doc = msg.document
+    filename = (doc.file_name or "").lower()
+    if doc.file_size and doc.file_size > 8 * 1024 * 1024:
+        await msg.reply_text("حجم الملف أكبر من الحد المسموح (8 ميغابايت). أرسل نسخة أصغر.")
+        return
+    if not filename.endswith((".pdf", ".docx", ".txt")):
+        await msg.reply_text("أستطيع محاولة قراءة ملفات PDF وDOCX وTXT فقط حاليًا. الصور وملفات Word القديمة DOC غير مدعومة.")
+        return
+    await msg.reply_text("📄 استلمت الملف. سأحاول استخراج النص ثم تلخيصه؛ الملفات التي لا تحتوي نصًا قابلًا للاستخراج قد لا تنجح.")
+    try:
+        telegram_file = await context.bot.get_file(doc.file_id)
+        raw = bytes(await telegram_file.download_as_bytearray())
+        extracted = ""
+        if filename.endswith(".txt"):
+            extracted = raw.decode("utf-8", errors="replace")
+        elif filename.endswith(".pdf"):
+            from pypdf import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(raw))
+            extracted = "\n".join((page.extract_text() or "") for page in reader.pages[:40])
+        else:
+            from docx import Document
+            import io
+            document = Document(io.BytesIO(raw))
+            extracted = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        extracted = extracted.strip()
+        if not extracted:
+            await msg.reply_text("لم أتمكن من استخراج نص من الملف. قد يكون PDF مصوّرًا يحتاج OCR، وهذه النسخة لا تتضمن OCR.")
+            return
+        remember_assistant_user(user)
+        await msg.reply_text("🧠 جارٍ إعداد الملخص. لا ترسل ملفات تحتوي بيانات حساسة إذا لم ترغب بمشاركتها مع مزود الذكاء الاصطناعي.")
+        answer = await assistant_ai_request(user.id, "لخّص محتوى الملف التالي بالعربية في عناوين ونقاط، واذكر إن كان النص ناقصًا. لا تضف معلومات غير موجودة.\n\n" + extracted[:12000])
+        await msg.reply_text(("📄 ملخص الملف: " + (doc.file_name or "بدون اسم") + "\n\n" + answer)[:4000])
+    except ImportError:
+        await msg.reply_text("ميزة قراءة هذا النوع من الملفات تحتاج مكتبات إضافية. تأكد من تحديث requirements.txt وإعادة النشر.")
+    except Exception as exc:
+        log.warning("Document summary failed (%s)", type(exc).__name__)
+        await msg.reply_text("تعذر قراءة الملف أو تلخيصه. تأكد أنه غير تالف وأنه PDF نصي أو DOCX أو TXT، ثم جرّب مجددًا.")
+
+
+async def assistant_quiz_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    topic = " ".join(context.args).strip()
+    if not topic:
+        await update.effective_message.reply_text("🎓 لإنشاء اختبار تدريبي اكتب: /quiz موضوع الاختبار\nمثال: /quiz مبادئ الإدارة - الفصل الأول\nسيُنشأ اختبار تدريبي، وليس اختبارًا رسميًا معتمدًا.")
+        return
+    prompt = ("أنشئ اختبارًا تدريبيًا عربيًا من 5 أسئلة اختيار من متعدد عن الموضوع التالي: " + topic[:500] + ". "
+              "لكل سؤال أربعة خيارات (أ، ب، ج، د) وإجابة صحيحة مع شرح سطر واحد. لا تدّع أن الأسئلة من ملف أو منهج رسمي ما لم يُزوّد به. نظّمها بوضوح.")
+    await update.effective_message.reply_text("🎓 جارٍ إعداد الاختبار التدريبي...")
+    answer = await assistant_ai_request(user.id, prompt)
+    await update.effective_message.reply_text(answer[:4000])
+
+
+async def assistant_private_text(update, context):
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or chat.type != ChatType.PRIVATE or not msg or not msg.text:
+        return
+    # Leave existing panel workflows intact; this handler must not consume their input.
+    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation"):
+        return
+    remember_assistant_user(user)
+    pref = db.execute("SELECT ai_enabled FROM assistant_preferences WHERE user_id=?", (user.id,)).fetchone()
+    if pref and not pref[0]:
+        return
+    await msg.reply_text("🧠 أفكر في طلبك...", do_quote=True)
+    answer = await assistant_ai_request(user.id, msg.text)
+    await msg.reply_text(answer)
+
+
 async def start(update, context):
     remember_delegated_user(update.effective_user)
     if update.effective_chat.type == ChatType.PRIVATE:
+        remember_assistant_user(update.effective_user)
         await update.effective_message.reply_text(
-            f"مرحبًا 👋\nرقم حسابك: {update.effective_user.id}\n\n"
-            "استخدم /panel لفتح لوحة التحكم."
+            "🤖 أهلًا بك في مساعد الابتكار الذكي\n\n"
+            "اكتب سؤالك مباشرة للتحدث مع المساعد، أو استخدم الأوامر التالية:\n"
+            "/note — حفظ ملاحظة\n/notes — عرض ملاحظاتك\n/remind — إنشاء تذكير\n/reminders — عرض تذكيراتك\n/usage — إحصائيات استخدامك\n/clear_ai — حذف سجل محادثة المساعد\n"
+            "/task و/tasks — إدارة المهام\n/expense و/expenses — تسجيل المصاريف\n/summarize — تلخيص نص أو ملف\n/quiz — اختبار تدريبي\n/panel — لوحة القروبات للمصرح لهم\n\n"
+            "تنبيه: المحادثة الذكية تحتاج إعداد OPENAI_API_KEY في Render.",
+            reply_markup=assistant_menu_markup()
         )
     else:
         register_group(update.effective_chat)
@@ -1949,6 +2404,37 @@ async def callback(update, context):
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "assistant_ai_help":
+        await q.message.reply_text("🧠 اكتب سؤالك هنا مباشرة، وسأجيبك عبر المساعد الذكي إذا كانت الخدمة مفعّلة.")
+        return
+    if data == "assistant_notes_help":
+        await q.message.reply_text("📝 لحفظ ملاحظة: /note نص الملاحظة\nلعرض ملاحظاتك: /notes")
+        return
+    if data == "assistant_reminder_help":
+        await q.message.reply_text("⏰ إنشاء تذكير: /remind YYYY-MM-DD HH:MM | نص التذكير\nعرض التذكيرات: /reminders\nحذف تذكير: /delreminder رقم_التذكير\nالمواعيد بتوقيت السعودية.")
+        return
+    if data == "assistant_tasks_help":
+        await q.message.reply_text("📋 إدارة المهام:\n/task نص المهمة — إضافة\n/tasks — عرض المفتوح\n/donetask رقم — إنجاز\n/deltask رقم — حذف")
+        return
+    if data == "assistant_expenses_help":
+        await q.message.reply_text("💰 المصاريف:\n/expense المبلغ | الوصف — تسجيل مصروف\n/expenses — عرض آخر المصاريف وإجمالي الشهر")
+        return
+    if data == "assistant_summary_help":
+        await q.message.reply_text("📄 للتلخيص اكتب /summarize ثم النص، أو أرسل ملف PDF أو DOCX أو TXT في الخاص. تنبيه: قد يُرسل محتوى النص المستخرج إلى مزود الذكاء الاصطناعي؛ لا ترسل بيانات حساسة.")
+        return
+    if data == "assistant_quiz_help":
+        await q.message.reply_text("🎓 لإنشاء اختبار تدريبي: /quiz ثم اسم الموضوع أو الفصل. الأسئلة مولدة للتدريب وقد تحتاج مراجعة.")
+        return
+    if data == "assistant_privacy":
+        await q.message.reply_text("🔒 نسجل معرّف حسابك واسم العرض وتواريخ الاستخدام وعدد طلبات المساعد. لا تُعرض محادثاتك في لوحة المالك تلقائيًا. يمكنك حذف سجل المحادثة عبر /clear_ai.")
+        return
+    if data == "assistant_group_panel":
+        if can_use_panel(uid):
+            await panel(update, context)
+        else:
+            await q.message.reply_text("🛡️ إدارة القروبات متاحة للمصرح لهم فقط. أضف البوت إلى قروبك وامنحه صلاحيات المشرف المطلوبة، ثم اتبع تعليمات التسجيل.")
+        return
 
     if data.startswith(("reentry_approve:", "reentry_keep:")):
         if not (is_owner(uid) or is_delegated_owner(uid)):
@@ -3437,13 +3923,22 @@ def start_health_server():
     port = int(os.environ.get("PORT", "10000"))
     ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
+async def post_init(app):
+    """Start long-running assistant workers only after PTB has initialized its event loop."""
+    app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
         "start": start, "help": help_cmd, "panel": panel, "report": report_cmd,
+        "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
+        "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
+        "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
+        "expense": assistant_expense_cmd, "expenses": assistant_expenses_cmd, "summarize": assistant_summarize_cmd, "quiz": assistant_quiz_cmd,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
         "grantpublish": grantpublish, "revokepublish": revokepublish,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
@@ -3458,6 +3953,8 @@ def main():
     for name, fn in command_handlers.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("cancel", cancel_owner_autoreply), group=-2)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, assistant_private_text), group=-4)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, assistant_private_document), group=-4)
 
     for cmd in LOCK_MAP:
         app.add_handler(CommandHandler(cmd, set_lock))
