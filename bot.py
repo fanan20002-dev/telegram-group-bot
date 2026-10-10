@@ -51,6 +51,19 @@ CREATE TABLE IF NOT EXISTS logs(
 )
 """)
 db.execute("""
+CREATE TABLE IF NOT EXISTS reentry_restrictions(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    display_name TEXT DEFAULT '',
+    username TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(chat_id, user_id)
+)
+""")
+
+db.execute("""
 CREATE TABLE IF NOT EXISTS watched_groups(
     chat_id INTEGER PRIMARY KEY,
     title TEXT,
@@ -1670,6 +1683,44 @@ async def edited_filter(update, context):
             except Exception:
                 pass
 
+async def notify_reentry_restriction(context, chat, member, reason):
+    """Keep a departed/kicked member banned until a primary/delegated owner approves."""
+    chat_id = chat.id
+    username = member.username or ""
+    display_name = member.full_name or "عضو بلا اسم"
+    db.execute("""INSERT INTO reentry_restrictions
+        (chat_id,user_id,display_name,username,reason,created_at,status)
+        VALUES(?,?,?,?,?,?, 'pending')
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET
+        display_name=excluded.display_name, username=excluded.username,
+        reason=excluded.reason, created_at=excluded.created_at, status='pending'""",
+        (chat_id, member.id, display_name, username, reason, now()))
+    db.commit()
+    log_action(chat_id, member.id, "reentry_blocked", reason)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ السماح له بالعودة", callback_data=f"reentry_approve:{chat_id}:{member.id}"),
+        InlineKeyboardButton("⛔ إبقاؤه ممنوعًا", callback_data=f"reentry_keep:{chat_id}:{member.id}")
+    ]])
+    text = (
+        "🚨 تنبيه أمني: تم منع عضو من العودة حتى موافقة المالك أو المالك المفوّض.\n\n"
+        f"👥 القروب: {chat.title or chat_id}\n"
+        f"👤 الاسم الحالي: {display_name}\n"
+        f"🔎 اسم المستخدم: @{username if username else 'غير متوفر'}\n"
+        f"🆔 المعرّف الثابت: {member.id}\n"
+        f"📌 السبب: {reason}\n"
+        "ℹ️ يتم التعرف على العضو بواسطة المعرّف الثابت، حتى لو غيّر اسمه أو اسم المستخدم."
+    )
+    recipients = {OWNER_ID} if OWNER_ID else set()
+    recipients.update(r[0] for r in db.execute("SELECT user_id FROM delegated_owners").fetchall())
+    for recipient in recipients:
+        pref = db.execute("SELECT enabled FROM notification_preferences WHERE user_id=? AND event='membership'", (recipient,)).fetchone()
+        if pref and not pref[0]:
+            continue
+        try:
+            await context.bot.send_message(chat_id=recipient, text=text, reply_markup=keyboard)
+        except Exception as exc:
+            log.info("تعذر إرسال تنبيه منع العودة إلى %s: %s", recipient, exc)
+
 async def chat_member_handler(update, context):
     cm = update.chat_member
     if not cm or not cm.chat:
@@ -1680,9 +1731,18 @@ async def chat_member_handler(update, context):
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
     member = cm.new_chat_member.user
-    if member and old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
+    if member and old in ("member", "administrator", "restricted") and new in ("left", "kicked") and not member.is_bot:
+        reason = "غادر القروب بنفسه" if new == "left" else "تم حظره/طرده من القروب"
         log_action(chat_id, member.id, "member_leave", f"{member.full_name} ({new})")
-        await notify_owners(context, f"🚪 مغادرة عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
+        # On voluntary departure, ban immediately so the member cannot rejoin without owner approval.
+        # A kicked member is already banned by Telegram; refresh the restriction record either way.
+        try:
+            if new == "left":
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+            await notify_reentry_restriction(context, cm.chat, member, reason)
+        except Exception as exc:
+            log.warning("تعذر فرض منع العودة للعضو %s في %s: %s", member.id, chat_id, exc)
+            await notify_owners(context, f"⚠️ تعذر منع عضو من العودة تلقائيًا\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف الثابت: {member.id}\nالسبب: {exc}", "membership")
     elif member and old in ("left", "kicked") and new in ("member", "administrator", "restricted") and not member.is_bot:
         log_action(chat_id, member.id, "member_join", member.full_name)
         await notify_owners(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
@@ -1889,6 +1949,34 @@ async def callback(update, context):
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    if data.startswith(("reentry_approve:", "reentry_keep:")):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            return
+        try:
+            action, chat_raw, user_raw = data.split(":", 2)
+            target_chat, target_user = int(chat_raw), int(user_raw)
+        except (ValueError, TypeError):
+            return
+        row = db.execute("SELECT display_name, username, status FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (target_chat, target_user)).fetchone()
+        if not row:
+            return
+        if action == "reentry_approve":
+            try:
+                await context.bot.unban_chat_member(chat_id=target_chat, user_id=target_user, only_if_banned=True)
+                db.execute("UPDATE reentry_restrictions SET status='approved' WHERE chat_id=? AND user_id=?", (target_chat, target_user))
+                db.commit()
+                log_action(target_chat, target_user, "reentry_approved", f"approved_by={uid}")
+                await q.edit_message_text((q.message.text or "") + f"\n\n✅ تمت الموافقة على عودة العضو بواسطة: {uid}\nيمكنه العودة عبر رابط الدعوة أو رابط القروب.")
+            except Exception as exc:
+                log.warning("تعذرت الموافقة على عودة %s إلى %s: %s", target_user, target_chat, exc)
+                await q.edit_message_text((q.message.text or "") + "\n\n⚠️ تعذر رفع الحظر. تأكد أن البوت مشرف ولديه صلاحية الحظر.")
+        else:
+            db.execute("UPDATE reentry_restrictions SET status='blocked' WHERE chat_id=? AND user_id=?", (target_chat, target_user))
+            db.commit()
+            log_action(target_chat, target_user, "reentry_denied", f"kept_by={uid}")
+            await q.edit_message_text((q.message.text or "") + f"\n\n⛔ تقرر إبقاء المنع بواسطة: {uid}")
+        return
 
     if data == "owner_autoreplies":
         if not is_owner(uid):
