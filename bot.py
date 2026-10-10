@@ -632,7 +632,7 @@ async def help_cmd(update, context):
         "🏠 /panel — لوحة التحكم من الخاص (للمصرح لهم)\n"
         "🛡️ من الخاص: اختر القروب ثم غيّر إعدادات الحماية.\n"
         "🔨 من الخاص: اختر القروب ثم نفّذ الحظر والكتم والطرد والحذف والتثبيت برقم المستخدم أو الرسالة.\n"
-        "📣 النشر: اختر القروبات، أرسل المحتوى، ثم راجع المعاينة وأكّد.\n"
+        "🎮 الألعاب والتحديات متاحة من قائمة الأعضاء داخل القروب.\n"
         "🆔 /id — عرض رقم حسابك\n"
         "🆔 /idgroup — عرض رقم المجموعة\n"
         "📊 الإحصائيات والسجلات من لوحة التحكم\n\n"
@@ -1193,13 +1193,16 @@ async def public_settings(update, context):
     settings = get_settings(chat.id)
     buttons = []
     if settings.get("public_commands", 1):
-        buttons.append(InlineKeyboardButton("📚 أوامر البوت", callback_data="public:commands"))
+        buttons.append(InlineKeyboardButton("📚 دليل البوت", callback_data="public:commands"))
     if settings.get("public_activity", 1):
-        buttons.append(InlineKeyboardButton("⭐ نشاط الأعضاء", callback_data="public:activity"))
+        buttons.append(InlineKeyboardButton("🏆 لوحة نشاط الأعضاء", callback_data="public:activity"))
     rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
+    # واجهة الأعضاء تعرض خدمات عامة فقط؛ لا تعرض أي خيارات تشغيلية أو تحديثات النظام.
+    rows.append([InlineKeyboardButton("🎮 مركز الألعاب والتحديات", callback_data=f"member_games:{chat.id}")])
+    rows.append([InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat.id}")])
     if settings.get("public_protection", 1):
-        rows.append([InlineKeyboardButton("🛡️ أنظمة الحماية", callback_data="public:protection")])
-    text = "⚙️ إعدادات ومساعدة القروب\n\n👋 أهلًا بك! هذه القائمة متاحة لجميع الأعضاء.\n\n🔐 إدارة القروب وتغيير الإعدادات والصلاحيات محصورة بالمصرح لهم."
+        rows.append([InlineKeyboardButton("🛡️ معلومات الحماية", callback_data="public:protection")])
+    text = "🤖 مركز الأعضاء\n\n📚 دليل البوت • 🏆 لوحة المتصدرين • 🎮 الألعاب • 🎯 تحدي اليوم\n\n🔒 لوحة الإدارة وإعدادات النظام مخصصة للمصرّح لهم فقط."
     await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 async def settings_cmd(update, context):
@@ -1603,6 +1606,31 @@ async def callback(update, context):
         await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
         return
 
+    if data.startswith("member_games:"):
+        try:
+            chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("معرّف القروب غير صحيح.", show_alert=True)
+            return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await q.answer("هذا القروب غير مسجل.", show_alert=True)
+            return
+        db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
+        db.commit()
+        cfg = db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if not cfg or not cfg[0]:
+            await q.edit_message_text("🎮 الألعاب متوقفة حاليًا في هذا القروب.")
+            return
+        rows = [
+            [InlineKeyboardButton("🧠 أسئلة ثقافية وذكاء", callback_data=f"game_quiz:{chat_id}"), InlineKeyboardButton("🔤 تحدي الكلمات", callback_data=f"game_word:{chat_id}")],
+            [InlineKeyboardButton("🧩 فك الكلمات المبعثرة", callback_data=f"game_scramble:{chat_id}"), InlineKeyboardButton("✊ حجر ورقة مقص", callback_data=f"game_rps:{chat_id}")],
+            [InlineKeyboardButton("⭕ إكس أو لاعبين", callback_data=f"game_xo_start:{chat_id}"), InlineKeyboardButton("⚡ تحدي السرعة", callback_data=f"game_speed:{chat_id}")],
+            [InlineKeyboardButton("🎯 تحدي اليوم", callback_data=f"game_daily:{chat_id}"), InlineKeyboardButton("🏆 المتصدرون", callback_data=f"game_scores:{chat_id}")],
+            [InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")]
+        ]
+        await q.edit_message_text("🎮 مركز الألعاب والتحديات\n\nاختر اللعبة التي تريد المشاركة فيها:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
     if data == "public:commands":
         chat_id = q.message.chat.id
         settings = get_settings(chat_id)
@@ -1655,17 +1683,17 @@ async def callback(update, context):
         # Rebuild the public menu in the same group.
         settings = get_settings(q.message.chat.id)
         buttons = []
-        if settings.get("public_commands", 1): buttons.append(InlineKeyboardButton("📚 أوامر البوت", callback_data="public:commands"))
-        if settings.get("public_activity", 1): buttons.append(InlineKeyboardButton("⭐ نشاط الأعضاء", callback_data="public:activity"))
+        if settings.get("public_commands", 1): buttons.append(InlineKeyboardButton("📚 دليل البوت", callback_data="public:commands"))
+        if settings.get("public_activity", 1): buttons.append(InlineKeyboardButton("🏆 لوحة نشاط الأعضاء", callback_data="public:activity"))
         rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
-        if settings.get("public_protection", 1): rows.append([InlineKeyboardButton("🛡️ أنظمة الحماية", callback_data="public:protection")])
-        await q.edit_message_text("⚙️ إعدادات ومساعدة القروب\n\n👋 قائمة عامة للأعضاء.\n🔐 إدارة الإعدادات والصلاحيات للمصرح لهم فقط.", reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+        if settings.get("public_protection", 1): rows.append([InlineKeyboardButton("🛡️ مركز الحماية", callback_data="public:protection")])
+        await q.edit_message_text("🤖 مركز المساعدة\n\n📚 دليل البوت • 🏆 نشاط الأعضاء • 🛡️ معلومات الحماية\n🎮 يمكن المشاركة في الألعاب المتاحة داخل القروب.\n\n🔐 أدوات الإدارة الخاصة لا تظهر هنا، ولا تتاح إلا للحسابات المصرّح لها.", reply_markup=InlineKeyboardMarkup(rows) if rows else None)
         return
     if data == "public:protection":
         await q.edit_message_text(
-            "🛡️ أنظمة الحماية\n\n"
-            "يمكن للمصرح لهم ضبط منع الروابط والصور والفيديو والملفات والملصقات والتكرار من لوحة الإدارة.\n"
-            "🔐 لا يستطيع العضو تغيير إعدادات الحماية."
+            "🛡️ معلومات الحماية\n\n"
+            "يعمل البوت على المساعدة في الحفاظ على تنظيم القروب وفق الإعدادات المعتمدة من الإدارة.\n"
+            "🔒 إعدادات الحماية وأدوات الإدارة غير متاحة للأعضاء العاديين."
         )
         return
 
