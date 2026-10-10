@@ -9,8 +9,6 @@ import uuid
 import time
 import random
 import json
-import urllib.request
-import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -28,9 +26,6 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 BOOTSTRAP_CODE = os.environ.get("BOOTSTRAP_CODE", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-AI_API_URL = os.environ.get("AI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("groupbot")
@@ -69,6 +64,16 @@ db.execute("""CREATE TABLE IF NOT EXISTS assistant_expenses(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
     amount REAL NOT NULL, description TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'SAR',
     created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS student_schedule(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    weekday TEXT NOT NULL, study_time TEXT NOT NULL, subject TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS student_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL, title TEXT NOT NULL, event_at TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
 )""")
 db.commit()
 db.execute("""
@@ -890,51 +895,44 @@ def remember_assistant_user(user):
 
 def assistant_menu_markup():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 اسأل المساعد الذكي", callback_data="assistant_ai_help")],
         [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("⏰ تذكير جديد", callback_data="assistant_reminder_help")],
         [InlineKeyboardButton("📋 مهامي", callback_data="assistant_tasks_help"), InlineKeyboardButton("💰 مصاريفي", callback_data="assistant_expenses_help")],
-        [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تعليمي", callback_data="assistant_quiz_help")],
+        [InlineKeyboardButton("🎓 جدولي الدراسي", callback_data="student_schedule_help"), InlineKeyboardButton("🗓️ اختباراتي ومواعيدي", callback_data="student_events_help")],
+        [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تدريبي", callback_data="assistant_quiz_help")],
         [InlineKeyboardButton("📊 استخدامي وخصوصيتي", callback_data="assistant_privacy")],
         [InlineKeyboardButton("🛡️ لوحة حماية القروبات", callback_data="assistant_group_panel")]
     ])
 
 
-async def assistant_ai_request(user_id, user_text):
-    if not OPENAI_API_KEY:
-        return "⚠️ خدمة الذكاء الاصطناعي غير مفعّلة بعد. يضيف مالك البوت OPENAI_API_KEY في Environment Variables داخل Render، ثم يعيد النشر."
-    rows = db.execute("SELECT role,content FROM assistant_chat_history WHERE user_id=? ORDER BY id DESC LIMIT 10", (user_id,)).fetchall()
-    messages = [{"role":"system","content":"أنت مساعد شخصي عربي مفيد وآمن. أجب بوضوح واختصار مناسب. لا تدّع تنفيذ تذكير أو حفظ شيء ما لم ينفذ فعليًا. لا تطلب كلمات مرور أو مفاتيح سرية."}]
-    for role, content in reversed(rows):
-        if role in ("user", "assistant"):
-            messages.append({"role":role,"content":content})
-    messages.append({"role":"user","content":user_text[:6000]})
-    payload = json.dumps({"model":OPENAI_MODEL,"messages":messages,"temperature":0.5,"max_tokens":900}).encode("utf-8")
-    req = urllib.request.Request(AI_API_URL, data=payload, headers={"Authorization":"Bearer "+OPENAI_API_KEY,"Content-Type":"application/json"}, method="POST")
-    def call_api():
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    try:
-        result = await asyncio.to_thread(call_api)
-        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not answer:
-            return "ما قدرت أجهز إجابة الآن. جرّب مرة ثانية بعد قليل."
-        now = _assistant_now()
-        db.execute("INSERT INTO assistant_chat_history(user_id,role,content,created_at) VALUES(?,?,?,?)", (user_id,"user",user_text[:6000],now))
-        db.execute("INSERT INTO assistant_chat_history(user_id,role,content,created_at) VALUES(?,?,?,?)", (user_id,"assistant",answer[:8000],now))
-        db.execute("DELETE FROM assistant_chat_history WHERE user_id=? AND id NOT IN (SELECT id FROM assistant_chat_history WHERE user_id=? ORDER BY id DESC LIMIT 20)", (user_id,user_id))
-        db.execute("UPDATE assistant_users SET ai_requests=ai_requests+1,last_seen=? WHERE user_id=?", (now,user_id))
-        db.commit()
-        return answer[:4000]
-    except urllib.error.HTTPError as exc:
-        log.warning("AI API returned HTTP %s", exc.code)
-        if exc.code in (401,403):
-            return "⚠️ تعذر الاتصال بخدمة الذكاء الاصطناعي؛ راجع مفتاح API وإعدادات الخدمة في Render."
-        if exc.code == 429:
-            return "وصلنا إلى حد الطلبات أو الرصيد المتاح لخدمة الذكاء الاصطناعي. حاول لاحقًا أو راجع حساب الخدمة."
-        return "تعذر الاتصال بالمساعد الذكي حاليًا. حاول مرة أخرى لاحقًا."
-    except Exception as exc:
-        log.warning("AI request failed: %s", type(exc).__name__)
-        return "تعذر الاتصال بالمساعد الذكي حاليًا. تحقق من إعدادات الخدمة والاتصال ثم جرّب مجددًا."
+def _offline_summary(source, limit=8):
+    import re
+    text = re.sub(r"\s+", " ", source).strip()
+    if not text:
+        return "لم أجد نصًا قابلًا للتلخيص."
+    sentences = re.split(r"(?<=[.!؟])\s+", text)
+    sentences = [x.strip() for x in sentences if x.strip()]
+    if len(sentences) <= limit:
+        chosen = sentences
+    else:
+        # Extractive summary: select sentences distributed across the text; no AI or external API.
+        indexes = sorted(set(round(i*(len(sentences)-1)/(limit-1)) for i in range(limit)))
+        chosen = [sentences[i] for i in indexes]
+    return "📄 ملخص استخراجي محلي (دون ذكاء اصطناعي):\n\n" + "\n".join(f"• {x[:500]}" for x in chosen)[:3500]
+
+
+async def offline_assistant_response(user_id, user_text):
+    """Offline helper: no AI provider, network call, API key, or claim of generative AI."""
+    text = (user_text or "").strip()
+    lower = text.lower()
+    if any(x in lower for x in ("السلام عليكم", "مرحبا", "هلا", "صباح الخير", "مساء الخير")):
+        return "وعليكم السلام ورحمة الله وبركاته 🌷\nأنا مساعد خدمات يعمل محليًا دون ذكاء اصطناعي. أستطيع مساعدتك في الملاحظات والمهام والتذكيرات والمصاريف والجدول الدراسي ومواعيد الاختبارات. اضغط أحد أزرار القائمة أو اكتب /help."
+    if any(x in lower for x in ("جدول", "اختبار", "مذاكرة", "دراسة", "واجب", "محاضرة")):
+        return "🎓 لخدمات الدراسة استخدم:\n/studyadd اليوم | الوقت | المادة — إضافة مادة للجدول\n/studyschedule — عرض الجدول\n/exam التاريخ YYYY-MM-DD HH:MM | اسم الاختبار — إضافة موعد اختبار\n/exams — عرض الاختبارات والمواعيد\n/delexam رقم — حذف موعد"
+    if any(x in lower for x in ("مهمة", "مهامي", "task")):
+        return "📋 إدارة المهام: /task نص المهمة، /tasks لعرضها، /donetask رقم لإنجازها، /deltask رقم لحذفها."
+    if any(x in lower for x in ("تذكير", "ذكرني", "موعد")):
+        return "⏰ لإضافة تذكير: /remind YYYY-MM-DD HH:MM | نص التذكير، ولعرض التذكيرات: /reminders."
+    return "ℹ️ هذا الإصدار لا يستخدم الذكاء الاصطناعي ولا يتصل بأي مزود خارجي. أستطيع تنفيذ الخدمات المحددة من القائمة مثل الملاحظات والمهام والتذكيرات والمصاريف والجدول الدراسي والاختبارات. استخدم /help لعرض الأوامر."
 
 
 async def assistant_note_cmd(update, context):
@@ -1043,6 +1041,18 @@ async def assistant_reminder_worker(app):
                     log.warning("Temporary reminder delivery failure for user %s (%s); will retry", user_id, type(exc).__name__)
             if due:
                 db.commit()
+            # Deliver scheduled student exams/deadlines when their time arrives.
+            now_local = datetime.now().astimezone().isoformat(timespec="seconds")
+            due_events = db.execute("SELECT id,user_id,title,event_at FROM student_events WHERE notified=0 AND event_at<=? ORDER BY event_at LIMIT 50", (now_local,)).fetchall()
+            for event_id, event_user_id, title, event_at in due_events:
+                try:
+                    await app.bot.send_message(chat_id=event_user_id, text=f"🎓 تذكير بموعدك الدراسي: {title}\nالموعد: {event_at.replace('T',' ')[:16]}")
+                except Exception as exc:
+                    log.warning("Student event notification failed (%s)", type(exc).__name__)
+                finally:
+                    db.execute("UPDATE student_events SET notified=1 WHERE id=?", (event_id,))
+            if due_events:
+                db.commit()
         except Exception as exc:
             log.warning("Reminder worker error: %s", type(exc).__name__)
         await asyncio.sleep(30)
@@ -1056,7 +1066,7 @@ async def assistant_usage_cmd(update, context):
     row = db.execute("SELECT ai_requests,notes_count,first_seen,last_seen FROM assistant_users WHERE user_id=?", (user.id,)).fetchone()
     await update.effective_message.reply_text(
         "📊 معلومات استخدامك\n"
-        f"طلبات الذكاء الاصطناعي: {row[0]}\nالملاحظات المحفوظة: {row[1]}\n"
+        f"طلبات المساعد المحلي المسجلة سابقًا: {row[0]}\nالملاحظات المحفوظة: {row[1]}\n"
         f"أول استخدام: {row[2]}\nآخر استخدام: {row[3]}\n\n"
         "🔒 تحفظ بيانات الاستخدام الأساسية لتحسين الخدمة وإحصاء النشاط. محادثاتك ليست معروضة في لوحة المالك تلقائيًا. استخدم /clear_ai لحذف سجل محادثة المساعد الخاص بك."
     )
@@ -1191,11 +1201,9 @@ async def assistant_summarize_cmd(update, context):
         return
     source = " ".join(context.args).strip()
     if not source:
-        await update.effective_message.reply_text("📄 اكتب /summarize ثم النص الذي تريد تلخيصه. ويمكنك إرسال ملف PDF أو DOCX أو TXT إلى الخاص مع البوت.\nتنبيه: عند استخدام الذكاء الاصطناعي قد يُرسل النص إلى مزود الخدمة لإنتاج الملخص.")
+        await update.effective_message.reply_text("📄 اكتب /summarize ثم النص الذي تريد تلخيصه. ويمكنك إرسال ملف PDF أو DOCX أو TXT إلى الخاص مع البوت. يجري التلخيص محليًا باختيار جمل من النص دون ذكاء اصطناعي أو إرسال خارجي.")
         return
-    await update.effective_message.reply_text("📄 جارٍ تلخيص النص...")
-    answer = await assistant_ai_request(user.id, "لخّص النص التالي بالعربية في نقاط واضحة، مع الحفاظ على المعلومات المهمة وعدم اختلاق تفاصيل:\n\n" + source[:12000])
-    await update.effective_message.reply_text(answer[:4000])
+    await update.effective_message.reply_text(_offline_summary(source[:12000]))
 
 
 async def assistant_private_document(update, context):
@@ -1236,8 +1244,8 @@ async def assistant_private_document(update, context):
             await msg.reply_text("لم أتمكن من استخراج نص من الملف. قد يكون PDF مصوّرًا يحتاج OCR، وهذه النسخة لا تتضمن OCR.")
             return
         remember_assistant_user(user)
-        await msg.reply_text("🧠 جارٍ إعداد الملخص. لا ترسل ملفات تحتوي بيانات حساسة إذا لم ترغب بمشاركتها مع مزود الذكاء الاصطناعي.")
-        answer = await assistant_ai_request(user.id, "لخّص محتوى الملف التالي بالعربية في عناوين ونقاط، واذكر إن كان النص ناقصًا. لا تضف معلومات غير موجودة.\n\n" + extracted[:12000])
+        await msg.reply_text("📄 جارٍ استخراج ملخص محلي من النص دون إرساله إلى أي خدمة خارجية.")
+        answer = _offline_summary(extracted[:12000])
         await msg.reply_text(("📄 ملخص الملف: " + (doc.file_name or "بدون اسم") + "\n\n" + answer)[:4000])
     except ImportError:
         await msg.reply_text("ميزة قراءة هذا النوع من الملفات تحتاج مكتبات إضافية. تأكد من تحديث requirements.txt وإعادة النشر.")
@@ -1252,13 +1260,94 @@ async def assistant_quiz_cmd(update, context):
         return
     topic = " ".join(context.args).strip()
     if not topic:
-        await update.effective_message.reply_text("🎓 لإنشاء اختبار تدريبي اكتب: /quiz موضوع الاختبار\nمثال: /quiz مبادئ الإدارة - الفصل الأول\nسيُنشأ اختبار تدريبي، وليس اختبارًا رسميًا معتمدًا.")
+        await update.effective_message.reply_text("🎓 اكتب /quiz ثم موضوعًا دراسيًا. سأعطيك قالب مراجعة وأسئلة عامة دون ادعاء أنها من منهج رسمي.")
         return
-    prompt = ("أنشئ اختبارًا تدريبيًا عربيًا من 5 أسئلة اختيار من متعدد عن الموضوع التالي: " + topic[:500] + ". "
-              "لكل سؤال أربعة خيارات (أ، ب، ج، د) وإجابة صحيحة مع شرح سطر واحد. لا تدّع أن الأسئلة من ملف أو منهج رسمي ما لم يُزوّد به. نظّمها بوضوح.")
-    await update.effective_message.reply_text("🎓 جارٍ إعداد الاختبار التدريبي...")
-    answer = await assistant_ai_request(user.id, prompt)
-    await update.effective_message.reply_text(answer[:4000])
+    await update.effective_message.reply_text(
+        f"🎓 قالب مراجعة ذاتية لموضوع: {topic[:300]}\n\n"
+        "1) ما تعريف المفهوم الأساسي في هذا الموضوع؟\n"
+        "2) اذكر ثلاث نقاط رئيسية تتعلق به.\n"
+        "3) ما الفرق بين أهم مصطلحين فيه؟\n"
+        "4) اذكر مثالًا تطبيقيًا.\n"
+        "5) ما الخطأ الشائع الذي ينبغي تجنبه؟\n\n"
+        "ℹ️ هذا قالب تدريبي محلي وليس اختبارًا مولّدًا آليًا أو أسئلة رسمية. أرسل نص الدرس مع /summarize لاستخراج ملخص منه.")
+
+
+async def student_studyadd_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) != 3 or not all(parts):
+        await update.effective_message.reply_text("الصيغة: /studyadd اليوم | الوقت | المادة\nمثال: /studyadd الأحد | 08:00 | مبادئ الإدارة")
+        return
+    db.execute("INSERT INTO student_schedule(user_id,weekday,study_time,subject,created_at) VALUES(?,?,?,?,?)", (user.id,parts[0][:30],parts[1][:30],parts[2][:200],_assistant_now()))
+    db.commit()
+    await update.effective_message.reply_text("✅ تمت إضافة المادة إلى جدولك الدراسي.")
+
+
+async def student_schedule_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    rows = db.execute("SELECT id,weekday,study_time,subject FROM student_schedule WHERE user_id=? ORDER BY CASE weekday WHEN 'الأحد' THEN 1 WHEN 'الاثنين' THEN 2 WHEN 'الثلاثاء' THEN 3 WHEN 'الأربعاء' THEN 4 WHEN 'الخميس' THEN 5 WHEN 'الجمعة' THEN 6 WHEN 'السبت' THEN 7 ELSE 8 END, study_time", (user.id,)).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("لا يوجد جدول دراسي بعد. استخدم /studyadd اليوم | الوقت | المادة")
+        return
+    await update.effective_message.reply_text("🎓 جدولك الدراسي:\n\n" + "\n".join(f"#{i} — {day}، {tm} — {sub}" for i,day,tm,sub in rows)[:4000])
+
+
+async def student_studydelete_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE or not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الصيغة: /delstudy رقم المادة")
+        return
+    cur = db.execute("DELETE FROM student_schedule WHERE id=? AND user_id=?", (int(context.args[0]),user.id))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم حذف المادة." if cur.rowcount else "لم أجد مادة بهذا الرقم في جدولك.")
+
+
+async def student_exam_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split("|",1)]
+    if len(parts) != 2 or not all(parts):
+        await update.effective_message.reply_text("الصيغة: /exam YYYY-MM-DD HH:MM | اسم الاختبار\nمثال: /exam 2026-11-01 09:00 | اختبار المحاسبة")
+        return
+    try:
+        dt = datetime.strptime(parts[0], "%Y-%m-%d %H:%M").astimezone().isoformat(timespec="seconds")
+    except ValueError:
+        await update.effective_message.reply_text("صيغة التاريخ غير صحيحة. استخدم YYYY-MM-DD HH:MM مثل 2026-11-01 09:00")
+        return
+    if datetime.fromisoformat(dt) <= datetime.now().astimezone():
+        await update.effective_message.reply_text("موعد الاختبار يجب أن يكون في المستقبل.")
+        return
+    db.execute("INSERT INTO student_events(user_id,event_type,title,event_at,created_at) VALUES(?,?,?,?,?)", (user.id,"exam",parts[1][:250],dt,_assistant_now()))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم حفظ موعد الاختبار. سأرسل لك تذكيرًا عندما يحين الموعد إذا كان البوت يعمل.")
+
+
+async def student_events_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    rows = db.execute("SELECT id,event_type,title,event_at FROM student_events WHERE user_id=? AND notified=0 ORDER BY event_at LIMIT 30", (user.id,)).fetchall()
+    if not rows:
+        await update.effective_message.reply_text("لا توجد اختبارات أو مواعيد قادمة مسجلة.")
+        return
+    await update.effective_message.reply_text("🗓️ مواعيدك القادمة:\n\n" + "\n".join(f"#{i} — {title} — {when.replace('T',' ')[:16]}" for i,typ,title,when in rows)[:4000])
+
+
+async def student_event_delete_cmd(update, context):
+    user = update.effective_user
+    if not user or update.effective_chat.type != ChatType.PRIVATE or not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الصيغة: /delexam رقم الموعد")
+        return
+    cur = db.execute("DELETE FROM student_events WHERE id=? AND user_id=?", (int(context.args[0]),user.id))
+    db.commit()
+    await update.effective_message.reply_text("✅ تم حذف الموعد." if cur.rowcount else "لم أجد موعدًا بهذا الرقم.")
 
 
 async def assistant_private_text(update, context):
@@ -1267,15 +1356,11 @@ async def assistant_private_text(update, context):
     msg = update.effective_message
     if not user or not chat or chat.type != ChatType.PRIVATE or not msg or not msg.text:
         return
-    # Leave existing panel workflows intact; this handler must not consume their input.
+    # Do not consume messages used by existing owner/panel workflows.
     if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation"):
         return
     remember_assistant_user(user)
-    pref = db.execute("SELECT ai_enabled FROM assistant_preferences WHERE user_id=?", (user.id,)).fetchone()
-    if pref and not pref[0]:
-        return
-    await msg.reply_text("🧠 أفكر في طلبك...", do_quote=True)
-    answer = await assistant_ai_request(user.id, msg.text)
+    answer = await offline_assistant_response(user.id, msg.text)
     await msg.reply_text(answer)
 
 
@@ -1284,11 +1369,11 @@ async def start(update, context):
     if update.effective_chat.type == ChatType.PRIVATE:
         remember_assistant_user(update.effective_user)
         await update.effective_message.reply_text(
-            "🤖 أهلًا بك في مساعد الابتكار الذكي\n\n"
-            "اكتب سؤالك مباشرة للتحدث مع المساعد، أو استخدم الأوامر التالية:\n"
-            "/note — حفظ ملاحظة\n/notes — عرض ملاحظاتك\n/remind — إنشاء تذكير\n/reminders — عرض تذكيراتك\n/usage — إحصائيات استخدامك\n/clear_ai — حذف سجل محادثة المساعد\n"
-            "/task و/tasks — إدارة المهام\n/expense و/expenses — تسجيل المصاريف\n/summarize — تلخيص نص أو ملف\n/quiz — اختبار تدريبي\n/panel — لوحة القروبات للمصرح لهم\n\n"
-            "تنبيه: المحادثة الذكية تحتاج إعداد OPENAI_API_KEY في Render.",
+            "🤖 أهلًا بك في مساعد الخدمات الشخصية والطلابية\n\n"
+            "هذا الإصدار يعمل دون ذكاء اصطناعي ودون مفتاح API، ولا يرسل نصوصك إلى مزود خارجي.\n"
+            "/note و/notes — الملاحظات\n/remind و/reminders — التذكيرات\n/task و/tasks — المهام\n/expense و/expenses — المصاريف\n"
+            "/studyadd و/studyschedule — الجدول الدراسي\n/exam و/exams — الاختبارات والمواعيد\n/summarize — تلخيص استخراجي للنص أو الملف\n/quiz — قالب مراجعة تدريبي\n/panel — لوحة القروبات للمصرح لهم\n\n"
+            "ℹ️ الردود النصية محدودة بأوامر وخدمات محددة ولا تمثل محادثة ذكاء اصطناعي.",
             reply_markup=assistant_menu_markup()
         )
     else:
@@ -2406,7 +2491,7 @@ async def callback(update, context):
     data = q.data or ""
 
     if data == "assistant_ai_help":
-        await q.message.reply_text("🧠 اكتب سؤالك هنا مباشرة، وسأجيبك عبر المساعد الذكي إذا كانت الخدمة مفعّلة.")
+        await q.message.reply_text("ℹ️ المحادثة بالذكاء الاصطناعي أزيلت من هذا الإصدار. يمكنك استخدام خدمات الملاحظات والمهام والتذكيرات والمصاريف والجدول الدراسي والاختبارات.")
         return
     if data == "assistant_notes_help":
         await q.message.reply_text("📝 لحفظ ملاحظة: /note نص الملاحظة\nلعرض ملاحظاتك: /notes")
@@ -2421,13 +2506,19 @@ async def callback(update, context):
         await q.message.reply_text("💰 المصاريف:\n/expense المبلغ | الوصف — تسجيل مصروف\n/expenses — عرض آخر المصاريف وإجمالي الشهر")
         return
     if data == "assistant_summary_help":
-        await q.message.reply_text("📄 للتلخيص اكتب /summarize ثم النص، أو أرسل ملف PDF أو DOCX أو TXT في الخاص. تنبيه: قد يُرسل محتوى النص المستخرج إلى مزود الذكاء الاصطناعي؛ لا ترسل بيانات حساسة.")
+        await q.message.reply_text("📄 للتلخيص المحلي اكتب /summarize ثم النص، أو أرسل ملف PDF أو DOCX أو TXT في الخاص. يجري استخراج بعض الجمل من النص دون ذكاء اصطناعي أو إرسالها إلى خدمة خارجية.")
         return
     if data == "assistant_quiz_help":
-        await q.message.reply_text("🎓 لإنشاء اختبار تدريبي: /quiz ثم اسم الموضوع أو الفصل. الأسئلة مولدة للتدريب وقد تحتاج مراجعة.")
+        await q.message.reply_text("🎓 اكتب /quiz ثم اسم الموضوع للحصول على قالب أسئلة مراجعة محلي. القالب عام وليس أسئلة مولّدة أو رسمية.")
         return
     if data == "assistant_privacy":
-        await q.message.reply_text("🔒 نسجل معرّف حسابك واسم العرض وتواريخ الاستخدام وعدد طلبات المساعد. لا تُعرض محادثاتك في لوحة المالك تلقائيًا. يمكنك حذف سجل المحادثة عبر /clear_ai.")
+        await q.message.reply_text("🔒 تُحفظ ملاحظاتك ومهامك ومواعيدك ومصاريفك في قاعدة بيانات البوت مرتبطة بمعرّف حسابك. لا توجد خدمة ذكاء اصطناعي أو إرسال للنصوص إلى مزود خارجي في هذا الإصدار. استخدم أوامر الحذف المتاحة لإزالة سجلاتك.")
+        return
+    if data == "student_schedule_help":
+        await q.message.reply_text("🎓 الجدول الدراسي:\n/studyadd اليوم | الوقت | المادة — مثال: /studyadd الأحد | 08:00 | مبادئ الإدارة\n/studyschedule — عرض الجدول\n/delstudy رقم — حذف مادة")
+        return
+    if data == "student_events_help":
+        await q.message.reply_text("🗓️ الاختبارات والمواعيد:\n/exam YYYY-MM-DD HH:MM | اسم الاختبار — إضافة موعد\n/exams — عرض المواعيد القادمة\n/delexam رقم — حذف موعد. أوقات المواعيد حسب توقيت السعودية.")
         return
     if data == "assistant_group_panel":
         if can_use_panel(uid):
@@ -3939,6 +4030,8 @@ def main():
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
         "expense": assistant_expense_cmd, "expenses": assistant_expenses_cmd, "summarize": assistant_summarize_cmd, "quiz": assistant_quiz_cmd,
+        "studyadd": student_studyadd_cmd, "studyschedule": student_schedule_cmd, "delstudy": student_studydelete_cmd,
+        "exam": student_exam_cmd, "exams": student_events_cmd, "delexam": student_event_delete_cmd,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
         "grantpublish": grantpublish, "revokepublish": revokepublish,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
