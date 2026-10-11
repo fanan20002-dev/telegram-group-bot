@@ -2074,19 +2074,21 @@ async def public_settings(update, context):
         return
     register_group(chat)
     settings = get_settings(chat.id)
-    buttons = []
+    # واجهة مربعة/مختصرة قدر الإمكان ضمن قيود أزرار Telegram: 3 أيقونات رئيسية في صف واحد.
+    # أزرار تيليجرام لا تسمح بتحديد لون أو أبعاد مربعة فعلية؛ الترتيب المتجاور يعطي شكل لوحة أيقونات.
+    rows = [[
+        InlineKeyboardButton("🛡️", callback_data="public:protection"),
+        InlineKeyboardButton("🎮", callback_data=f"member_games:{chat.id}"),
+        InlineKeyboardButton("🕹️", callback_data=f"game_daily:{chat.id}"),
+    ]]
+    secondary = []
     if settings.get("public_commands", 1):
-        buttons.append(InlineKeyboardButton("📚 دليل البوت", callback_data="public:commands"))
+        secondary.append(InlineKeyboardButton("📚 الدليل", callback_data="public:commands"))
     if settings.get("public_activity", 1):
-        buttons.append(InlineKeyboardButton("🏆 لوحة نشاط الأعضاء", callback_data="public:activity"))
-    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
-    # واجهة الأعضاء تعرض خدمات عامة فقط؛ لا تعرض أي خيارات تشغيلية أو تحديثات النظام.
-    rows.append([InlineKeyboardButton("🕹️ عالم الألعاب والمغامرات", callback_data=f"member_games:{chat.id}")])
-    rows.append([InlineKeyboardButton("🎬 مركز الوسائط والصور والتنزيلات", callback_data=f"member_media:{chat.id}")])
-    rows.append([InlineKeyboardButton("🗓️ مهمة اليوم", callback_data=f"game_daily:{chat.id}")])
-    if settings.get("public_protection", 1):
-        rows.append([InlineKeyboardButton("🛡️ معلومات الحماية", callback_data="public:protection")])
-    text = "🤖 مركز الأعضاء\n\n📚 دليل البوت • 🏆 لوحة المتصدرين • 🎮 الألعاب • 🎯 تحدي اليوم\n\n🔒 لوحة الإدارة وإعدادات النظام مخصصة للمصرّح لهم فقط."
+        secondary.append(InlineKeyboardButton("🏆 النشاط", callback_data="public:activity"))
+    secondary.append(InlineKeyboardButton("🎬 الوسائط", callback_data=f"member_media:{chat.id}"))
+    rows.extend([secondary[i:i+2] for i in range(0, len(secondary), 2) if secondary[i:i+2]])
+    text = "🤖 مركز الأعضاء\n\nاختر إحدى الخدمات من لوحة الأيقونات أدناه.\n🔒 أدوات الإدارة وإعدادات النظام مخصصة للمصرّح لهم فقط."
     await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 async def settings_cmd(update, context):
