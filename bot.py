@@ -27,6 +27,10 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 BOOTSTRAP_CODE = os.environ.get("BOOTSTRAP_CODE", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
+# Optional Render deploy integration. Configure both values in Render Environment.
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("groupbot")
@@ -616,19 +620,6 @@ def set_setting(chat_id, field, value):
     db.execute(f'UPDATE settings SET "{field}"=? WHERE chat_id=?', (int(bool(value)), chat_id))
     db.commit()
 
-def group_games_enabled(chat_id):
-    """Return whether interactive games are enabled in both protection and game settings."""
-    try:
-        protection = get_settings(chat_id)
-        if protection.get("games", 0):
-            return False
-        cfg = db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        return not cfg or bool(cfg[0])
-    except Exception as exc:
-        log.warning("تعذر قراءة حالة الألعاب للقروب %s: %s", chat_id, exc)
-        return False
-
-
 def log_action(chat_id, user_id, action, details=""):
     try:
         db.execute(
@@ -826,7 +817,7 @@ def panel_markup(uid):
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
             [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         ])
-    return InlineKeyboardMarkup([
+    owner_rows = [
         [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
@@ -837,7 +828,10 @@ def panel_markup(uid):
         [InlineKeyboardButton("💬 إدارة الردود الآلية (للمالك فقط)", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
-    ])
+    ]
+    if is_owner(uid):
+        owner_rows.append([InlineKeyboardButton("🔄 إدارة تحديثات البوت", callback_data="update_manager")])
+    return InlineKeyboardMarkup(owner_rows)
 
 def settings_page_markup(chat_id, page=0, back_callback="home"):
     items = [
@@ -1436,33 +1430,16 @@ async def start(update, context):
     else:
         register_group(update.effective_chat)
         chat = update.effective_chat
-        owner_tag = "مالك القروب"
-        try:
-            admins = await context.bot.get_chat_administrators(chat.id)
-            creator = next((a.user for a in admins if a.status == "creator"), None)
-            if creator:
-                owner_tag = f'<a href="tg://user?id={creator.id}">{html.escape(creator.full_name or "مالك القروب")}</a>'
-        except Exception as exc:
-            log.info("تعذر جلب مالك القروب للتنبيه: %s", exc)
-        try:
-            bot_user = await context.bot.get_me()
-            bot_tag = f'@{bot_user.username}' if bot_user.username else 'البوت'
-        except Exception:
-            bot_tag = 'البوت'
+        # رسالة تشغيل مختصرة: لا تعرض اسم مالك القروب أو تفاصيل اللوحة، والأزرار أيقونات فقط.
         await update.effective_message.reply_text(
-            f"تم تشغيل {html.escape(bot_tag)} ✅\n"
-            f"👑 مالك القروب: {owner_tag}\n\n"
-            "🤖 الردود الآلية مفعّلة افتراضيًا في هذا القروب.\n"
-            "🛡️ لوحة التحكم هنا تخص هذا القروب فقط، وتظهر لمالك القروب ومشرفيه في Telegram.\n"
-            "🔒 لا تفتح هذه اللوحة صلاحيات مالك البوت أو إعدادات قروبات أخرى.\n"
-            "استخدم /panel لفتح لوحة القروب.",
-            parse_mode="HTML",
+            "✅",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛡️ فتح لوحة هذا القروب", callback_data=f"group_panel_home:{chat.id}")],
-                [InlineKeyboardButton("🎮 الألعاب والمراجعات والتحديات", callback_data=f"member_games:{chat.id}")],
-                [InlineKeyboardButton("🕹️ مركز الأعضاء", callback_data=f"public:back")],
+                [InlineKeyboardButton("🛡️", callback_data=f"group_panel_home:{chat.id}")],
+                [InlineKeyboardButton("🎮", callback_data=f"member_games:{chat.id}")],
+                [InlineKeyboardButton("🕹️", callback_data="public:back")],
             ]),
         )
+
 
 async def games_cmd(update, context):
     """فتح ألعاب ومراجعات القروب مباشرة بأمر /games."""
@@ -2742,11 +2719,102 @@ async def broadcast_draft_message(update, context):
         await msg.reply_text("✅ تم حفظ رسالة الترحيب. ستُرسل عند دخول أعضاء جدد إذا كان البوت قادرًا على إرسال الرسائل في القروب.")
         return
 
+async def _render_trigger_latest_deploy():
+    """Trigger a Render deploy of the latest commit from the service's configured repository."""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        raise RuntimeError("يلزم ضبط RENDER_API_KEY وRENDER_SERVICE_ID في متغيرات البيئة.")
+    import urllib.request
+    import urllib.error
+
+    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys"
+    req = urllib.request.Request(
+        url,
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {RENDER_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    def _request():
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                return response.status, body
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"رفض Render الطلب (HTTP {exc.code}): {detail}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"تعذر الاتصال بخدمة Render: {exc}") from exc
+
+    status, body = await asyncio.to_thread(_request)
+    try:
+        payload = json.loads(body) if body else {}
+    except Exception:
+        payload = {}
+    deploy_id = payload.get("id") or payload.get("deploy", {}).get("id") or ""
+    return status, deploy_id
+
+
+def update_manager_markup():
+    configured = bool(RENDER_API_KEY and RENDER_SERVICE_ID)
+    rows = []
+    if configured:
+        rows.append([InlineKeyboardButton("🚀 نشر آخر تحديث من GitHub", callback_data="update_deploy_latest")])
+    rows.append([InlineKeyboardButton("🔄 تحديث الحالة", callback_data="update_manager")])
+    rows.append([InlineKeyboardButton("⬅️ العودة للرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def callback(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     data = q.data or ""
+
+    # نشر آخر نسخة من المستودع على Render متاح للمالك الأساسي فقط.
+    if data in ("update_manager", "update_deploy_latest"):
+        if not is_owner(uid):
+            await q.edit_message_text("⛔ إدارة تحديثات البوت متاحة للمالك الأساسي فقط.")
+            return
+        if data == "update_manager":
+            configured = bool(RENDER_API_KEY and RENDER_SERVICE_ID)
+            status_text = (
+                "🟢 الربط مع Render جاهز.\nيمكنك نشر آخر commit موجود في GitHub؛ هذا لا يرفع تعديلات محلية غير منشورة."
+                if configured else
+                "🟠 الربط غير مكتمل. أضف RENDER_API_KEY وRENDER_SERVICE_ID إلى متغيرات البيئة في Render، ثم أعد تشغيل الخدمة.\n"
+                "احفظ المفتاح كمتغير سري ولا ترسله في المحادثة."
+            )
+            await q.edit_message_text(
+                "🔄 إدارة تحديثات البوت\n\n"
+                + status_text
+                + "\n\nقبل النشر: ارفع الكود المعدل إلى GitHub. زر النشر سيطلب من Render تشغيل آخر نسخة من المستودع."
+                + "\nملاحظة: قد يعاد تشغيل البوت أثناء النشر.",
+                reply_markup=update_manager_markup(),
+            )
+            return
+        try:
+            await q.edit_message_text("⏳ جارٍ طلب نشر آخر نسخة من Render…")
+            status_code, deploy_id = await _render_trigger_latest_deploy()
+            suffix = f"\nمعرّف النشر: {html.escape(str(deploy_id))}" if deploy_id else ""
+            await q.edit_message_text(
+                "✅ استقبل Render طلب النشر بنجاح.\n"
+                "انتظر اكتمال النشر، ثم تحقق من سجل الخدمة وحالة البوت."
+                + suffix,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 إدارة التحديثات", callback_data="update_manager")],
+                                                   [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]),
+            )
+        except Exception as exc:
+            log.warning("Render deploy request failed: %s", exc)
+            await q.edit_message_text(
+                "❌ لم يتم طلب النشر. تحقق من RENDER_API_KEY وRENDER_SERVICE_ID وصلاحيات المفتاح في Render.\n"
+                + html.escape(str(exc))[:800],
+                reply_markup=update_manager_markup(),
+                parse_mode="HTML",
+            )
+        return
 
     # استدعاء التاق: المالك الأساسي والمفوّض لهما الصلاحية نفسها على القروبات المسجلة.
     if data.startswith(("owner_tag_groups", "owner_tag_toggle:", "owner_tag_all", "owner_tag_send")):
@@ -3275,8 +3343,8 @@ async def callback(update, context):
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         db.commit()
         cfg = db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id):
-            await q.edit_message_text("🎮 الألعاب متوقفة حاليًا في هذا القروب من إعدادات الحماية أو لوحة الألعاب.")
+        if not cfg or not cfg[0]:
+            await q.edit_message_text("🎮 الألعاب متوقفة حاليًا في هذا القروب.")
             return
         rows = []
         base_buttons = [InlineKeyboardButton(label, callback_data=f"{callback}:{chat_id}") for label, callback in MEMBER_GAMES]
@@ -3603,7 +3671,7 @@ async def callback(update, context):
             await q.answer("اللعبة أو القروب غير متاح.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
-        if not group_games_enabled(chat_id) or (flag and not flag[0]):
+        if (cfg and not cfg[0]) or (flag and not flag[0]):
             await q.answer("هذه الألعاب متوقفة حاليًا من لوحة الإدارة.",show_alert=True); return
         uid_player=q.from_user.id; display=q.from_user.full_name or "عضو"; epoch=int(time.time())
         row=db.execute("SELECT progress,coins,last_claim_epoch FROM persistent_game_state WHERE chat_id=? AND user_id=? AND game_key=?",(chat_id,uid_player,game_key)).fetchone()
@@ -3664,7 +3732,7 @@ async def callback(update, context):
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         rows = [[InlineKeyboardButton(title, callback_data=f"game_quiz_cat:{chat_id}:{key}")]
                 for key,(title,_questions) in QUIZ_CATEGORIES.items()]
         rows.append([InlineKeyboardButton("🎯 مسابقة متنوعة من 5 مراحل", callback_data=f"game_quiz_cat:{chat_id}:mixed")])
@@ -3676,7 +3744,8 @@ async def callback(update, context):
         except ValueError: await q.answer("بيانات المسابقة غير صحيحة.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         if category == "mixed": category=random.choice(list(QUIZ_CATEGORIES.keys()))
         if category not in QUIZ_CATEGORIES: await q.answer("هذا المجال غير متاح.", show_alert=True); return
         await q.answer("بدأت المسابقة!")
@@ -3717,7 +3786,7 @@ async def callback(update, context):
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("أوقف الإشراف الألعاب في هذا القروب.", show_alert=True); return
         if category not in QUIZ_CATEGORIES or stage < 2 or stage > 5:
             await q.answer("المرحلة غير متاحة.", show_alert=True); return
         await q.answer(f"المرحلة {stage} بدأت")
@@ -3744,7 +3813,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         target, hint = random.choice(WORD_BANK)
         distractors = [word for word, _hint in WORD_BANK if word != target]
         options = random.sample(distractors, min(3, len(distractors))) + [target]
@@ -3771,7 +3840,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         import random
         bot_choice=random.choice(["حجر","ورقة","مقص"])
         context.user_data[f"rps:{chat_id}"]=bot_choice
@@ -3802,7 +3871,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if not group_games_enabled(chat_id) or (cfg and (not cfg[0] or not cfg[1])): await q.answer("تحدي الخاسر أو الألعاب غير مفعّلة في هذا القروب.", show_alert=True); return
+        if cfg and (not cfg[0] or not cfg[1]): await q.answer("تحدي الخاسر غير مفعّل.", show_alert=True); return
         import random
         tasks=["اكتب في القروب: أنا بطل التحديات 😎", "أرسل ثلاثة إيموجيات تعبّر عن مزاجك 🎭", "امدح عضوًا في القروب بكلمة لطيفة 🌟", "اكتب حقيقة ممتعة عن نفسك (اختياري) 🧠"]
         task=random.choice(tasks)
@@ -3864,7 +3933,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         answer, _hint = random.choice(WORD_BANK)
         scrambled = "".join(random.sample(list(answer), len(answer)))
@@ -3881,7 +3950,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,created_at) VALUES(?,?,?,?,?)",(token,chat_id,"speed","الرياض",now())); db.commit()
         buttons=[[InlineKeyboardButton("جدة", callback_data=f"game_round_answer:{token}:جدة"), InlineKeyboardButton("الرياض", callback_data=f"game_round_answer:{token}:الرياض")], [InlineKeyboardButton("أبها", callback_data=f"game_round_answer:{token}:أبها"), InlineKeyboardButton("تبوك", callback_data=f"game_round_answer:{token}:تبوك")]]
@@ -3909,7 +3978,8 @@ async def callback(update, context):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.",show_alert=True); return
+        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
         day=datetime.now(timezone.utc).date().isoformat()
         existing=db.execute("SELECT completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
         if existing:
@@ -3945,7 +4015,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.",show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.",show_alert=True); return
+        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_xo(token,chat_id,player_x,board,turn,status,created_at) VALUES(?,?,?,'         ','X','waiting',?)",(token,chat_id,uid,now())); db.commit()
         try:
@@ -4041,7 +4111,7 @@ async def callback(update, context):
         current = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
         text = current[0] if current and current[0] else "غير مفعّل؛ لم تُحدّد رسالة ترحيب."
         await q.edit_message_text(
-            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {{name}} لاسم العضو و {{group}} لاسم القروب.",
+            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {name} لاسم العضو.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✏️ تعيين رسالة جديدة", callback_data=f"welcome_set:{chat_id}")],
                 [InlineKeyboardButton("🗑️ إيقاف الترحيب", callback_data=f"welcome_off:{chat_id}")],
