@@ -111,6 +111,14 @@ CREATE TABLE IF NOT EXISTS reentry_restrictions(
     PRIMARY KEY(chat_id, user_id)
 )
 """)
+db.execute("""
+CREATE TABLE IF NOT EXISTS member_security_warnings(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    warning_count INTEGER NOT NULL DEFAULT 0, last_reason TEXT DEFAULT '',
+    updated_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id)
+)
+""")
+
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS watched_groups(
@@ -2446,10 +2454,13 @@ async def notify_reentry_restriction(context, chat, member, reason):
         (chat_id, member.id, display_name, username, reason, now()))
     db.commit()
     log_action(chat_id, member.id, "reentry_blocked", reason)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ السماح له بالعودة", callback_data=f"reentry_approve:{chat_id}:{member.id}"),
-        InlineKeyboardButton("⛔ إبقاؤه ممنوعًا", callback_data=f"reentry_keep:{chat_id}:{member.id}")
-    ]])
+    warning_row = db.execute("SELECT warning_count FROM member_security_warnings WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
+    warning_count = warning_row[0] if warning_row else 0
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ السماح له بالعودة", callback_data=f"reentry_approve:{chat_id}:{member.id}"),
+         InlineKeyboardButton("⛔ إبقاؤه ممنوعًا", callback_data=f"reentry_keep:{chat_id}:{member.id}")],
+        [InlineKeyboardButton(f"⚠️ تسجيل إنذار ({warning_count}/3)", callback_data=f"reentry_warn:{chat_id}:{member.id}")]
+    ])
     text = (
         "🚨 تنبيه أمني: تم منع عضو من العودة حتى موافقة المالك أو المالك المفوّض.\n\n"
         f"👥 القروب: {chat.title or chat_id}\n"
@@ -2476,6 +2487,10 @@ async def chat_member_handler(update, context):
         return
     chat_id = cm.chat.id
     register_group(cm.chat)
+    # Define transition values before using them in membership statistics.
+    old = cm.old_chat_member.status
+    new = cm.new_chat_member.status
+    member = cm.new_chat_member.user
     if member and not member.is_bot:
         if old in ("left", "kicked") and new in ("member", "administrator", "restricted"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "join", _riyadh_now().isoformat()))
@@ -2484,9 +2499,6 @@ async def chat_member_handler(update, context):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
             db.commit()
     s = get_settings(chat_id)
-    old = cm.old_chat_member.status
-    new = cm.new_chat_member.status
-    member = cm.new_chat_member.user
     if member and old in ("member", "administrator", "restricted") and new in ("left", "kicked") and not member.is_bot:
         reason = "غادر القروب بنفسه" if new == "left" else "تم حظره/طرده من القروب"
         log_action(chat_id, member.id, "member_leave", f"{member.full_name} ({new})")
@@ -2650,6 +2662,22 @@ async def broadcast_draft_message(update, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالك المفوّض", callback_data="delegated_owner")]])
         )
         return
+    # Handle an active broadcast draft BEFORE pending admin actions. Otherwise a
+    # stale awaiting_admin_action flag can intercept the ad and demand a numeric ID.
+    if context.user_data.get("awaiting_broadcast") and (is_owner(user.id) or is_delegated_owner(user.id)):
+        context.user_data.pop("awaiting_admin_action", None)
+        context.user_data["broadcast_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
+        selected = context.user_data.get("broadcast_selected_groups", [])
+        await msg.reply_text(
+            "👀 معاينة الإعلان جاهزة. سيتم إرساله فقط إلى القروبات المحددة والمصرح لك بها.\n"
+            f"عدد القروبات المستهدفة: {len(selected)}\nهل تريد المتابعة؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأكيد النشر للقروبات المحددة", callback_data="broadcast_confirm")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]
+            ])
+        )
+        context.user_data["awaiting_broadcast"] = False
+        return
     pending_action = context.user_data.get("awaiting_admin_action")
     if pending_action:
         raw = (msg.text or "").strip()
@@ -2700,19 +2728,6 @@ async def broadcast_draft_message(update, context):
         context.user_data.pop("awaiting_welcome_chat", None)
         await msg.reply_text("✅ تم حفظ رسالة الترحيب. ستُرسل عند دخول أعضاء جدد إذا كان البوت قادرًا على إرسال الرسائل في القروب.")
         return
-    if not context.user_data.get("awaiting_broadcast") or not (is_owner(user.id) or is_delegated_owner(user.id)):
-        return
-    context.user_data["broadcast_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
-    selected = context.user_data.get("broadcast_selected_groups", [])
-    await msg.reply_text(
-        "👀 معاينة الإعلان جاهزة. سيتم إرساله فقط إلى القروبات المحددة والمصرح لك بها.\n"
-        f"عدد القروبات المستهدفة: {len(selected)}\nهل تريد المتابعة؟",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تأكيد النشر للقروبات المحددة", callback_data="broadcast_confirm")],
-            [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]
-        ])
-    )
-    context.user_data["awaiting_broadcast"] = False
 
 async def callback(update, context):
     q = update.callback_query
@@ -2955,6 +2970,50 @@ async def callback(update, context):
             await panel(update, context)
         else:
             await q.message.reply_text("🛡️ إدارة القروبات متاحة للمصرح لهم فقط. أضف البوت إلى قروبك وامنحه صلاحيات المشرف المطلوبة، ثم اتبع تعليمات التسجيل.")
+        return
+
+    if data.startswith("reentry_warn:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذه الصلاحية للمالك والمفوّض فقط.", show_alert=True)
+            return
+        try:
+            _, chat_raw, user_raw = data.split(":", 2)
+            target_chat, target_user = int(chat_raw), int(user_raw)
+        except (ValueError, TypeError):
+            await q.answer("بيانات الإنذار غير صحيحة.", show_alert=True)
+            return
+        restriction = db.execute("SELECT display_name, username, status FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (target_chat, target_user)).fetchone()
+        if not restriction:
+            await q.answer("لا يوجد سجل عودة لهذا العضو.", show_alert=True)
+            return
+        row = db.execute("SELECT warning_count FROM member_security_warnings WHERE chat_id=? AND user_id=?", (target_chat, target_user)).fetchone()
+        count = row[0] if row else 0
+        if count >= 3:
+            await q.answer("وصل الحد الأعلى: 3 إنذارات.", show_alert=True)
+            return
+        count += 1
+        db.execute("""INSERT INTO member_security_warnings(chat_id,user_id,warning_count,last_reason,updated_at)
+            VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET
+            warning_count=excluded.warning_count,last_reason=excluded.last_reason,updated_at=excluded.updated_at""",
+            (target_chat, target_user, count, restriction[2] or "مغادرة/طرد", now()))
+        db.commit()
+        log_action(target_chat, target_user, "member_security_warning", f"count={count}; by={uid}")
+        await q.answer(f"تم تسجيل الإنذار {count}/3")
+        try:
+            await q.edit_message_text((q.message.text or "") + f"\\n\\n⚠️ الإنذارات المسجلة: {count}/3\\nسجّل الإنذار: {uid}")
+        except Exception as exc:
+            log.info("تعذر تحديث رسالة الإنذار: %s", exc)
+        if count == 3:
+            alert = (f"🚨 بلغ العضو الحد الأعلى من الإنذارات (3/3).\\nالقروب: {target_chat}\\n"
+                     f"الاسم: {restriction[0] or target_user}\\nاسم المستخدم: @{restriction[1] or 'غير متوفر'}\\n"
+                     f"المعرّف الثابت: {target_user}\\nيرجى مراجعة طلب العودة واتخاذ القرار.")
+            recipients = {OWNER_ID} if OWNER_ID else set()
+            recipients.update(r[0] for r in db.execute("SELECT user_id FROM delegated_owners").fetchall())
+            for recipient in recipients:
+                try:
+                    await context.bot.send_message(chat_id=recipient, text=alert)
+                except Exception as exc:
+                    log.info("تعذر إرسال تنبيه الإنذارات إلى %s: %s", recipient, exc)
         return
 
     if data.startswith(("reentry_approve:", "reentry_keep:")):
@@ -4119,6 +4178,7 @@ async def callback(update, context):
         if not selected:
             await q.answer("حدد قروبًا واحدًا على الأقل تملك صلاحية النشر فيه.", show_alert=True)
             return
+        context.user_data.pop("awaiting_admin_action", None)
         context.user_data["awaiting_broadcast"] = True
         await q.edit_message_text(
             "📣 أرسل الآن الإعلان في الخاص مع البوت (نص أو صورة أو فيديو أو ملف مع تعليق).\n"
