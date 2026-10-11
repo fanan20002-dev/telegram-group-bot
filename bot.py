@@ -816,6 +816,7 @@ def panel_markup(uid):
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
             [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
+            [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         ])
     owner_rows = [
         [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
@@ -825,7 +826,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
-        [InlineKeyboardButton("💬 إدارة الردود الآلية (للمالك فقط)", callback_data="owner_autoreplies")],
+        [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
@@ -3128,13 +3129,77 @@ async def callback(update, context):
         return
 
     if data == "owner_autoreplies":
-        if not is_owner(uid):
-            await q.answer("إدارة الردود العامة للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         groups = await accessible_groups(context.bot, uid)
         await q.edit_message_text("💬 إدارة الردود الآلية\n\nاختر القروب الذي تريد إضافة ردوده أو تعديلها. التغييرات تحفظ في قاعدة البيانات وتعمل تلقائيًا داخل القروب.", reply_markup=owner_autoreply_groups_markup(groups)); return
 
+    if data == "owner_ar_all":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        groups = await accessible_groups(context.bot, uid)
+        enabled_count = db.execute("SELECT COUNT(*) FROM auto_reply_settings WHERE enabled=1").fetchone()[0]
+        rows = [
+            [InlineKeyboardButton("➕ إضافة/تعميم رد على كل القروبات", callback_data="owner_ar_add_all")],
+            [InlineKeyboardButton("✏️ تعديل عبارة ورد في كل القروبات", callback_data="owner_ar_edit_all")],
+            [InlineKeyboardButton("🗑️ حذف عبارة من كل القروبات", callback_data="owner_ar_delete_all")],
+            [InlineKeyboardButton("🔄 تشغيل الردود في كل القروبات", callback_data="owner_ar_on_all"),
+             InlineKeyboardButton("⏸️ إيقاف الردود في كل القروبات", callback_data="owner_ar_off_all")],
+            [InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="owner_autoreplies")],
+        ]
+        await q.edit_message_text(
+            f"🌐 الإدارة الموحّدة للردود الآلية\n\n"
+            f"القروبات المسجلة المتاحة: {len(groups)}\n"
+            f"القروبات التي تظهر فيها الردود مفعّلة حاليًا (وفق قاعدة البيانات): {enabled_count}\n\n"
+            "أي إضافة أو تعديل هنا يُطبّق على جميع القروبات المسجلة دفعة واحدة، "
+            "ويُمنح المالك المفوّض الصلاحية نفسها لهذا القسم.",
+            reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data in ("owner_ar_add_all", "owner_ar_edit_all"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        context.user_data["owner_autoreply_state"] = {
+            "action": "add_all" if data == "owner_ar_add_all" else "edit_all",
+            "chat_id": None
+        }
+        await q.edit_message_text(
+            "أرسل العبارة والرد بهذا الشكل ليتم تعميمهما على جميع القروبات المسجلة:\n"
+            "العبارة | الرد الذي سيظهر في القروب\n\n"
+            "مثال: وين البوت؟ | أنا بوت حماية القروبات 🛡️\n"
+            "في وضع التعديل يجب أن تكون العبارة موجودة مسبقًا في قروب واحد على الأقل.\n"
+            "أرسل /cancel للإلغاء.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إلغاء", callback_data="owner_ar_all")]]))
+        return
+
+    if data == "owner_ar_delete_all":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        context.user_data["owner_autoreply_state"] = {"action": "delete_all", "chat_id": None}
+        await q.edit_message_text(
+            "أرسل العبارة المطابقة تمامًا لحذفها من جميع القروبات المسجلة.\n"
+            "أرسل /cancel للإلغاء.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إلغاء", callback_data="owner_ar_all")]]))
+        return
+
+    if data in ("owner_ar_on_all", "owner_ar_off_all"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        groups = db.execute("SELECT chat_id FROM watched_groups").fetchall()
+        enabled = 1 if data == "owner_ar_on_all" else 0
+        for (group_id,) in groups:
+            ensure_auto_replies(group_id)
+            db.execute("UPDATE auto_reply_settings SET enabled=? WHERE chat_id=?", (enabled, group_id))
+        db.commit()
+        await q.answer(f"تم {'تشغيل' if enabled else 'إيقاف'} الردود في {len(groups)} قروب.")
+        await q.edit_message_text(
+            f"✅ تم {'تشغيل' if enabled else 'إيقاف'} الردود الآلية في جميع القروبات المسجلة ({len(groups)}).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إدارة الردود الموحدة", callback_data="owner_ar_all")],
+                                               [InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="owner_autoreplies")]]))
+        return
+
     if data.startswith("owner_ar_group:"):
-        if not is_owner(uid): await q.answer("للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
         ensure_auto_replies(chat_id)
@@ -3148,7 +3213,7 @@ async def callback(update, context):
         await q.edit_message_text("\n".join(lines)[:3500], reply_markup=InlineKeyboardMarkup(buttons)); return
 
     if data.startswith(("owner_ar_add:", "owner_ar_edit:")):
-        if not is_owner(uid): await q.answer("للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
         action, raw_id = data.split(":",1)
         try: chat_id = int(raw_id)
         except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
@@ -3157,7 +3222,7 @@ async def callback(update, context):
         await q.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"owner_ar_group:{chat_id}")]])); return
 
     if data.startswith("owner_ar_delete:"):
-        if not is_owner(uid): await q.answer("للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
         rules = db.execute("SELECT trigger_text FROM auto_replies WHERE chat_id=? ORDER BY trigger_text", (chat_id,)).fetchall()
@@ -3167,7 +3232,7 @@ async def callback(update, context):
         await q.edit_message_text("اختر الرد الذي تريد حذفه:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("owner_ar_delone:"):
-        if not is_owner(uid): await q.answer("للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try:
             _, chat_raw, index_raw = data.split(":",2); chat_id=int(chat_raw); idx=int(index_raw)
             choices=context.user_data.get("owner_ar_delete_choices", {})
@@ -3186,7 +3251,7 @@ async def callback(update, context):
         await q.edit_message_text("\n".join(lines)[:3500], reply_markup=InlineKeyboardMarkup(buttons)); return
 
     if data.startswith(("owner_ar_on:", "owner_ar_off:")):
-        if not is_owner(uid): await q.answer("للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
         action, raw_id=data.split(":",1)
         try: chat_id=int(raw_id)
         except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
@@ -4506,6 +4571,7 @@ def owner_autoreply_groups_markup(groups):
     rows = [[InlineKeyboardButton(f"💬 {title or chat_id}", callback_data=f"owner_ar_group:{chat_id}")] for chat_id, title in groups[:50]]
     if not rows:
         rows = [[InlineKeyboardButton("لا توجد قروبات مسجلة بعد", callback_data="noop")]]
+    rows.insert(0, [InlineKeyboardButton("🌐 إدارة موحّدة — جميع القروبات دفعة واحدة", callback_data="owner_ar_all")])
     rows.append([InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
@@ -4521,13 +4587,13 @@ def owner_autoreply_group_markup(chat_id):
     return rows, buttons
 
 async def owner_autoreply_text_handler(update, context):
-    """Receives the owner's next private message during add/edit workflow."""
+    """Receives the primary/delegated owner's next private message during reply management."""
     if not update.effective_user or not update.effective_message or update.effective_chat.type != ChatType.PRIVATE:
         return
     state = context.user_data.get("owner_autoreply_state")
     if not state:
         return
-    if not is_owner(update.effective_user.id):
+    if not (is_owner(update.effective_user.id) or is_delegated_owner(update.effective_user.id)):
         context.user_data.pop("owner_autoreply_state", None)
         return
     raw = (update.effective_message.text or "").strip()
@@ -4538,8 +4604,58 @@ async def owner_autoreply_text_handler(update, context):
         context.user_data.pop("owner_autoreply_state", None)
         await update.effective_message.reply_text("تم إلغاء العملية.")
         return
-    chat_id = int(state["chat_id"])
     action = state["action"]
+    if action in ("add_all", "edit_all", "delete_all"):
+        groups = [r[0] for r in db.execute("SELECT chat_id FROM watched_groups ORDER BY title").fetchall()]
+        if not groups:
+            context.user_data.pop("owner_autoreply_state", None)
+            await update.effective_message.reply_text("لا توجد قروبات مسجلة لتطبيق التغيير عليها.")
+            return
+        if action == "delete_all":
+            trigger = raw.strip()
+            if not trigger or len(trigger) > 100:
+                await update.effective_message.reply_text("أرسل عبارة صحيحة لا تتجاوز 100 حرف.")
+                return
+            deleted = 0
+            for group_id in groups:
+                cur = db.execute("DELETE FROM auto_replies WHERE chat_id=? AND trigger_text=?", (group_id, trigger))
+                deleted += cur.rowcount
+                if cur.rowcount:
+                    log_action(group_id, update.effective_user.id, "auto_reply_deleted", trigger)
+            db.commit()
+            context.user_data.pop("owner_autoreply_state", None)
+            await update.effective_message.reply_text(f"🗑️ اكتمل الحذف من جميع القروبات المسجلة. عدد السجلات المحذوفة: {deleted}.")
+            return
+        if "|" not in raw:
+            await update.effective_message.reply_text("أرسل العبارة والرد بهذا الشكل:\nالعبارة | الرد")
+            return
+        trigger, reply = (x.strip() for x in raw.split("|", 1))
+        if not trigger or not reply or len(trigger) > 100 or len(reply) > 1000:
+            await update.effective_message.reply_text("تأكد من كتابة العبارة والرد، بحد أقصى 100 حرف للعبارة و1000 للرد.")
+            return
+        if action == "edit_all":
+            found = any(db.execute("SELECT 1 FROM auto_replies WHERE chat_id=? AND trigger_text=?", (group_id, trigger)).fetchone() for group_id in groups)
+            if not found:
+                context.user_data.pop("owner_autoreply_state", None)
+                await update.effective_message.reply_text("لم أجد العبارة في أي قروب. استخدم الإضافة للتعميم أو أعد المحاولة بعبارة موجودة.")
+                return
+        for group_id in groups:
+            ensure_auto_replies(group_id)
+            db.execute(
+                "INSERT INTO auto_replies(chat_id,trigger_text,reply_text,enabled) VALUES(?,?,?,1) "
+                "ON CONFLICT(chat_id,trigger_text) DO UPDATE SET reply_text=excluded.reply_text,enabled=1",
+                (group_id, trigger, reply))
+            db.execute("UPDATE auto_reply_settings SET enabled=1 WHERE chat_id=?", (group_id,))
+            log_action(group_id, update.effective_user.id, "auto_reply_added" if action == "add_all" else "auto_reply_edited", trigger)
+        db.commit()
+        context.user_data.pop("owner_autoreply_state", None)
+        await update.effective_message.reply_text(
+            f"✅ تم {'تعميم' if action == 'add_all' else 'تعديل وتعميم'} الرد على جميع القروبات المسجلة ({len(groups)}).\n\n"
+            f"🗣️ العبارة: {trigger}\n💬 الرد: {reply}\n\n"
+            "ملاحظة: تم حفظ الإعدادات في قاعدة البيانات؛ يجب أن تكون القروبات مسجلة في البوت.")
+        return
+
+    chat_id = int(state["chat_id"])
     if action in ("add", "edit"):
         if " | " not in raw and "|" not in raw:
             await update.effective_message.reply_text("أرسل العبارة والرد بهذا الشكل:\nالعبارة | الرد الذي سيظهر في القروب")
