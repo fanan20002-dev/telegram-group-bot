@@ -616,6 +616,19 @@ def set_setting(chat_id, field, value):
     db.execute(f'UPDATE settings SET "{field}"=? WHERE chat_id=?', (int(bool(value)), chat_id))
     db.commit()
 
+def group_games_enabled(chat_id):
+    """Return whether interactive games are enabled in both protection and game settings."""
+    try:
+        protection = get_settings(chat_id)
+        if protection.get("games", 0):
+            return False
+        cfg = db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
+        return not cfg or bool(cfg[0])
+    except Exception as exc:
+        log.warning("تعذر قراءة حالة الألعاب للقروب %s: %s", chat_id, exc)
+        return False
+
+
 def log_action(chat_id, user_id, action, details=""):
     try:
         db.execute(
@@ -3262,8 +3275,8 @@ async def callback(update, context):
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         db.commit()
         cfg = db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if not cfg or not cfg[0]:
-            await q.edit_message_text("🎮 الألعاب متوقفة حاليًا في هذا القروب.")
+        if not group_games_enabled(chat_id):
+            await q.edit_message_text("🎮 الألعاب متوقفة حاليًا في هذا القروب من إعدادات الحماية أو لوحة الألعاب.")
             return
         rows = []
         base_buttons = [InlineKeyboardButton(label, callback_data=f"{callback}:{chat_id}") for label, callback in MEMBER_GAMES]
@@ -3590,7 +3603,7 @@ async def callback(update, context):
             await q.answer("اللعبة أو القروب غير متاح.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
-        if (cfg and not cfg[0]) or (flag and not flag[0]):
+        if not group_games_enabled(chat_id) or (flag and not flag[0]):
             await q.answer("هذه الألعاب متوقفة حاليًا من لوحة الإدارة.",show_alert=True); return
         uid_player=q.from_user.id; display=q.from_user.full_name or "عضو"; epoch=int(time.time())
         row=db.execute("SELECT progress,coins,last_claim_epoch FROM persistent_game_state WHERE chat_id=? AND user_id=? AND game_key=?",(chat_id,uid_player,game_key)).fetchone()
@@ -3651,7 +3664,7 @@ async def callback(update, context):
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         rows = [[InlineKeyboardButton(title, callback_data=f"game_quiz_cat:{chat_id}:{key}")]
                 for key,(title,_questions) in QUIZ_CATEGORIES.items()]
         rows.append([InlineKeyboardButton("🎯 مسابقة متنوعة من 5 مراحل", callback_data=f"game_quiz_cat:{chat_id}:mixed")])
@@ -3663,8 +3676,7 @@ async def callback(update, context):
         except ValueError: await q.answer("بيانات المسابقة غير صحيحة.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
-        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         if category == "mixed": category=random.choice(list(QUIZ_CATEGORIES.keys()))
         if category not in QUIZ_CATEGORIES: await q.answer("هذا المجال غير متاح.", show_alert=True); return
         await q.answer("بدأت المسابقة!")
@@ -3705,7 +3717,7 @@ async def callback(update, context):
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("أوقف الإشراف الألعاب في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         if category not in QUIZ_CATEGORIES or stage < 2 or stage > 5:
             await q.answer("المرحلة غير متاحة.", show_alert=True); return
         await q.answer(f"المرحلة {stage} بدأت")
@@ -3732,7 +3744,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         target, hint = random.choice(WORD_BANK)
         distractors = [word for word, _hint in WORD_BANK if word != target]
         options = random.sample(distractors, min(3, len(distractors))) + [target]
@@ -3759,7 +3771,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         import random
         bot_choice=random.choice(["حجر","ورقة","مقص"])
         context.user_data[f"rps:{chat_id}"]=bot_choice
@@ -3790,7 +3802,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and (not cfg[0] or not cfg[1]): await q.answer("تحدي الخاسر غير مفعّل.", show_alert=True); return
+        if not group_games_enabled(chat_id) or (cfg and (not cfg[0] or not cfg[1])): await q.answer("تحدي الخاسر أو الألعاب غير مفعّلة في هذا القروب.", show_alert=True); return
         import random
         tasks=["اكتب في القروب: أنا بطل التحديات 😎", "أرسل ثلاثة إيموجيات تعبّر عن مزاجك 🎭", "امدح عضوًا في القروب بكلمة لطيفة 🌟", "اكتب حقيقة ممتعة عن نفسك (اختياري) 🧠"]
         task=random.choice(tasks)
@@ -3852,7 +3864,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         answer, _hint = random.choice(WORD_BANK)
         scrambled = "".join(random.sample(list(answer), len(answer)))
@@ -3869,7 +3881,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,created_at) VALUES(?,?,?,?,?)",(token,chat_id,"speed","الرياض",now())); db.commit()
         buttons=[[InlineKeyboardButton("جدة", callback_data=f"game_round_answer:{token}:جدة"), InlineKeyboardButton("الرياض", callback_data=f"game_round_answer:{token}:الرياض")], [InlineKeyboardButton("أبها", callback_data=f"game_round_answer:{token}:أبها"), InlineKeyboardButton("تبوك", callback_data=f"game_round_answer:{token}:تبوك")]]
@@ -3897,8 +3909,7 @@ async def callback(update, context):
         try: chat_id=int(data.split(":",1)[1])
         except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
-        cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.",show_alert=True); return
         day=datetime.now(timezone.utc).date().isoformat()
         existing=db.execute("SELECT completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
         if existing:
@@ -3934,7 +3945,7 @@ async def callback(update, context):
         except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.",show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        if not group_games_enabled(chat_id): await q.answer("الألعاب مقفلة في هذا القروب من إعدادات الحماية أو لوحة الألعاب.",show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_xo(token,chat_id,player_x,board,turn,status,created_at) VALUES(?,?,?,'         ','X','waiting',?)",(token,chat_id,uid,now())); db.commit()
         try:
@@ -4030,7 +4041,7 @@ async def callback(update, context):
         current = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
         text = current[0] if current and current[0] else "غير مفعّل؛ لم تُحدّد رسالة ترحيب."
         await q.edit_message_text(
-            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {name} لاسم العضو.",
+            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {{name}} لاسم العضو و {{group}} لاسم القروب.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✏️ تعيين رسالة جديدة", callback_data=f"welcome_set:{chat_id}")],
                 [InlineKeyboardButton("🗑️ إيقاف الترحيب", callback_data=f"welcome_off:{chat_id}")],
