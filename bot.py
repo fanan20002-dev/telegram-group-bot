@@ -73,30 +73,6 @@ db.execute("""CREATE TABLE IF NOT EXISTS general_inquiries(
     replied_at TEXT DEFAULT '',
     reply_text TEXT DEFAULT ''
 )""")
-# Private staff inquiries and owner-to-staff notices. Additive migration; existing data is preserved.
-db.execute("""CREATE TABLE IF NOT EXISTS staff_inquiries(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    username TEXT DEFAULT '',
-    display_name TEXT DEFAULT '',
-    role_label TEXT DEFAULT '',
-    chat_id INTEGER DEFAULT NULL,
-    inquiry_text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'new',
-    created_at TEXT NOT NULL,
-    reply_text TEXT DEFAULT '',
-    replied_at TEXT DEFAULT ''
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS staff_notifications(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    read_at TEXT DEFAULT ''
-)""")
-db.commit()
-
 # Registered broadcast channels. The bot must be an administrator with posting rights.
 db.execute("""CREATE TABLE IF NOT EXISTS linked_channels(
     chat_id INTEGER PRIMARY KEY,
@@ -105,6 +81,50 @@ db.execute("""CREATE TABLE IF NOT EXISTS linked_channels(
     linked_by INTEGER NOT NULL,
     linked_at TEXT NOT NULL
 )""")
+db.commit()
+
+# Additive staff management system. Existing tables and data are retained.
+db.executescript("""
+CREATE TABLE IF NOT EXISTS staff_tasks(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL DEFAULT 0,
+ assigned_to INTEGER NOT NULL, assigned_by INTEGER NOT NULL, title TEXT NOT NULL,
+ details TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'open', due_at TEXT DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staff_shifts(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL DEFAULT 0,
+ user_id INTEGER NOT NULL, assigned_by INTEGER NOT NULL, starts_at TEXT NOT NULL,
+ ends_at TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'scheduled', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staff_appeals(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+ moderation_log_id INTEGER DEFAULT 0, appeal_text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new',
+ reviewer_id INTEGER DEFAULT 0, review_note TEXT DEFAULT '', created_at TEXT NOT NULL, reviewed_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS staff_badges(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, badge TEXT NOT NULL,
+ awarded_by INTEGER NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staff_inquiries(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL DEFAULT 0,
+ body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staff_permissions(
+ chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, permission TEXT NOT NULL,
+ granted_by INTEGER NOT NULL, granted_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id,permission)
+);
+CREATE INDEX IF NOT EXISTS idx_staff_tasks_user ON staff_tasks(assigned_to,status);
+CREATE INDEX IF NOT EXISTS idx_staff_shifts_user ON staff_shifts(user_id,status);
+CREATE INDEX IF NOT EXISTS idx_staff_appeals_status ON staff_appeals(status);
+
+""")
+db.commit()
+
+# Cursor for owner-facing audit notifications. Additive; does not alter existing log data.
+db.execute("""CREATE TABLE IF NOT EXISTS owner_activity_cursor(
+    id INTEGER PRIMARY KEY CHECK(id=1), last_log_id INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("INSERT OR IGNORE INTO owner_activity_cursor(id,last_log_id) VALUES(1,0)")
 db.commit()
 
 # Additional personal-assistant features; additive schema only.
@@ -400,6 +420,22 @@ DEFAULT_AUTO_REPLIES = [
 _auto_reply_last = {}
 _AUTO_REPLY_COOLDOWN_SECONDS = 30
 
+def split_mentions_for_telegram(mentions, header="#all\n", max_chars=3900):
+    """Split HTML mention strings into Telegram-safe messages without splitting a mention."""
+    chunks = []
+    current = header
+    for mention in mentions:
+        addition = mention if current == header else " ، " + mention
+        if len(current) + len(addition) > max_chars and current != header:
+            chunks.append(current)
+            current = "#all (تابع)\n" + mention
+        else:
+            current += addition
+    if current.strip() and current not in ("#all\n", "#all (تابع)\n"):
+        chunks.append(current)
+    return chunks
+
+
 def normalize_auto_reply(text):
     text = (text or "").strip().lower()
     text = re.sub(r"[\u064b-\u065f\u0670ـ]", "", text)
@@ -489,9 +525,7 @@ def record_game_points(chat_id, user_id, points, event_type):
         db.commit()
 
 def game_board_markup(token, board):
-    """لوحة إكس أو واضحة: ترقيم الخانات الفارغة حتى لا تبدو الأزرار مربعات بلا معنى."""
-    empty_labels = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣")
-    cells = ["❌" if c == "X" else "⭕" if c == "O" else empty_labels[i] for i, c in enumerate(board)]
+    cells = ["❌" if c == "X" else "⭕" if c == "O" else "▫️" for c in board]
     rows = []
     for start in (0, 3, 6):
         rows.append([InlineKeyboardButton(cells[i], callback_data=f"xo_move:{token}:{i}") for i in range(start, start+3)])
@@ -921,6 +955,7 @@ def panel_markup(uid):
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
             [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
+            [InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
             [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         ])
     owner_rows = [
@@ -933,8 +968,8 @@ def panel_markup(uid):
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
-        [InlineKeyboardButton("📨 استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox")],
-        [InlineKeyboardButton("📣 تعليمات وإشعارات الطاقم", callback_data="staff_notify_start")],
+        [InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center")],
+        [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
         [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
@@ -1137,12 +1172,63 @@ async def process_private_workflows(update, context):
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
     # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
-    if (context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
+    if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
         or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
         or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id")
-        or context.user_data.get("awaiting_admin_action") or context.user_data.get("awaiting_staff_inquiry") or context.user_data.get("staff_inquiry_reply_id") or context.user_data.get("awaiting_staff_notice") or context.user_data.get("awaiting_staff_note")):
+        or context.user_data.get("awaiting_admin_action")):
         context.user_data["_skip_assistant_private_message_id"] = msg.message_id
     # Primary-owner inquiry replies are deliberately not delegated.
+    staff_task_state = context.user_data.get("staff_task_state")
+    if staff_task_state:
+        context.user_data.pop("staff_task_state", None)
+        if raw.strip().lower() == "/cancel":
+            await msg.reply_text("تم إلغاء إنشاء المهمة."); return
+        parts = [x.strip() for x in raw.split("|", 2)]
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1]:
+            await msg.reply_text("الصيغة: رقم_المشرف | عنوان المهمة | التفاصيل (اختياري)\nمثال: 123456789 | متابعة القروب | الرد على الاستفسارات")
+            context.user_data["staff_task_state"] = True; return
+        target_id = int(parts[0]); title = parts[1][:120]; details = parts[2][:1000] if len(parts)>2 else ""
+        cur = db.execute("INSERT INTO staff_tasks(chat_id,assigned_to,assigned_by,title,details,status,due_at,created_at,updated_at) VALUES(0,?,?,?,?, 'open','',?,?)", (target_id, user.id, title, details, now(), now()))
+        db.commit(); task_id = cur.lastrowid
+        log_action(0, user.id, "staff_task_assigned", f"task={task_id}; target={target_id}; title={title}")
+        try: await context.bot.send_message(target_id, f"📋 تكليف جديد #{task_id}\n{title}\n{details}\n\nلإنهائه استخدم /staffdone {task_id}")
+        except Exception: pass
+        await msg.reply_text(f"✅ تم تسجيل المهمة #{task_id} وإسنادها إلى {target_id}."); return
+    staff_shift_state = context.user_data.get("staff_shift_state")
+    if staff_shift_state:
+        context.user_data.pop("staff_shift_state", None)
+        if raw.strip().lower() == "/cancel": await msg.reply_text("تم إلغاء المناوبة."); return
+        parts = [x.strip() for x in raw.split("|", 2)]
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1]:
+            await msg.reply_text("الصيغة: رقم_المشرف | موعد بداية المناوبة | نهاية المناوبة (اختياري)")
+            context.user_data["staff_shift_state"] = True; return
+        target_id=int(parts[0]); starts=parts[1][:80]; ends=parts[2][:80] if len(parts)>2 else ""
+        db.execute("INSERT INTO staff_shifts(chat_id,user_id,assigned_by,starts_at,ends_at,status,created_at) VALUES(0,?,?,?,?,'scheduled',?)",(target_id,user.id,starts,ends,now())); db.commit(); log_action(0,user.id,"staff_shift_assigned",f"target={target_id}; starts={starts}; ends={ends}")
+        try: await context.bot.send_message(target_id, f"🗓️ تم تعيين مناوبة لك\nالبداية: {starts}\nالنهاية: {ends or 'غير محددة'}")
+        except Exception: pass
+        await msg.reply_text("✅ تم تسجيل المناوبة."); return
+    staff_badge_state = context.user_data.get("staff_badge_state")
+    if staff_badge_state:
+        context.user_data.pop("staff_badge_state", None)
+        if not (is_owner(user.id) or is_delegated_owner(user.id)):
+            await msg.reply_text("هذه الوظيفة للمالك والمفوّض فقط."); return
+        if raw.strip().lower() == "/cancel": await msg.reply_text("تم إلغاء منح الوسام."); return
+        parts=[x.strip() for x in raw.split("|",2)]
+        if len(parts)<2 or not parts[0].isdigit() or not parts[1]:
+            await msg.reply_text("الصيغة: رقم_المشرف | اسم الوسام | السبب (اختياري)")
+            context.user_data["staff_badge_state"]=True; return
+        target=int(parts[0]); badge=parts[1][:80]; reason=parts[2][:300] if len(parts)>2 else ""
+        db.execute("INSERT INTO staff_badges(user_id,badge,awarded_by,reason,created_at) VALUES(?,?,?,?,?)",(target,badge,user.id,reason,now())); db.commit(); log_action(0,user.id,"staff_badge_awarded",f"target={target}; badge={badge}; reason={reason}")
+        try: await context.bot.send_message(target,f"🏅 حصلت على وسام: {badge}\nالسبب: {reason or 'تقدير لجهودك'}")
+        except Exception: pass
+        await msg.reply_text("✅ تم تسجيل الوسام وإرسال إشعار للمشرف إن أمكن."); return
+    staff_inquiry_state = context.user_data.get("staff_inquiry_state")
+    if staff_inquiry_state:
+        context.user_data.pop("staff_inquiry_state", None)
+        if raw.strip().lower() == "/cancel": await msg.reply_text("تم إلغاء الاستفسار."); return
+        cur=db.execute("INSERT INTO staff_inquiries(user_id,chat_id,body,status,created_at) VALUES(?,0,?,'new',?)",(user.id,raw[:3000],now())); db.commit(); iid=cur.lastrowid
+        await notify_owners(context, f"📨 استفسار طاقم جديد #{iid}\nمن: {user.full_name} ({user.id})\n\n{raw[:2500]}", "membership")
+        await msg.reply_text("✅ وصل استفسارك إلى المالك الأساسي."); return
     reply_state = context.user_data.get("inquiry_reply_id")
     if reply_state:
         if not is_owner(user.id):
@@ -1178,73 +1264,6 @@ async def process_private_workflows(update, context):
                 log.warning("could not notify primary owner of inquiry: %s", exc)
                 await msg.reply_text("تم حفظ الطلب، لكن تعذر تنبيه المالك الآن. تأكد أن المالك بدأ محادثة مع البوت باستخدام /start.")
         return
-    if context.user_data.get("awaiting_staff_calculation"):
-        raw=(msg.text or '').strip()
-        if raw=="/cancel": context.user_data.pop("awaiting_staff_calculation",None); await msg.reply_text("تم إلغاء الحاسبة."); return
-        import ast as _ast, operator as _op
-        ops={_ast.Add:_op.add,_ast.Sub:_op.sub,_ast.Mult:_op.mul,_ast.Div:_op.truediv,_ast.Pow:_op.pow,_ast.USub:_op.neg,_ast.UAdd:_op.pos,_ast.Mod:_op.mod}
-        def _calc(node):
-            if isinstance(node,_ast.Expression): return _calc(node.body)
-            if isinstance(node,_ast.Constant) and isinstance(node.value,(int,float)): return node.value
-            if isinstance(node,_ast.BinOp) and type(node.op) in ops: return ops[type(node.op)](_calc(node.left),_calc(node.right))
-            if isinstance(node,_ast.UnaryOp) and type(node.op) in ops: return ops[type(node.op)](_calc(node.operand))
-            raise ValueError("invalid")
-        try:
-            tree=_ast.parse(raw,mode='eval'); result=_calc(tree)
-            if abs(result)>1e15: raise ValueError("range")
-            await msg.reply_text(f"🧮 النتيجة: {result}")
-        except Exception: await msg.reply_text("تعذر الحساب. استخدم أرقامًا وعمليات + - * / % وأقواسًا فقط.")
-        context.user_data.pop("awaiting_staff_calculation",None); return
-
-    # Private staff inquiry submission: only registered managers/delegates/group-scoped staff.
-    if context.user_data.get("awaiting_staff_inquiry"):
-        raw=(msg.text or "").strip()
-        if raw == "/cancel":
-            context.user_data.pop("awaiting_staff_inquiry",None); await msg.reply_text("تم إلغاء الاستفسار."); return
-        if not raw or raw.startswith("/") or len(raw)>3000:
-            await msg.reply_text("أرسل استفسارًا نصيًا لا يتجاوز 3000 حرف، أو /cancel للإلغاء."); return
-        role=role_name(user.id)
-        cur=db.execute("INSERT INTO staff_inquiries(user_id,username,display_name,role_label,chat_id,inquiry_text,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                       (user.id,user.username or '',user.full_name or '',role,None,raw,'new',now()))
-        iid=cur.lastrowid; db.commit(); context.user_data.pop("awaiting_staff_inquiry",None)
-        await msg.reply_text(f"✅ تم إرسال استفسارك الخاص للمالك برقم #{iid}. ستصلك الإجابة هنا.")
-        if OWNER_ID:
-            try:
-                await context.bot.send_message(OWNER_ID,f"🗂️ استفسار طاقم جديد #{iid}\nالاسم: {user.full_name}\nالدور: {role}\nالمعرّف: {user.id}\n\n{raw}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"staff_inquiry_reply:{iid}"),InlineKeyboardButton("🔎 عرض الطلب",callback_data=f"staff_inquiry_view:{iid}")]]))
-            except Exception as exc: log.warning("staff inquiry owner notification failed: %s",exc)
-        return
-    # Owner replies to staff inquiry, routed only to its author.
-    if context.user_data.get("staff_inquiry_reply_id"):
-        if not is_owner(user.id): context.user_data.pop("staff_inquiry_reply_id",None); return
-        reply=(msg.text or '').strip(); iid=int(context.user_data["staff_inquiry_reply_id"])
-        if not reply or reply.startswith("/"):
-            await msg.reply_text("أرسل نص الرد أو /cancel للإلغاء."); return
-        row=db.execute("SELECT user_id FROM staff_inquiries WHERE id=?",(iid,)).fetchone()
-        if not row: context.user_data.pop("staff_inquiry_reply_id",None); await msg.reply_text("الطلب غير موجود."); return
-        try:
-            await context.bot.send_message(row[0],f"📨 رد المالك على استفسارك #{iid}:\n\n{reply}")
-            db.execute("UPDATE staff_inquiries SET status='answered',reply_text=?,replied_at=? WHERE id=?",(reply,now(),iid)); db.commit()
-            await msg.reply_text(f"✅ وصل الرد لصاحب الاستفسار #{iid}.")
-        except Exception: await msg.reply_text("تعذر إرسال الرد؛ يجب أن يكون صاحب الاستفسار قد بدأ محادثة مع البوت.")
-        context.user_data.pop("staff_inquiry_reply_id",None); return
-    if context.user_data.get("awaiting_staff_notice") and is_owner(user.id):
-        raw=(msg.text or '').strip()
-        if raw=="/cancel": context.user_data.pop("awaiting_staff_notice",None); await msg.reply_text("تم الإلغاء."); return
-        if "|" not in raw: await msg.reply_text("أرسل: رقم_المستخدم | عنوان | نص الرسالة"); return
-        parts=[p.strip() for p in raw.split("|",2)]
-        if len(parts)!=3 or not parts[0].isdigit() or not parts[1] or not parts[2]: await msg.reply_text("الصيغة: رقم_المستخدم | عنوان | نص الرسالة"); return
-        target=int(parts[0]); db.execute("INSERT INTO staff_notifications(user_id,title,body,created_at) VALUES(?,?,?,?)",(target,parts[1],parts[2],now())); db.commit()
-        context.user_data.pop("awaiting_staff_notice",None)
-        try: await context.bot.send_message(target,f"🔔 {parts[1]}\n\n{parts[2]}") ; delivered=True
-        except Exception: delivered=False
-        await msg.reply_text("✅ حُفظت الرسالة ووصل الإشعار." if delivered else "⚠️ حُفظت الرسالة، لكن تعذر إرسال الإشعار. على المستلم بدء محادثة مع البوت أولًا."); return
-    if context.user_data.get("awaiting_staff_note"):
-        raw=(msg.text or '').strip()
-        if raw=="/cancel": context.user_data.pop("awaiting_staff_note",None); await msg.reply_text("تم الإلغاء."); return
-        db.execute("INSERT INTO assistant_notes(user_id,note_text,created_at) VALUES(?,?,?)",(user.id,raw,now())); db.commit()
-        context.user_data.pop("awaiting_staff_note",None); await msg.reply_text("📝 تم حفظ المذكرة في حسابك الخاص."); return
-
     if context.user_data.get("awaiting_channel_broadcast") and is_owner(user.id):
         context.user_data["channel_broadcast_draft"] = {"chat_id": update.effective_chat.id, "message_id": msg.message_id}
         context.user_data["awaiting_channel_broadcast"] = False
@@ -1766,6 +1785,21 @@ async def start(update, context):
         )
 
 
+async def staffdone_cmd(update, context):
+    if not update.effective_user:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("استخدم /staffdone رقم_المهمة")
+        return
+    task_id=int(context.args[0])
+    row=db.execute("SELECT assigned_to FROM staff_tasks WHERE id=?",(task_id,)).fetchone()
+    if not row:
+        await update.effective_message.reply_text("المهمة غير موجودة."); return
+    if row[0] != update.effective_user.id and not (is_owner(update.effective_user.id) or is_delegated_owner(update.effective_user.id)):
+        await update.effective_message.reply_text("هذه المهمة ليست مسندة إليك."); return
+    db.execute("UPDATE staff_tasks SET status='done',updated_at=? WHERE id=?",(now(),task_id)); db.commit()
+    await update.effective_message.reply_text(f"✅ تم تسجيل إكمال المهمة #{task_id}.")
+
 async def games_cmd(update, context):
     """فتح ألعاب ومراجعات القروب مباشرة بأمر /games."""
     chat = update.effective_chat
@@ -1863,20 +1897,6 @@ async def panel(update, context):
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         register_group(chat)
     is_primary_owner = is_owner(uid)
-    if not is_owner(uid) and not is_delegated_owner(uid):
-        # Staff see a compact personal dashboard; action-level callbacks still enforce scoped permissions.
-        await update.effective_message.reply_text(
-            f"🧭 لوحة المشرف الشخصية\n\nالصلاحية: {role_name(uid)}\n"
-            "تظهر لك أدوات الإدارة المسموحة فقط. ملاحظاتك وخدماتك خاصة بحسابك.\n"
-            "استخدم صندوق الاستفسارات للتواصل بسرية مع المالك، وزر الإشعارات لمراجعة التعليمات.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛡️ حماية القروبات", callback_data="security_groups"), InlineKeyboardButton("🎮 الألعاب", callback_data="games")],
-                [InlineKeyboardButton("🧮 الحاسبة", callback_data="staff_calculator"), InlineKeyboardButton("📝 مذكرتي", callback_data="staff_note_start")],
-                [InlineKeyboardButton("📨 استفسار خاص للمالك", callback_data="staff_inquiry_start"), InlineKeyboardButton("🔔 إشعاراتي", callback_data="staff_notifications")],
-                [InlineKeyboardButton("⬅️ الخدمات الشخصية", callback_data="assistant_privacy")]
-            ])
-        )
-        return
     panel_intro = (
         "👑 لوحة التحكم الرئيسية\n\n"
         f"الصلاحية: {role_name(uid)}\n\n"
@@ -2908,56 +2928,130 @@ async def verification_timeout(bot, chat_id, user_id):
 
 
 async def new_members(update, context):
-    msg = update.message
-    if not msg or not msg.new_chat_members:
+    """Record new members and send welcome independently of owner notifications.
+
+    A failure to DM the owner must never prevent the group welcome from being sent.
+    If no custom welcome is configured, send a safe default so the welcome feature
+    does not appear to do nothing after selecting a group in the panel.
+    """
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or not msg.new_chat_members:
         return
-    register_group(update.effective_chat)
-    s = get_settings(update.effective_chat.id)
-    welcome_row = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
+
+    try:
+        register_group(chat)
+        settings = get_settings(chat.id)
+    except Exception:
+        log.exception("WELCOME_SETUP_FAILED chat_id=%s", getattr(chat, "id", None))
+        settings = {"entry": 0, "verify_new_members": 0}
+
+    try:
+        welcome_row = db.execute(
+            "SELECT message FROM welcome_messages WHERE chat_id=?", (chat.id,)
+        ).fetchone()
+        configured_welcome = welcome_row[0].strip() if welcome_row and welcome_row[0] else ""
+    except Exception:
+        log.exception("WELCOME_CONFIG_READ_FAILED chat_id=%s", chat.id)
+        configured_welcome = ""
+
+    group_title = chat.title or "القروب"
     for member in msg.new_chat_members:
-        if not member.is_bot:
+        if member.is_bot:
+            continue
+
+        display_name = member.full_name or "عضو"
+        try:
             db.execute(
                 "INSERT INTO member_activity(chat_id,user_id,display_name,message_count,stars,custom_title,username) "
                 "VALUES(?,?,?,0,0,'',?) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
                 "display_name=excluded.display_name, username=excluded.username",
-                (update.effective_chat.id, member.id, member.full_name or "عضو", member.username or "")
+                (chat.id, member.id, display_name, member.username or "")
             )
             db.commit()
-            await notify_owners(context, f"👋 دخول عضو جديد\nالمجموعة: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
-            if welcome_row and welcome_row[0]:
-                welcome_text = welcome_row[0].replace("{name}", member.full_name).replace("{group}", update.effective_chat.title or "القروب")
+        except Exception:
+            log.exception("MEMBER_ACTIVITY_SAVE_FAILED chat_id=%s member_id=%s", chat.id, member.id)
+
+        # Send the welcome first: unrelated owner-DM issues must not block it.
+        if configured_welcome:
+            welcome_text = configured_welcome.replace("{name}", display_name).replace("{group}", group_title)
+            try:
+                await context.bot.send_message(chat_id=chat.id, text=welcome_text[:4000])
+                log.info("WELCOME_SENT chat_id=%s member_id=%s custom=1", chat.id, member.id)
+            except Exception as exc:
+                log.warning(
+                    "WELCOME_SEND_FAILED chat_id=%s member_id=%s bot_must_be_able_to_send_messages error=%r",
+                    chat.id, member.id, exc
+                )
                 try:
-                    await context.bot.send_message(update.effective_chat.id, welcome_text)
-                except Exception as e:
-                    log.warning("Welcome message failed for %s: %s", update.effective_chat.id, e)
-            if s.get("verify_new_members", 0):
+                    await notify_owners(
+                        context,
+                        f"⚠️ تعذر إرسال الترحيب\nالقروب: {group_title} ({chat.id})\n"
+                        f"العضو: {display_name} (ID: {member.id})\n"
+                        "تحقق من أن البوت لم يُحظر وأن لديه صلاحية إرسال الرسائل.",
+                        "security"
+                    )
+                except Exception:
+                    log.exception("WELCOME_FAILURE_OWNER_ALERT_FAILED chat_id=%s", chat.id)
+        else:
+            log.info("WELCOME_NOT_CONFIGURED chat_id=%s member_id=%s", chat.id, member.id)
+
+        try:
+            await notify_owners(
+                context,
+                f"👋 دخول عضو جديد\nالمجموعة: {group_title}\nالعضو: {display_name}\nالمعرّف: {member.id}",
+                "membership"
+            )
+        except Exception:
+            log.exception("NEW_MEMBER_OWNER_ALERT_FAILED chat_id=%s member_id=%s", chat.id, member.id)
+
+        if settings.get("verify_new_members", 0):
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat.id, user_id=member.id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False, can_send_audios=False,
+                        can_send_documents=False, can_send_photos=False,
+                        can_send_videos=False, can_send_video_notes=False,
+                        can_send_voice_notes=False, can_send_polls=False,
+                        can_send_other_messages=False, can_add_web_page_previews=False
+                    )
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO pending_verifications(chat_id,user_id,created_at) VALUES(?,?,?)",
+                    (chat.id, member.id, now())
+                )
+                db.commit()
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"👤 أهلًا {display_name}! أكمل التحقق خلال دقيقتين للمشاركة في القروب.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ أنا إنسان — تحقق", callback_data=f"verify_member:{chat.id}:{member.id}")
+                    ]])
+                )
+                context.application.create_task(verification_timeout(context.bot, chat.id, member.id))
+            except Exception as exc:
                 try:
-                    await context.bot.restrict_chat_member(
-                        chat_id=update.effective_chat.id, user_id=member.id,
-                        permissions=ChatPermissions(can_send_messages=False, can_send_audios=False,
-                            can_send_documents=False, can_send_photos=False, can_send_videos=False,
-                            can_send_video_notes=False, can_send_voice_notes=False, can_send_polls=False,
-                            can_send_other_messages=False, can_add_web_page_previews=False)
-                    )
-                    db.execute("INSERT OR REPLACE INTO pending_verifications(chat_id,user_id,created_at) VALUES(?,?,?)",
-                               (update.effective_chat.id, member.id, now()))
+                    db.execute("DELETE FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat.id, member.id))
                     db.commit()
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=f"👤 أهلًا {member.full_name}! أكمل التحقق خلال دقيقتين للمشاركة في القروب.",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ أنا إنسان — تحقق", callback_data=f"verify_member:{update.effective_chat.id}:{member.id}")]])
+                except Exception:
+                    log.exception("VERIFY_STATE_CLEANUP_FAILED chat_id=%s member_id=%s", chat.id, member.id)
+                log.warning("تعذر بدء التحقق للعضو %s في %s: %s", member.id, chat.id, exc)
+                try:
+                    await notify_owners(
+                        context,
+                        f"⚠️ تعذر بدء التحقق من عضو جديد\nالقروب: {group_title} ({chat.id})\n"
+                        f"العضو: {display_name} (ID: {member.id})\nتحقق من صلاحيات البوت كمشرف.",
+                        "security"
                     )
-                    context.application.create_task(verification_timeout(context.bot, update.effective_chat.id, member.id))
-                except Exception as exc:
-                    db.execute("DELETE FROM pending_verifications WHERE chat_id=? AND user_id=?", (update.effective_chat.id, member.id))
-                    db.commit()
-                    log.warning("تعذر بدء التحقق للعضو %s في %s: %s", member.id, update.effective_chat.id, exc)
-                    await notify_owners(context, f"⚠️ تعذر بدء التحقق من عضو جديد\nالقروب: {update.effective_chat.title or update.effective_chat.id}\nالعضو: {member.full_name} (ID: {member.id})\nتحقق من صلاحيات البوت كمشرف.", "security")
-    if s["entry"]:
+                except Exception:
+                    log.exception("VERIFY_FAILURE_OWNER_ALERT_FAILED chat_id=%s", chat.id)
+
+    if settings.get("entry", 0):
         try:
             await msg.delete()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.info("ENTRY_SERVICE_DELETE_FAILED chat_id=%s error=%r", chat.id, exc)
 
 async def service_add_handler(update, context):
     msg = update.message
@@ -3149,46 +3243,58 @@ async def callback(update, context):
     uid = q.from_user.id
     data = q.data or ""
 
-    if data == "staff_inquiry_start":
-        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid) or db.execute("SELECT 1 FROM group_roles WHERE user_id=? LIMIT 1",(uid,)).fetchone()):
-            await safe_callback_answer(q,"هذه الخدمة للطاقم المصرح له فقط.",show_alert=True); return
-        context.user_data["awaiting_staff_inquiry"]=True
-        await q.message.reply_text("🔒 اكتب استفسارك الخاص للمالك. لا يظهر لبقية المشرفين أو في القروبات. /cancel للإلغاء."); return
+    if data == "staff_center":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "إدارة الطاقم حصرية للمالك الأساسي والمالك المفوّض.", show_alert=True); return
+        await q.edit_message_text("🧭 مركز إدارة الطاقم\n\nاختر خدمة لإدارة المهام والمناوبات والصلاحيات والتقييمات والاعتراضات.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 إنشاء تكليف", callback_data="staff_task_new"), InlineKeyboardButton("🗓️ تعيين مناوبة", callback_data="staff_shift_new")],
+            [InlineKeyboardButton("📊 تقييم الطاقم", callback_data="staff_rating"), InlineKeyboardButton("🏅 منح وسام", callback_data="staff_badge_new")],
+            [InlineKeyboardButton("🔐 صلاحيات القروبات", callback_data="staff_permissions"), InlineKeyboardButton("⚖️ الاعتراضات", callback_data="staff_appeals")],
+            [InlineKeyboardButton("📨 استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام", callback_data="staff_tasks")],
+            [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]
+        ])); return
+    if data in ("staff_task_new", "staff_shift_new", "staff_badge_new"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "هذه الوظيفة للمالك الأساسي والمفوّض فقط.", show_alert=True); return
+        if data == "staff_task_new":
+            context.user_data["staff_task_state"] = True
+            await q.message.reply_text("📋 أرسل: رقم_المشرف | عنوان المهمة | التفاصيل (اختياري). أرسل /cancel للإلغاء.")
+        elif data == "staff_shift_new":
+            context.user_data["staff_shift_state"] = True
+            await q.message.reply_text("🗓️ أرسل: رقم_المشرف | موعد البداية | موعد النهاية (اختياري). أرسل /cancel للإلغاء.")
+        else:
+            context.user_data["staff_badge_state"] = True
+            await q.message.reply_text("🏅 أرسل: رقم_المشرف | اسم الوسام | سبب المنح. أرسل /cancel للإلغاء.")
+        return
+    if data == "staff_tasks":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            rows=db.execute("SELECT id,title,status,due_at FROM staff_tasks WHERE assigned_to=? ORDER BY id DESC LIMIT 15",(uid,)).fetchall()
+        else:
+            rows=db.execute("SELECT id,title,status,due_at FROM staff_tasks ORDER BY id DESC LIMIT 20").fetchall()
+        text="📋 المهام والتكليفات\n\n"+("\n".join(f"#{i} · {t} · {st}"+(f" · {due}" if due else "") for i,t,st,due in rows) if rows else "لا توجد مهام مسجلة.")
+        await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ تكليف",callback_data="staff_task_new")],[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")]])); return
+    if data == "staff_rating":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q,"عرض التقييم للمالك والمفوّض فقط.",show_alert=True); return
+        rows=db.execute("SELECT user_id,COUNT(*),SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) FROM staff_tasks GROUP BY user_id").fetchall()
+        body="\n".join(f"• {uid2}: {done or 0}/{total} مهمة مكتملة" for uid2,total,done in rows) or "لا توجد بيانات مهام كافية للتقييم بعد."
+        await q.edit_message_text("📊 تقرير إنجاز المهام (مؤشر أولي وليس حكمًا شاملًا على الأداء)\n\n"+body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")]])); return
+    if data == "staff_permissions":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q,"تعديل الصلاحيات حصرية للمالك والمفوّض.",show_alert=True); return
+        await q.edit_message_text("🔐 إدارة صلاحيات القروبات\n\nلإضافة مشرف وصلاحيات مفصلة نحتاج تحديد القروب والعضو والصلاحيات من داخل القروب. لا تمنح هذه الصفحة أي صلاحية تلقائيًا حتى لا تتجاوز التفويض الحالي.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")]])); return
+    if data == "staff_appeals":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q,"مراجعة الاعتراضات للمالك والمفوّض فقط.",show_alert=True); return
+        rows=db.execute("SELECT id,chat_id,user_id,appeal_text,status FROM staff_appeals WHERE status='new' ORDER BY id DESC LIMIT 15").fetchall()
+        body="\n\n".join(f"#{i} · قروب {c} · العضو {u}\n{t}" for i,c,u,t,st in rows) or "لا توجد اعتراضات جديدة. استقبال الاعتراضات يحتاج تفعيل مسار تقديمها في القروب."
+        await q.edit_message_text("⚖️ مراجعة الاعتراضات\n\n"+body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")]])); return
     if data == "staff_inquiries_inbox":
-        if not is_owner(uid): await safe_callback_answer(q,"هذا الصندوق للمالك الأساسي فقط.",show_alert=True); return
-        rows=db.execute("SELECT id,display_name,status FROM staff_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 30").fetchall()
-        kb=[[InlineKeyboardButton(f"#{iid} · {name or 'طاقم'} · {status}",callback_data=f"staff_inquiry_view:{iid}")] for iid,name,status in rows]
-        kb.append([InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")])
-        await q.edit_message_text("🗂️ صندوق استفسارات الطاقم — خاص بالمالك الأساسي",reply_markup=InlineKeyboardMarkup(kb)); return
-    if data.startswith("staff_inquiry_view:"):
-        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        iid=int(data.split(":",1)[1]); row=db.execute("SELECT user_id,display_name,role_label,inquiry_text,status FROM staff_inquiries WHERE id=?",(iid,)).fetchone()
-        if not row: await safe_callback_answer(q,"الطلب غير موجود.",show_alert=True); return
-        await q.edit_message_text(f"🗂️ استفسار الطاقم #{iid}\nالاسم: {row[1]}\nالدور: {row[2]}\nالمعرّف: {row[0]}\nالحالة: {row[4]}\n\n{row[3]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"staff_inquiry_reply:{iid}"),InlineKeyboardButton("✅ إغلاق",callback_data=f"staff_inquiry_close:{iid}")],[InlineKeyboardButton("⬅️ الصندوق",callback_data="staff_inquiries_inbox")]])); return
-    if data.startswith("staff_inquiry_reply:"):
-        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        iid=int(data.split(":",1)[1]); context.user_data["staff_inquiry_reply_id"]=iid
-        await q.message.reply_text(f"✍️ أرسل ردك الخاص على استفسار الطاقم #{iid}. /cancel للإلغاء."); return
-    if data.startswith("staff_inquiry_close:"):
-        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        iid=int(data.split(":",1)[1]); db.execute("UPDATE staff_inquiries SET status='closed' WHERE id=?",(iid,)); db.commit()
-        await q.edit_message_text(f"✅ تم إغلاق الاستفسار #{iid}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ صندوق الطاقم",callback_data="staff_inquiries_inbox")]])); return
-    if data == "staff_notify_start":
-        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        context.user_data["awaiting_staff_notice"]=True
-        await q.message.reply_text("📣 أرسل إشعارًا فرديًا بالصيغة:\nرقم_المستخدم | عنوان | نص الرسالة\n/cancel للإلغاء."); return
-    if data == "staff_notifications":
-        rows=db.execute("SELECT id,title,body,created_at FROM staff_notifications WHERE user_id=? ORDER BY id DESC LIMIT 15",(uid,)).fetchall()
-        if not rows: await q.edit_message_text("🔔 لا توجد إشعارات جديدة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
-        lines=[f"• #{i} {title} — {created}\n{body[:250]}" for i,title,body,created in rows]
-        db.execute("UPDATE staff_notifications SET read_at=? WHERE user_id=? AND read_at=''",(now(),uid)); db.commit()
-        await q.edit_message_text("🔔 إشعاراتي\n\n"+"\n\n".join(lines)[:3900],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
-    if data == "staff_note_start":
-        context.user_data["awaiting_staff_note"]=True
-        await q.message.reply_text("📝 أرسل نص المذكرة الخاصة بك. لن يراها غيرك. /cancel للإلغاء."); return
-    if data == "staff_calculator":
-        await q.message.reply_text("🧮 الحاسبة: أرسل عملية حسابية بسيطة مثل 125*3 أو 450/5. لا ترسل تعبيرات برمجية.")
-        context.user_data["awaiting_staff_calculation"]=True; return
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q,"صندوق الطاقم للمالك والمفوّض فقط.",show_alert=True); return
+        rows=db.execute("SELECT id,user_id,body,status FROM staff_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 20").fetchall()
+        body="\n\n".join(f"#{i} · {u} · {st}\n{b[:400]}" for i,u,b,st in rows) or "لا توجد استفسارات طاقم مفتوحة."
+        await q.edit_message_text("📨 استفسارات الطاقم\n\n"+body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
     if data == "inquiry_start":
         if q.message.chat.type != ChatType.PRIVATE:
             await safe_callback_answer(q, "افتح البوت في الخاص لإرسال استفسار يحفظ الخصوصية.", show_alert=True); return
@@ -3386,15 +3492,8 @@ async def callback(update, context):
                 if not mentions:
                     empty_groups += 1
                     continue
-                chunks, current = [], "📣 استدعاء أعضاء القروب\n"
-                for mention in mentions:
-                    addition = mention + "  "
-                    if len(current) + len(addition) > 3500 and current.strip():
-                        chunks.append(current.rstrip())
-                        current = "📣 استدعاء أعضاء القروب (تابع)\n"
-                    current += addition
-                if current.strip():
-                    chunks.append(current.rstrip())
+                # تقسيم تلقائي حسب حد طول رسالة تيليجرام، دون قطع روابط المنشن.
+                chunks = split_mentions_for_telegram(mentions)
                 try:
                     for chunk in chunks:
                         await context.bot.send_message(chat_id=cid, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
@@ -3456,25 +3555,17 @@ async def callback(update, context):
             if not mentions:
                 await safe_callback_answer(q, "لا توجد معرّفات أعضاء مسجلة لهذا القروب بعد.", show_alert=True)
                 return
-            chunks, current = [], "📣 استدعاء أعضاء القروب\n"
-            for mention in mentions:
-                addition = mention + "  "
-                if len(current) + len(addition) > 3500 and current.strip():
-                    chunks.append(current.rstrip())
-                    current = "📣 استدعاء أعضاء القروب (تابع)\n"
-                current += addition
-            if current.strip(): chunks.append(current.rstrip())
-            sent = 0
+            # تقسيم تلقائي حسب حد طول رسالة تيليجرام، دون قطع روابط المنشن.
+            chunks = split_mentions_for_telegram(mentions)
             try:
                 for chunk in chunks:
                     await context.bot.send_message(chat_id=group_chat_id, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
-                    sent += 1
                     await asyncio.sleep(0.08)
             except Exception as exc:
                 log.warning("Local group mass mention failed for %s: %s", group_chat_id, exc)
                 await safe_callback_answer(q, "تعذر إكمال الإرسال. تحقق من صلاحيات البوت وحدود تيليجرام.", show_alert=True)
                 return
-            await safe_callback_answer(q, f"تم إرسال {len(mentions)} منشن مسجل.", show_alert=True)
+            await safe_callback_answer(q, f"تم إرسال {len(mentions)} منشن مسجل على {len(chunks)} رسالة تلقائيًا.", show_alert=True)
             return
         if action == "group_panel_home":
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
@@ -4082,15 +4173,7 @@ async def callback(update, context):
             await safe_callback_answer(q, "ليس لديك صلاحية تغيير هذا الإعداد.", show_alert=True); return
         s = get_settings(chat_id)
         new_value = 0 if s[field] else 1
-        try:
-            set_setting(chat_id, field, new_value)
-            db.commit()
-            # أكد الضغط مباشرة حتى لا يبقى مؤشر الانتظار ظاهرًا في تيليجرام.
-            await safe_callback_answer(q, f"تم {'قفل الإعداد' if new_value else 'فتح الإعداد'} بنجاح.")
-        except Exception as exc:
-            log.exception("تعذر تحديث إعداد %s للقروب %s", field, chat_id)
-            await safe_callback_answer(q, "تعذر حفظ الإعداد. حاول مرة أخرى.", show_alert=True)
-            return
+        set_setting(chat_id, field, new_value)
         log_action(chat_id, uid, "setting", f"{field}={new_value}")
         back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
         await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
@@ -4139,29 +4222,6 @@ async def callback(update, context):
             await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل أولًا.", show_alert=True); return
         await q.edit_message_text(f"اختر الأمر المطلوب تنفيذه على {len(selected)} قروب.\nسيُحدّث البوت الإعدادات ويحاول نشر إشعار عام بالقروب.", reply_markup=bulk_security_actions_markup()); return
 
-    if data.startswith("bulksec_do:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
-        context.user_data["pending_bulk_security_action"] = data
-        try:
-            _, field, raw_value = data.split(":",2); value=int(raw_value)
-            if field not in SETTING_FIELDS or value not in (0,1): raise ValueError()
-        except (ValueError, TypeError):
-            await safe_callback_answer(q, "الأمر غير صحيح.", show_alert=True); return
-        selected=context.user_data.get("bulk_security_selected", [])
-        label=dict((f,l) for l,f in BULK_SECURITY_OPTIONS).get(field,field)
-        await q.edit_message_text(f"⚠️ تأكيد أمر الحماية\n\nالإجراء: {'قفل' if value else 'فتح'} {label}\nعدد القروبات: {len(selected)}\n\nهل تريد تنفيذ الأمر الآن؟",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأكيد التنفيذ",callback_data="bulksec_confirm"),InlineKeyboardButton("❌ إلغاء",callback_data="bulksec_cancel")]]))
-        return
-    if data == "bulksec_cancel":
-        context.user_data.pop("pending_bulk_security_action",None)
-        await q.edit_message_text("تم إلغاء أمر الحماية دون تطبيقه.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ العودة لأوامر الحماية",callback_data="bulk_security")]])); return
-    if data == "bulksec_confirm":
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q,"غير مصرح لك.",show_alert=True); return
-        data=context.user_data.pop("pending_bulk_security_action","")
-        if not data.startswith("bulksec_do:"):
-            await safe_callback_answer(q,"لا يوجد أمر بانتظار التأكيد.",show_alert=True); return
-        # Fall through to the validated bulksec_do execution block below.
     if data.startswith("bulksec_do:"):
         if not (is_owner(uid) or is_delegated_owner(uid)):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
@@ -4732,17 +4792,10 @@ async def callback(update, context):
         chat_id,px,po,board,turn,status,message_id=row
         if status!="waiting": await safe_callback_answer(q, "اللعبة بدأت أو انتهت.",show_alert=True); return
         if uid==px: await safe_callback_answer(q, "تحتاج لاعبًا ثانيًا.",show_alert=True); return
-        cur = db.execute("UPDATE game_xo SET player_o=?,status='playing' WHERE token=? AND status='waiting'",(uid,token))
-        db.commit()
-        if cur.rowcount != 1:
-            await safe_callback_answer(q, "سبق لاعب آخر إلى الانضمام؛ حدّث الرسالة واختر تحديًا جديدًا.", show_alert=True)
-            return
-        await safe_callback_answer(q, "انضممت إلى اللعبة! ابدأ اللعب عند ظهور دورك.")
-        text=f"⭕ إكس أو — ❌ اللاعب الأول ضد ⭕ اللاعب الثاني\nالدور: ❌ اللاعب الأول"
+        db.execute("UPDATE game_xo SET player_o=?,status='playing' WHERE token=? AND status='waiting'",(uid,token)); db.commit()
+        text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {uid}\nالدور: ❌ اللاعب الأول"
         try: await q.edit_message_text(text,reply_markup=game_board_markup(token,board))
-        except Exception:
-            log.exception("تعذر عرض لوحة إكس أو للعبة %s", token)
-            await safe_callback_answer(q, "تم تسجيل الانضمام، لكن تعذر تحديث لوحة اللعبة.",show_alert=True)
+        except Exception: await safe_callback_answer(q, "تعذر تحديث لوحة اللعبة.",show_alert=True); return
         return
 
     if data.startswith("xo_move:"):
@@ -4770,11 +4823,8 @@ async def callback(update, context):
             next_turn="O" if turn=="X" else "X"; db.execute("UPDATE game_xo SET board=?,turn=? WHERE token=?",(board,next_turn))
             text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {po}\nالدور: {'❌ اللاعب الأول' if next_turn=='X' else '⭕ اللاعب الثاني'}"
         db.commit()
-        await safe_callback_answer(q, "تم تسجيل حركتك.")
         try: await q.edit_message_text(text,reply_markup=None if winner or draw else game_board_markup(token,board))
-        except Exception:
-            log.exception("تعذر تحديث لوحة إكس أو بعد الحركة في اللعبة %s", token)
-            await safe_callback_answer(q, "تم تسجيل الحركة، لكن تعذر تحديث اللوحة.",show_alert=True)
+        except Exception: await safe_callback_answer(q, "تم تسجيل الحركة، لكن تعذر تحديث اللوحة.",show_alert=True)
         return
 
     if data == "statistics":
@@ -5333,7 +5383,7 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_inquiry", "staff_inquiry_reply_id", "awaiting_staff_notice", "awaiting_staff_note", "awaiting_staff_calculation")
+    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected")
     cancelled = any(context.user_data.pop(key, None) is not None for key in keys)
     await update.effective_message.reply_text("تم إلغاء العملية الحالية." if cancelled else "لا توجد عملية قيد التنفيذ.")
 
@@ -5355,7 +5405,68 @@ async def post_init(app):
     """Start long-running assistant workers only after PTB has initialized its event loop."""
     app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
     app.create_task(weekly_stats_worker(app), name="weekly-group-stats-worker")
+    app.create_task(owner_activity_audit_worker(app), name="owner-activity-audit-worker")
 
+
+
+async def owner_activity_audit_worker(app):
+    """Notify the primary owner about logged actions by delegated owners/managers/staff."""
+    # Skip historic rows at startup; only new actions generate notifications.
+    try:
+        latest = db.execute("SELECT COALESCE(MAX(id),0) FROM logs").fetchone()[0]
+        db.execute("UPDATE owner_activity_cursor SET last_log_id=? WHERE id=1", (latest,))
+        db.commit()
+    except Exception:
+        log.exception("تعذر تهيئة مؤشر تنبيهات نشاط الإدارة")
+    while True:
+        try:
+            if not OWNER_ID:
+                await asyncio.sleep(10)
+                continue
+            cursor = db.execute("SELECT last_log_id FROM owner_activity_cursor WHERE id=1").fetchone()
+            last_id = int(cursor[0]) if cursor else 0
+            rows = db.execute(
+                "SELECT id,chat_id,user_id,action,details,created_at FROM logs WHERE id>? ORDER BY id LIMIT 100",
+                (last_id,)
+            ).fetchall()
+            for log_id, chat_id, actor_id, action, details, created_at in rows:
+                try:
+                    actor_id = int(actor_id or 0)
+                    is_staff_actor = bool(
+                        actor_id and ((is_delegated_owner(actor_id) and not is_owner(actor_id))
+                        or db.execute("SELECT 1 FROM managers WHERE user_id=?", (actor_id,)).fetchone()
+                        or db.execute("SELECT 1 FROM protection_managers WHERE user_id=?", (actor_id,)).fetchone()
+                        or db.execute("SELECT 1 FROM group_roles WHERE user_id=? LIMIT 1", (actor_id,)).fetchone())
+                    )
+                    if is_staff_actor:
+                        role = role_name(actor_id)
+                        name = user_display_name(actor_id)
+                        group_title = "خاص/النظام" if not chat_id else str(chat_id)
+                        if chat_id:
+                            row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+                            if row and row[0]: group_title = row[0]
+                        message = (
+                            "🔔 تنبيه نشاط إداري\n\n"
+                            f"👤 المنفّذ: {name}\n🪪 المعرّف: {actor_id}\n🏷️ الصفة: {role}\n"
+                            f"⚙️ نوع الإجراء: {action or 'غير محدد'}\n📍 القروب/النطاق: {group_title}\n"
+                            f"📝 التفاصيل: {(details or 'لا توجد تفاصيل')[:900]}\n🕒 الوقت: {created_at or 'غير محدد'}"
+                        )
+                        try:
+                            await app.bot.send_message(chat_id=OWNER_ID, text=message)
+                        except Exception as exc:
+                            log.info("تعذر إرسال تنبيه النشاط الإداري للمالك: %s", exc)
+                    db.execute("UPDATE owner_activity_cursor SET last_log_id=? WHERE id=1", (log_id,))
+                    db.commit()
+                except Exception:
+                    log.exception("تعذر معالجة سجل النشاط الإداري %s", log_id)
+                    db.execute("UPDATE owner_activity_cursor SET last_log_id=? WHERE id=1", (log_id,))
+                    db.commit()
+            await asyncio.sleep(5 if rows else 10)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("خطأ في مراقبة النشاط الإداري")
+            await asyncio.sleep(10)
 
 def main():
     if not TOKEN:
@@ -5363,7 +5474,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
