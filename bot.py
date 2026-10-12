@@ -920,7 +920,6 @@ def panel_markup(uid):
             [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
-            [InlineKeyboardButton("🆔 معرّفات الإدارة", callback_data="owner_ids"), InlineKeyboardButton("👤 معرفات الأعضاء", callback_data="member_ids_help")],
             [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
             [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         ])
@@ -932,7 +931,6 @@ def panel_markup(uid):
         [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
-        [InlineKeyboardButton("🆔 معرّفات الإدارة", callback_data="owner_ids"), InlineKeyboardButton("👤 معرفات الأعضاء", callback_data="member_ids_help")],
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("📨 استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox")],
@@ -2219,47 +2217,8 @@ async def group_role_command(update, context):
     )
 
 
-def admin_ids_text():
-    rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
-    lines = [f"👑 المالك الأساسي — ID: {OWNER_ID}", "", "👑 المالكون المفوّضون:"]
-    if rows:
-        lines.extend(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id, name, username in rows)
-    else:
-        lines.append("لا يوجد مالكون مفوّضون مسجلون.")
-    lines += ["", "استخدم هذه الأرقام في الأوامر التي تتطلب ID."]
-    return "\n".join(lines)
-
 async def id_cmd(update, context):
-    user = update.effective_user
-    chat = update.effective_chat
-    message = update.effective_message
-    own_line = f"🆔 رقم حسابك: {user.id}"
-
-    # عند الرد على رسالة عضو داخل قروب، لا نكشف بيانات الآخرين إلا لمالك البوت
-    # أو المفوّض أو مشرف Telegram الفعلي لذلك القروب.
-    replied = message.reply_to_message if message else None
-    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and replied and replied.from_user:
-        allowed = is_owner(user.id) or is_delegated_owner(user.id) or await is_telegram_group_admin(context.bot, user.id, chat.id)
-        if not allowed:
-            await message.reply_text(own_line + "\nلعرض معرف عضو آخر، يجب أن تكون مالك البوت أو مفوّضًا أو مشرفًا في هذا القروب.")
-            return
-        target = replied.from_user
-        username = f"@{target.username}" if target.username else "غير متوفر"
-        role = "مالك البوت" if is_owner(target.id) else ("مالك مفوّض" if is_delegated_owner(target.id) else role_name(target.id))
-        await message.reply_text(
-            "👤 معلومات العضو\n"
-            f"الاسم: {html.escape(target.full_name or 'غير معروف')}\n"
-            f"المستخدم: {html.escape(username)}\n"
-            f"🆔 User ID: {target.id}\n"
-            f"🆔 Group ID: {chat.id}\n"
-            f"الصفة داخل البوت: {html.escape(role)}"
-        )
-        return
-
-    if chat and chat.type == ChatType.PRIVATE and (is_owner(user.id) or is_delegated_owner(user.id)):
-        await message.reply_text(own_line + "\n\n" + admin_ids_text() + "\n\n👤 لمعرفة ID عضو: افتح القروب ورد على رسالته بالأمر /id.")
-    else:
-        await message.reply_text(own_line + "\nلمعرفة ID عضو: رد على رسالته داخل القروب بالأمر /id (للمالك والمفوّض ومشرفي القروب فقط).\nلمعرفة Group ID استخدم /idgroup.")
+    await update.effective_message.reply_text(f"🆔 رقمك: {update.effective_user.id}")
 
 async def idgroup(update, context):
     await update.effective_message.reply_text(f"🆔 رقم القروب: {update.effective_chat.id}")
@@ -3811,32 +3770,6 @@ async def callback(update, context):
         lines=[f"💬 الردود الآلية — {title}", f"الحالة العامة: {'🟢 مفعّلة' if enabled else '⏸️ متوقفة'}", ""]+[f"{'✅' if en else '⏸️'} {tr} ← {rep}" for tr,rep,en in rules[:35]]
         _, buttons=owner_autoreply_group_markup(chat_id)
         await q.edit_message_text("\n".join(lines)[:3500], reply_markup=InlineKeyboardMarkup(buttons)); return
-
-    if data == "member_ids_help":
-        if not can_use_panel(uid):
-            await safe_callback_answer(q, "هذا القسم للإدارة المصرّح لها فقط.", show_alert=True)
-            return
-        await q.edit_message_text(
-            "👤 معرفات الأعضاء\n\n"
-            "1) افتح القروب المطلوب.\n"
-            "2) اضغط رد على رسالة العضو.\n"
-            "3) أرسل /id.\n\n"
-            "سيظهر اسم العضو واسم المستخدم وUser ID وGroup ID.\n"
-            "🔒 لا يمكن عرض ID عضو آخر إلا للمالك أو المالك المفوّض أو مشرف Telegram في القروب.\n"
-            "لإظهار رقم حسابك فقط، أرسل /id في الخاص مع البوت.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="home")]])
-        )
-        return
-
-    if data == "owner_ids":
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "معرّفات الإدارة للمالك والمالك المفوّض فقط.", show_alert=True)
-            return
-        if q.message.chat.type != ChatType.PRIVATE:
-            await safe_callback_answer(q, "افتح لوحة البوت في الخاص لعرض المعرّفات بأمان.", show_alert=True)
-            return
-        await q.edit_message_text(admin_ids_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="home")]]))
-        return
 
     if data == "health":
         if not can_use_panel(uid):
