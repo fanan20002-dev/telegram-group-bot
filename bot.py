@@ -59,6 +59,54 @@ db.execute("""CREATE TABLE IF NOT EXISTS assistant_chat_history(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
 )""")
+db.commit()
+
+# Private general inquiries are routed ONLY to the primary bot owner.
+db.execute("""CREATE TABLE IF NOT EXISTS general_inquiries(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT DEFAULT '',
+    display_name TEXT DEFAULT '',
+    inquiry_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TEXT NOT NULL,
+    replied_at TEXT DEFAULT '',
+    reply_text TEXT DEFAULT ''
+)""")
+# Private staff inquiries and owner-to-staff notices. Additive migration; existing data is preserved.
+db.execute("""CREATE TABLE IF NOT EXISTS staff_inquiries(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT DEFAULT '',
+    display_name TEXT DEFAULT '',
+    role_label TEXT DEFAULT '',
+    chat_id INTEGER DEFAULT NULL,
+    inquiry_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TEXT NOT NULL,
+    reply_text TEXT DEFAULT '',
+    replied_at TEXT DEFAULT ''
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS staff_notifications(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    read_at TEXT DEFAULT ''
+)""")
+db.commit()
+
+# Registered broadcast channels. The bot must be an administrator with posting rights.
+db.execute("""CREATE TABLE IF NOT EXISTS linked_channels(
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    username TEXT DEFAULT '',
+    linked_by INTEGER NOT NULL,
+    linked_at TEXT NOT NULL
+)""")
+db.commit()
+
 # Additional personal-assistant features; additive schema only.
 db.execute("""CREATE TABLE IF NOT EXISTS assistant_tasks(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -519,6 +567,46 @@ QUIZ_CATEGORIES = {
         ("ما الامتداد الشائع لملفات الصور؟", [".jpg", ".mp3", ".exe", ".py"], 0, "JPG امتداد شائع للصور."),
         ("ما فائدة تحديث البرامج؟", ["إصلاح أخطاء وتحسين الأمان", "إلغاء كل الملفات دائمًا", "تعطيل الشاشة", "زيادة حجم الجهاز"], 0, "تتضمن التحديثات إصلاحات وتحسينات أمنية ووظيفية."),
     ]),
+    "arabic": ("🔤 اللغة العربية", [
+        ("ما جمع كلمة مفتاح؟", ["مفاتيح", "مفتاحات", "مفتاحون", "مفتاحين فقط"], 0, "جمع مفتاح هو مفاتيح."),
+        ("ما ضد كلمة شجاع؟", ["جريء", "جبان", "قوي", "مقدام"], 1, "ضد شجاع: جبان."),
+        ("أي كلمة من التالية فعل؟", ["المدرسة", "يكتب", "القلم", "جميل"], 1, "يكتب فعل مضارع."),
+        ("ما نوع كلمة (سريع) في جملة: عدّاء سريع؟", ["اسم", "فعل", "صفة", "حرف جر"], 2, "سريع صفة تصف العدّاء."),
+        ("ما جمع كلمة كتاب؟", ["كتابات فقط", "كاتبون", "كتب", "مكتبة"], 2, "جمع كتاب هو كتب."),
+        ("أي كلمة تبدأ بهمزة قطع؟", ["استعمال", "ابن في وسط الكلام", "أحمد", "اسم"], 2, "أحمد تبدأ بهمزة قطع."),
+        ("ما المثنى من كلمة طالب؟", ["طلاب", "طالبان", "طالبات", "طلبة"], 1, "مثنى طالب: طالبان في حالة الرفع."),
+        ("أي جملة استفهامية؟", ["الجو جميل", "افتح الباب", "أين الكتاب؟", "ما أجمل السماء"], 2, "أين الكتاب؟ جملة استفهامية."),
+    ]),
+    "math": ("➗ الرياضيات", [
+        ("كم ناتج 9 × 7؟", ["56", "63", "72", "79"], 1, "9 × 7 = 63."),
+        ("ما نصف العدد 86؟", ["42", "43", "46", "48"], 1, "نصف 86 يساوي 43."),
+        ("كم ضلعًا للمثلث؟", ["2", "3", "4", "5"], 1, "للمثلث ثلاثة أضلاع."),
+        ("كم يساوي 25% من 200؟", ["25", "40", "50", "75"], 2, "25% ربع العدد، وربع 200 يساوي 50."),
+        ("ما العدد التالي: 2، 4، 6، 8، ...؟", ["9", "10", "11", "12"], 1, "النمط يزيد بمقدار 2؛ التالي 10."),
+        ("كم ثانية في دقيقتين؟", ["60", "100", "120", "180"], 2, "الدقيقتان تساويان 120 ثانية."),
+        ("ما محيط مربع طول ضلعه 5؟", ["10", "15", "20", "25"], 2, "محيط المربع يساوي أربعة أضعاف طول الضلع: 20."),
+        ("ما ناتج 144 ÷ 12؟", ["10", "11", "12", "14"], 2, "144 ÷ 12 = 12."),
+    ]),
+    "saudi": ("🇸🇦 المملكة العربية السعودية", [
+        ("ما عاصمة المملكة العربية السعودية؟", ["جدة", "الرياض", "الدمام", "أبها"], 1, "الرياض عاصمة المملكة العربية السعودية."),
+        ("ما العملة الرسمية في السعودية؟", ["الدينار", "الدرهم", "الريال السعودي", "الجنيه"], 2, "العملة الرسمية هي الريال السعودي."),
+        ("ما البحر الذي يقع غرب السعودية؟", ["البحر الأحمر", "بحر قزوين", "البحر الأسود", "بحر البلطيق"], 0, "يقع البحر الأحمر غرب المملكة."),
+        ("ما اسم رؤية المملكة لعام 2030؟", ["رؤية السعودية 2030", "خطة 2040", "برنامج 2020", "رؤية الخليج 2050"], 0, "اسم البرنامج الوطني هو رؤية السعودية 2030."),
+        ("في أي مدينة يقع المسجد النبوي؟", ["مكة المكرمة", "المدينة المنورة", "الرياض", "الطائف"], 1, "يقع المسجد النبوي في المدينة المنورة."),
+        ("ما اسم اليوم الوطني السعودي؟", ["يوم التأسيس فقط", "اليوم الوطني", "يوم العلم فقط", "يوم الوحدة العربية"], 1, "يُحتفل باليوم الوطني السعودي في 23 سبتمبر."),
+        ("ما المنطقة التي تقع فيها تبوك؟", ["شمال غرب المملكة", "جنوب شرق المملكة", "وسط اليمن", "شرق عُمان"], 0, "تقع منطقة تبوك في شمال غرب المملكة."),
+        ("ما اسم البحر الذي تطل عليه جدة؟", ["الخليج العربي", "البحر الأحمر", "بحر العرب", "البحر المتوسط"], 1, "تقع جدة على ساحل البحر الأحمر."),
+    ]),
+    "logic": ("🧩 ألغاز المنطق", [
+        ("إذا كان اليوم الاثنين، فما اليوم بعد يومين؟", ["الثلاثاء", "الأربعاء", "الخميس", "الجمعة"], 1, "بعد يومين من الاثنين يأتي الأربعاء."),
+        ("لديك 3 تفاحات وأخذت واحدة، كم تفاحة معك؟", ["واحدة", "اثنتان", "ثلاث", "صفر"], 0, "أخذت واحدة، إذن معك تفاحة واحدة."),
+        ("أي عدد لا ينتمي للمجموعة: 2، 4، 6، 9، 8؟", ["2", "4", "9", "8"], 2, "الأعداد الأخرى زوجية، أما 9 فردي."),
+        ("أيهما أثقل: كيلو حديد أم كيلو قطن؟", ["الحديد", "القطن", "متساويان", "لا يمكن معرفة ذلك"], 2, "كلاهما يزن كيلوغرامًا واحدًا."),
+        ("إذا كانت كل الورود نباتات، فهل كل النباتات ورود؟", ["نعم دائمًا", "لا يلزم", "لا توجد نباتات", "كلها أشجار"], 1, "كون الورود نباتات لا يعني أن كل النباتات ورود."),
+        ("ما العدد التالي: 1، 1، 2، 3، 5، ...؟", ["6", "7", "8", "10"], 2, "في متتالية فيبوناتشي، التالي 3 + 5 = 8."),
+        ("لدى أسرة 4 بنات ولكل بنت أخ واحد مشترك، كم عدد الأبناء؟", ["4", "5", "8", "9"], 1, "الأخ واحد مشترك بين البنات الأربع، فيكون العدد 5 أبناء."),
+        ("أي شهر يحتوي 28 يومًا على الأقل؟", ["فبراير فقط", "يناير فقط", "كل الشهور", "لا شهر"], 2, "كل الشهور تحتوي 28 يومًا على الأقل."),
+    ]),
 }
 
 WORD_BANK = [
@@ -564,7 +652,22 @@ async def send_quiz_stage(context, chat_id, category, stage):
     if category not in QUIZ_CATEGORIES or stage < 1 or stage > 5:
         return None
     title, questions = QUIZ_CATEGORIES[category]
-    question_index = random.randrange(len(questions))
+    # Rotate the offline bank: avoid repeating questions from the latest rounds
+    # in this group/category until the available questions have been used.
+    recent_rows = db.execute(
+        "SELECT answer FROM game_rounds WHERE chat_id=? AND kind='quiz_stage' ORDER BY created_at DESC LIMIT 20",
+        (chat_id,),
+    ).fetchall()
+    recent_indices = set()
+    for (stored_answer,) in recent_rows:
+        try:
+            stored_category, _stored_stage, stored_index, _stored_correct = stored_answer.split("|")
+            if stored_category == category:
+                recent_indices.add(int(stored_index))
+        except (AttributeError, ValueError):
+            continue
+    candidates = [i for i in range(len(questions)) if i not in recent_indices] or list(range(len(questions)))
+    question_index = random.choice(candidates)
     question, options, correct_index, explanation = questions[question_index]
     token = uuid.uuid4().hex[:10]
     answer_data = f"{category}|{stage}|{question_index}|{correct_index}"
@@ -820,6 +923,7 @@ def panel_markup(uid):
         ])
     owner_rows = [
         [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
+        [InlineKeyboardButton("⚡ أوامر الحماية الجماعية", callback_data="bulk_security")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
@@ -827,6 +931,9 @@ def panel_markup(uid):
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
+        [InlineKeyboardButton("📨 استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox")],
+        [InlineKeyboardButton("📣 تعليمات وإشعارات الطاقم", callback_data="staff_notify_start")],
+        [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
@@ -945,6 +1052,218 @@ def remember_assistant_user(user):
     db.commit()
 
 
+async def ask_cmd(update, context):
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("لخصوصيتك، أرسل الاستفسار في الخاص مع البوت.")
+        return
+    context.user_data["awaiting_general_inquiry"] = True
+    await update.effective_message.reply_text("💬 أرسل استفسارك الآن في رسالة واحدة. سيصل إلى المالك الأساسي فقط، ولن يُنشر في أي قروب. أرسل /cancel لإلغاء الطلب.")
+
+
+async def addchannel_cmd(update, context):
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ ربط القنوات للمالك الأساسي فقط.")
+        return
+    if not context.args:
+        await update.effective_message.reply_text("الاستخدام: /addchannel @channelusername\nأضف البوت مشرفًا في القناة مع صلاحية نشر الرسائل أولًا.")
+        return
+    target = context.args[0].strip()
+    try:
+        channel = await context.bot.get_chat(target)
+        if channel.type != ChatType.CHANNEL:
+            await update.effective_message.reply_text("المعرّف ليس قناة تيليجرام.")
+            return
+        bot_member = await context.bot.get_chat_member(channel.id, context.bot.id)
+        if getattr(bot_member, "status", "") != "administrator" or not getattr(bot_member, "can_post_messages", False):
+            await update.effective_message.reply_text("⛔ لم يتم الربط: أضف البوت مشرفًا في القناة وفعّل صلاحية نشر الرسائل، ثم أعد المحاولة.")
+            return
+        db.execute("INSERT INTO linked_channels(chat_id,title,username,linked_by,linked_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username,linked_by=excluded.linked_by,linked_at=excluded.linked_at",
+                   (channel.id, channel.title or str(channel.id), channel.username or "", update.effective_user.id, now()))
+        db.commit()
+        await update.effective_message.reply_text(f"✅ تم ربط القناة: {channel.title}\nالمعرّف: {channel.id}\nيمكنك الآن اختيارها من لوحة القنوات للنشر.")
+    except Exception as exc:
+        log.warning("channel registration failed: %s", exc)
+        await update.effective_message.reply_text("تعذر ربط القناة. تأكد من صحة @username وأن البوت مشرف مع صلاحية النشر.")
+
+
+async def delchannel_cmd(update, context):
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ حذف القنوات المرتبطة للمالك الأساسي فقط.")
+        return
+    if not context.args:
+        await update.effective_message.reply_text("الاستخدام: /delchannel @channelusername أو /delchannel CHANNEL_ID")
+        return
+    raw = context.args[0].strip()
+    row = None
+    if raw.lstrip('-').isdigit():
+        row = db.execute("SELECT chat_id,title FROM linked_channels WHERE chat_id=?", (int(raw),)).fetchone()
+    else:
+        row = db.execute("SELECT chat_id,title FROM linked_channels WHERE username=?", (raw.lstrip('@'),)).fetchone()
+    if not row:
+        await update.effective_message.reply_text("لم أجد هذه القناة ضمن القنوات المرتبطة.")
+        return
+    db.execute("DELETE FROM linked_channels WHERE chat_id=?", (row[0],)); db.commit()
+    await update.effective_message.reply_text(f"✅ تم فك ربط القناة: {row[1]}")
+
+
+async def channels_cmd(update, context):
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ قائمة القنوات للمالك الأساسي فقط.")
+        return
+    rows = db.execute("SELECT chat_id,title,username FROM linked_channels ORDER BY title").fetchall()
+    text = "📡 القنوات المرتبطة:\n" + ("\n".join(f"• {title} — @{username or 'بدون معرف'} — {cid}" for cid,title,username in rows) if rows else "لا توجد قنوات مرتبطة بعد.")
+    await update.effective_message.reply_text(text[:4000])
+
+
+async def publish_channels_cmd(update, context):
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ النشر للقنوات من المالك الأساسي فقط.")
+        return
+    rows = db.execute("SELECT COUNT(*) FROM linked_channels").fetchone()[0]
+    if not rows:
+        await update.effective_message.reply_text("لا توجد قنوات مرتبطة. استخدم /addchannel @channelusername بعد منح البوت صلاحية النشر.")
+        return
+    context.user_data["channel_broadcast_selected"] = []
+    context.user_data["channel_broadcast_stage"] = "select"
+    kb = [[InlineKeyboardButton(f"⬜ {title}", callback_data=f"channel_pub_toggle:{cid}")] for cid,title in db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()[:50]]
+    kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات", callback_data="channel_pub_all")], [InlineKeyboardButton("➡️ متابعة", callback_data="channel_pub_prepare")], [InlineKeyboardButton("❌ إلغاء", callback_data="channel_pub_cancel")]]
+    await update.effective_message.reply_text("📡 اختر القنوات المستهدفة للنشر:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def process_private_workflows(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
+    if (context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
+        or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
+        or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id")
+        or context.user_data.get("awaiting_admin_action") or context.user_data.get("awaiting_staff_inquiry") or context.user_data.get("staff_inquiry_reply_id") or context.user_data.get("awaiting_staff_notice") or context.user_data.get("awaiting_staff_note")):
+        context.user_data["_skip_assistant_private_message_id"] = msg.message_id
+    # Primary-owner inquiry replies are deliberately not delegated.
+    reply_state = context.user_data.get("inquiry_reply_id")
+    if reply_state:
+        if not is_owner(user.id):
+            context.user_data.pop("inquiry_reply_id", None); return
+        reply_text = (msg.text or "").strip()
+        if not reply_text or reply_text.startswith("/"):
+            await msg.reply_text("أرسل نص الرد، أو /cancel للإلغاء."); return
+        row = db.execute("SELECT user_id,status FROM general_inquiries WHERE id=?", (int(reply_state),)).fetchone()
+        if not row:
+            context.user_data.pop("inquiry_reply_id", None); await msg.reply_text("الاستفسار غير موجود."); return
+        try:
+            await context.bot.send_message(row[0], f"📨 رد المالك على استفسارك رقم #{reply_state}:\n\n{reply_text}")
+            db.execute("UPDATE general_inquiries SET status='answered',reply_text=?,replied_at=? WHERE id=?", (reply_text, now(), int(reply_state))); db.commit()
+            await msg.reply_text(f"✅ تم إرسال الرد لصاحب الاستفسار #{reply_state}.")
+        except Exception:
+            await msg.reply_text("تعذر إرسال الرد؛ يجب أن يكون صاحب الاستفسار قد بدأ محادثة مع البوت ولم يحظره.")
+        context.user_data.pop("inquiry_reply_id", None); return
+    if context.user_data.get("awaiting_general_inquiry"):
+        raw = (msg.text or "").strip()
+        if raw == "/cancel":
+            context.user_data.pop("awaiting_general_inquiry", None); await msg.reply_text("تم إلغاء الاستفسار."); return
+        if not raw or raw.startswith("/") or len(raw) > 3000:
+            await msg.reply_text("أرسل نصًا واضحًا لا يتجاوز 3000 حرف، أو /cancel للإلغاء."); return
+        cur = db.execute("INSERT INTO general_inquiries(user_id,username,display_name,inquiry_text,status,created_at) VALUES(?,?,?,?,?,?)", (user.id, user.username or "", user.full_name or "", raw, "new", now()))
+        inquiry_id = cur.lastrowid; db.commit(); context.user_data.pop("awaiting_general_inquiry", None)
+        await msg.reply_text(f"✅ تم استلام استفسارك برقم #{inquiry_id}. سيصل الرد إليك هنا في الخاص عند مراجعته.")
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(OWNER_ID,
+                    f"📨 استفسار عام جديد #{inquiry_id}\nالاسم: {user.full_name}\nالمعرّف: {user.id}\nاسم المستخدم: @{user.username or 'غير متوفر'}\n\n{raw}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد على الاستفسار", callback_data=f"inquiry_reply:{inquiry_id}"), InlineKeyboardButton("✅ إغلاق", callback_data=f"inquiry_close:{inquiry_id}")]]))
+            except Exception as exc:
+                log.warning("could not notify primary owner of inquiry: %s", exc)
+                await msg.reply_text("تم حفظ الطلب، لكن تعذر تنبيه المالك الآن. تأكد أن المالك بدأ محادثة مع البوت باستخدام /start.")
+        return
+    if context.user_data.get("awaiting_staff_calculation"):
+        raw=(msg.text or '').strip()
+        if raw=="/cancel": context.user_data.pop("awaiting_staff_calculation",None); await msg.reply_text("تم إلغاء الحاسبة."); return
+        import ast as _ast, operator as _op
+        ops={_ast.Add:_op.add,_ast.Sub:_op.sub,_ast.Mult:_op.mul,_ast.Div:_op.truediv,_ast.Pow:_op.pow,_ast.USub:_op.neg,_ast.UAdd:_op.pos,_ast.Mod:_op.mod}
+        def _calc(node):
+            if isinstance(node,_ast.Expression): return _calc(node.body)
+            if isinstance(node,_ast.Constant) and isinstance(node.value,(int,float)): return node.value
+            if isinstance(node,_ast.BinOp) and type(node.op) in ops: return ops[type(node.op)](_calc(node.left),_calc(node.right))
+            if isinstance(node,_ast.UnaryOp) and type(node.op) in ops: return ops[type(node.op)](_calc(node.operand))
+            raise ValueError("invalid")
+        try:
+            tree=_ast.parse(raw,mode='eval'); result=_calc(tree)
+            if abs(result)>1e15: raise ValueError("range")
+            await msg.reply_text(f"🧮 النتيجة: {result}")
+        except Exception: await msg.reply_text("تعذر الحساب. استخدم أرقامًا وعمليات + - * / % وأقواسًا فقط.")
+        context.user_data.pop("awaiting_staff_calculation",None); return
+
+    # Private staff inquiry submission: only registered managers/delegates/group-scoped staff.
+    if context.user_data.get("awaiting_staff_inquiry"):
+        raw=(msg.text or "").strip()
+        if raw == "/cancel":
+            context.user_data.pop("awaiting_staff_inquiry",None); await msg.reply_text("تم إلغاء الاستفسار."); return
+        if not raw or raw.startswith("/") or len(raw)>3000:
+            await msg.reply_text("أرسل استفسارًا نصيًا لا يتجاوز 3000 حرف، أو /cancel للإلغاء."); return
+        role=role_name(user.id)
+        cur=db.execute("INSERT INTO staff_inquiries(user_id,username,display_name,role_label,chat_id,inquiry_text,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (user.id,user.username or '',user.full_name or '',role,None,raw,'new',now()))
+        iid=cur.lastrowid; db.commit(); context.user_data.pop("awaiting_staff_inquiry",None)
+        await msg.reply_text(f"✅ تم إرسال استفسارك الخاص للمالك برقم #{iid}. ستصلك الإجابة هنا.")
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(OWNER_ID,f"🗂️ استفسار طاقم جديد #{iid}\nالاسم: {user.full_name}\nالدور: {role}\nالمعرّف: {user.id}\n\n{raw}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"staff_inquiry_reply:{iid}"),InlineKeyboardButton("🔎 عرض الطلب",callback_data=f"staff_inquiry_view:{iid}")]]))
+            except Exception as exc: log.warning("staff inquiry owner notification failed: %s",exc)
+        return
+    # Owner replies to staff inquiry, routed only to its author.
+    if context.user_data.get("staff_inquiry_reply_id"):
+        if not is_owner(user.id): context.user_data.pop("staff_inquiry_reply_id",None); return
+        reply=(msg.text or '').strip(); iid=int(context.user_data["staff_inquiry_reply_id"])
+        if not reply or reply.startswith("/"):
+            await msg.reply_text("أرسل نص الرد أو /cancel للإلغاء."); return
+        row=db.execute("SELECT user_id FROM staff_inquiries WHERE id=?",(iid,)).fetchone()
+        if not row: context.user_data.pop("staff_inquiry_reply_id",None); await msg.reply_text("الطلب غير موجود."); return
+        try:
+            await context.bot.send_message(row[0],f"📨 رد المالك على استفسارك #{iid}:\n\n{reply}")
+            db.execute("UPDATE staff_inquiries SET status='answered',reply_text=?,replied_at=? WHERE id=?",(reply,now(),iid)); db.commit()
+            await msg.reply_text(f"✅ وصل الرد لصاحب الاستفسار #{iid}.")
+        except Exception: await msg.reply_text("تعذر إرسال الرد؛ يجب أن يكون صاحب الاستفسار قد بدأ محادثة مع البوت.")
+        context.user_data.pop("staff_inquiry_reply_id",None); return
+    if context.user_data.get("awaiting_staff_notice") and is_owner(user.id):
+        raw=(msg.text or '').strip()
+        if raw=="/cancel": context.user_data.pop("awaiting_staff_notice",None); await msg.reply_text("تم الإلغاء."); return
+        if "|" not in raw: await msg.reply_text("أرسل: رقم_المستخدم | عنوان | نص الرسالة"); return
+        parts=[p.strip() for p in raw.split("|",2)]
+        if len(parts)!=3 or not parts[0].isdigit() or not parts[1] or not parts[2]: await msg.reply_text("الصيغة: رقم_المستخدم | عنوان | نص الرسالة"); return
+        target=int(parts[0]); db.execute("INSERT INTO staff_notifications(user_id,title,body,created_at) VALUES(?,?,?,?)",(target,parts[1],parts[2],now())); db.commit()
+        context.user_data.pop("awaiting_staff_notice",None)
+        try: await context.bot.send_message(target,f"🔔 {parts[1]}\n\n{parts[2]}") ; delivered=True
+        except Exception: delivered=False
+        await msg.reply_text("✅ حُفظت الرسالة ووصل الإشعار." if delivered else "⚠️ حُفظت الرسالة، لكن تعذر إرسال الإشعار. على المستلم بدء محادثة مع البوت أولًا."); return
+    if context.user_data.get("awaiting_staff_note"):
+        raw=(msg.text or '').strip()
+        if raw=="/cancel": context.user_data.pop("awaiting_staff_note",None); await msg.reply_text("تم الإلغاء."); return
+        db.execute("INSERT INTO assistant_notes(user_id,note_text,created_at) VALUES(?,?,?)",(user.id,raw,now())); db.commit()
+        context.user_data.pop("awaiting_staff_note",None); await msg.reply_text("📝 تم حفظ المذكرة في حسابك الخاص."); return
+
+    if context.user_data.get("awaiting_channel_broadcast") and is_owner(user.id):
+        context.user_data["channel_broadcast_draft"] = {"chat_id": update.effective_chat.id, "message_id": msg.message_id}
+        context.user_data["awaiting_channel_broadcast"] = False
+        targets = context.user_data.get("channel_broadcast_selected", [])
+        await msg.reply_text(f"👀 معاينة النشر للقنوات\nعدد القنوات المستهدفة: {len(targets)}\nهل تؤكد النشر؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأكيد النشر", callback_data="channel_pub_confirm")],[InlineKeyboardButton("❌ إلغاء", callback_data="channel_pub_cancel")]]))
+        return
+
+
+async def channel_post_listener(update, context):
+    """Receives channel posts only from channels linked by the primary owner."""
+    post = update.channel_post
+    if not post:
+        return
+    row = db.execute("SELECT title FROM linked_channels WHERE chat_id=?", (post.chat.id,)).fetchone()
+    if not row:
+        return
+    text_value = (post.text or post.caption or "").strip()
+    if text_value.startswith("/botstatus"):
+        await context.bot.send_message(post.chat.id, "🟢 البوت مرتبط بهذه القناة ويستقبل منشوراتها. لإدارة النشر استخدم /panel في الخاص مع البوت.")
+
+
 def assistant_menu_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("⏰ تذكير جديد", callback_data="assistant_reminder_help")],
@@ -952,6 +1271,7 @@ def assistant_menu_markup():
         [InlineKeyboardButton("🎓 جدولي الدراسي", callback_data="student_schedule_help"), InlineKeyboardButton("🗓️ اختباراتي ومواعيدي", callback_data="student_events_help")],
         [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تدريبي", callback_data="assistant_quiz_help")],
         [InlineKeyboardButton("📊 استخدامي وخصوصيتي", callback_data="assistant_privacy")],
+        [InlineKeyboardButton("💬 الاستفسارات العامة (خاص)", callback_data="inquiry_start")],
         [InlineKeyboardButton("🛡️ لوحة حماية القروبات", callback_data="assistant_group_panel")]
     ])
 
@@ -1408,8 +1728,10 @@ async def assistant_private_text(update, context):
     msg = update.effective_message
     if not user or not chat or chat.type != ChatType.PRIVATE or not msg or not msg.text:
         return
-    # Do not consume messages used by existing owner/panel workflows.
-    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation"):
+    # Do not answer workflow drafts as if they were ordinary assistant prompts.
+    if context.user_data.pop("_skip_assistant_private_message_id", None) == msg.message_id:
+        return
+    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_channel_broadcast"):
         return
     remember_assistant_user(user)
     answer = await offline_assistant_response(user.id, msg.text)
@@ -1539,6 +1861,20 @@ async def panel(update, context):
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         register_group(chat)
     is_primary_owner = is_owner(uid)
+    if not is_owner(uid) and not is_delegated_owner(uid):
+        # Staff see a compact personal dashboard; action-level callbacks still enforce scoped permissions.
+        await update.effective_message.reply_text(
+            f"🧭 لوحة المشرف الشخصية\n\nالصلاحية: {role_name(uid)}\n"
+            "تظهر لك أدوات الإدارة المسموحة فقط. ملاحظاتك وخدماتك خاصة بحسابك.\n"
+            "استخدم صندوق الاستفسارات للتواصل بسرية مع المالك، وزر الإشعارات لمراجعة التعليمات.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛡️ حماية القروبات", callback_data="security_groups"), InlineKeyboardButton("🎮 الألعاب", callback_data="games")],
+                [InlineKeyboardButton("🧮 الحاسبة", callback_data="staff_calculator"), InlineKeyboardButton("📝 مذكرتي", callback_data="staff_note_start")],
+                [InlineKeyboardButton("📨 استفسار خاص للمالك", callback_data="staff_inquiry_start"), InlineKeyboardButton("🔔 إشعاراتي", callback_data="staff_notifications")],
+                [InlineKeyboardButton("⬅️ الخدمات الشخصية", callback_data="assistant_privacy")]
+            ])
+        )
+        return
     panel_intro = (
         "👑 لوحة التحكم الرئيسية\n\n"
         f"الصلاحية: {role_name(uid)}\n\n"
@@ -2059,6 +2395,30 @@ async def locks(update, context):
         settings_text(0),
         reply_markup=settings_page_markup(update.effective_chat.id, 0)
     )
+
+BULK_SECURITY_OPTIONS = [
+    ("🔗 الروابط", "links"), ("🖼️ الصور", "photos"), ("🎥 الفيديو", "videos"),
+    ("🔊 الصوت", "audio"), ("📁 الملفات", "files"), ("🎭 الملصقات", "stickers"),
+    ("🎞️ الصور المتحركة", "gif"), ("🏷️ أسماء المستخدمين", "username"),
+    ("📣 الإشارات والتاق", "tag"), ("🤖 البوتات", "bots"), ("⌨️ الكيبورد", "keyboard"),
+    ("🎮 الألعاب", "games"), ("🔁 تكرار الرسائل", "repeat"), ("🚪 الدخول", "join_lock"),
+    ("👋 رسائل الدخول", "entry"), ("➕ إضافة الأعضاء", "add_lock"), ("✏️ تعديل الرسائل", "edit"),
+    ("🧯 إغراق الرسائل", "flood"),
+]
+
+def bulk_security_groups_markup(groups, selected):
+    rows = [[InlineKeyboardButton(("✅ " if cid in selected else "⬜ ") + (title or str(cid)), callback_data=f"bulksec_toggle:{cid}")] for cid,title in groups[:45]]
+    rows.append([InlineKeyboardButton("✅ تحديد الكل", callback_data="bulksec_all"), InlineKeyboardButton("🧹 إلغاء التحديد", callback_data="bulksec_none")])
+    rows.append([InlineKeyboardButton(f"➡️ اختيار الأمر ({len(selected)})", callback_data="bulksec_actions")])
+    rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+def bulk_security_actions_markup():
+    rows=[]
+    for label, field in BULK_SECURITY_OPTIONS:
+        rows.append([InlineKeyboardButton("🔒 قفل " + label, callback_data=f"bulksec_do:{field}:1"), InlineKeyboardButton("🔓 فتح " + label, callback_data=f"bulksec_do:{field}:0")])
+    rows.append([InlineKeyboardButton("⬅️ اختيار القروبات", callback_data="bulk_security")])
+    return InlineKeyboardMarkup(rows)
 
 async def public_settings(update, context):
     """Public, Arabic help menu for every group member; never exposes admin controls."""
@@ -2771,11 +3131,155 @@ def update_manager_markup():
     return InlineKeyboardMarkup(rows)
 
 
+async def safe_callback_answer(q, *args, **kwargs):
+    """Answer a callback query without letting a duplicate answer abort its action."""
+    try:
+        await q.answer(*args, **kwargs)
+    except BadRequest as exc:
+        # A global acknowledgement plus a branch-specific alert can attempt to
+        # answer the same query twice. The game/action must still finish.
+        log.debug("Callback query already answered or no longer valid: %s", exc)
+
+
 async def callback(update, context):
     q = update.callback_query
-    await q.answer()
+    await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "staff_inquiry_start":
+        if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid) or db.execute("SELECT 1 FROM group_roles WHERE user_id=? LIMIT 1",(uid,)).fetchone()):
+            await safe_callback_answer(q,"هذه الخدمة للطاقم المصرح له فقط.",show_alert=True); return
+        context.user_data["awaiting_staff_inquiry"]=True
+        await q.message.reply_text("🔒 اكتب استفسارك الخاص للمالك. لا يظهر لبقية المشرفين أو في القروبات. /cancel للإلغاء."); return
+    if data == "staff_inquiries_inbox":
+        if not is_owner(uid): await safe_callback_answer(q,"هذا الصندوق للمالك الأساسي فقط.",show_alert=True); return
+        rows=db.execute("SELECT id,display_name,status FROM staff_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 30").fetchall()
+        kb=[[InlineKeyboardButton(f"#{iid} · {name or 'طاقم'} · {status}",callback_data=f"staff_inquiry_view:{iid}")] for iid,name,status in rows]
+        kb.append([InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")])
+        await q.edit_message_text("🗂️ صندوق استفسارات الطاقم — خاص بالمالك الأساسي",reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("staff_inquiry_view:"):
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        iid=int(data.split(":",1)[1]); row=db.execute("SELECT user_id,display_name,role_label,inquiry_text,status FROM staff_inquiries WHERE id=?",(iid,)).fetchone()
+        if not row: await safe_callback_answer(q,"الطلب غير موجود.",show_alert=True); return
+        await q.edit_message_text(f"🗂️ استفسار الطاقم #{iid}\nالاسم: {row[1]}\nالدور: {row[2]}\nالمعرّف: {row[0]}\nالحالة: {row[4]}\n\n{row[3]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"staff_inquiry_reply:{iid}"),InlineKeyboardButton("✅ إغلاق",callback_data=f"staff_inquiry_close:{iid}")],[InlineKeyboardButton("⬅️ الصندوق",callback_data="staff_inquiries_inbox")]])); return
+    if data.startswith("staff_inquiry_reply:"):
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        iid=int(data.split(":",1)[1]); context.user_data["staff_inquiry_reply_id"]=iid
+        await q.message.reply_text(f"✍️ أرسل ردك الخاص على استفسار الطاقم #{iid}. /cancel للإلغاء."); return
+    if data.startswith("staff_inquiry_close:"):
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        iid=int(data.split(":",1)[1]); db.execute("UPDATE staff_inquiries SET status='closed' WHERE id=?",(iid,)); db.commit()
+        await q.edit_message_text(f"✅ تم إغلاق الاستفسار #{iid}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ صندوق الطاقم",callback_data="staff_inquiries_inbox")]])); return
+    if data == "staff_notify_start":
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        context.user_data["awaiting_staff_notice"]=True
+        await q.message.reply_text("📣 أرسل إشعارًا فرديًا بالصيغة:\nرقم_المستخدم | عنوان | نص الرسالة\n/cancel للإلغاء."); return
+    if data == "staff_notifications":
+        rows=db.execute("SELECT id,title,body,created_at FROM staff_notifications WHERE user_id=? ORDER BY id DESC LIMIT 15",(uid,)).fetchall()
+        if not rows: await q.edit_message_text("🔔 لا توجد إشعارات جديدة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+        lines=[f"• #{i} {title} — {created}\n{body[:250]}" for i,title,body,created in rows]
+        db.execute("UPDATE staff_notifications SET read_at=? WHERE user_id=? AND read_at=''",(now(),uid)); db.commit()
+        await q.edit_message_text("🔔 إشعاراتي\n\n"+"\n\n".join(lines)[:3900],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+    if data == "staff_note_start":
+        context.user_data["awaiting_staff_note"]=True
+        await q.message.reply_text("📝 أرسل نص المذكرة الخاصة بك. لن يراها غيرك. /cancel للإلغاء."); return
+    if data == "staff_calculator":
+        await q.message.reply_text("🧮 الحاسبة: أرسل عملية حسابية بسيطة مثل 125*3 أو 450/5. لا ترسل تعبيرات برمجية.")
+        context.user_data["awaiting_staff_calculation"]=True; return
+    if data == "inquiry_start":
+        if q.message.chat.type != ChatType.PRIVATE:
+            await safe_callback_answer(q, "افتح البوت في الخاص لإرسال استفسار يحفظ الخصوصية.", show_alert=True); return
+        context.user_data["awaiting_general_inquiry"] = True
+        await q.message.reply_text("💬 اكتب استفسارك هنا في الخاص. سيصل إلى المالك الأساسي فقط، ولن يظهر في القروب. أرسل /cancel للإلغاء.")
+        return
+    if data == "inquiries_inbox":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "صندوق الاستفسارات للمالك الأساسي فقط.", show_alert=True); return
+        rows = db.execute("SELECT id,display_name,inquiry_text,status FROM general_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 20").fetchall()
+        if not rows:
+            await q.edit_message_text("📨 لا توجد استفسارات مفتوحة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
+        kb = [[InlineKeyboardButton(f"#{iid} · {name or 'عضو'} · {'جديد' if status=='new' else 'تم الرد' if status=='answered' else status}", callback_data=f"inquiry_view:{iid}")] for iid,name,body,status in rows]
+        kb.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        await q.edit_message_text("📨 صندوق الاستفسارات العامة — المالك الأساسي فقط", reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("inquiry_view:"):
+        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        row=db.execute("SELECT user_id,username,display_name,inquiry_text,status,reply_text FROM general_inquiries WHERE id=?",(iid,)).fetchone()
+        if not row: await safe_callback_answer(q,"الاستفسار غير موجود.",show_alert=True); return
+        await q.edit_message_text(f"📨 الاستفسار #{iid}\nالحالة: {row[4]}\nالاسم: {row[2]}\nالمستخدم: @{row[1] or 'غير متوفر'}\nالمعرّف: {row[0]}\n\n{row[3]}\n\nالرد السابق: {row[5] or 'لا يوجد'}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد", callback_data=f"inquiry_reply:{iid}"),InlineKeyboardButton("✅ إغلاق", callback_data=f"inquiry_close:{iid}")],[InlineKeyboardButton("⬅️ الصندوق",callback_data="inquiries_inbox")]])); return
+    if data.startswith("inquiry_reply:"):
+        if not is_owner(uid): await safe_callback_answer(q,"الرد للمالك الأساسي فقط.",show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        if not db.execute("SELECT 1 FROM general_inquiries WHERE id=?",(iid,)).fetchone(): await safe_callback_answer(q,"الاستفسار غير موجود.",show_alert=True); return
+        context.user_data["inquiry_reply_id"]=iid
+        await q.message.reply_text(f"✍️ أرسل الآن ردك على الاستفسار #{iid} في رسالة واحدة. /cancel للإلغاء.")
+        return
+    if data.startswith("inquiry_close:"):
+        if not is_owner(uid): await safe_callback_answer(q,"الإغلاق للمالك الأساسي فقط.",show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        db.execute("UPDATE general_inquiries SET status='closed' WHERE id=?",(iid,)); db.commit()
+        await safe_callback_answer(q,"تم إغلاق الاستفسار.")
+        try: await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔒 تم الإغلاق",callback_data="noop")]]))
+        except Exception: pass
+        return
+
+    if data == "channels_manage":
+        if not is_owner(uid): await safe_callback_answer(q,"إدارة ربط القنوات والنشر للمالك الأساسي فقط.",show_alert=True); return
+        rows=db.execute("SELECT chat_id,title,username FROM linked_channels ORDER BY title").fetchall()
+        summary="\n".join(f"• {title} (@{username or 'بدون معرف'}) — {cid}" for cid,title,username in rows) or "لا توجد قنوات مرتبطة."
+        await q.edit_message_text("📡 إدارة القنوات والنشر\n\n"+summary+"\n\nلربط قناة: أضف البوت مشرفًا مع صلاحية النشر، ثم أرسل /addchannel @username في الخاص.\nلفك الربط: /delchannel @username\nلعرض القائمة: /channels\n\nالنشر: اختر القنوات ثم أرسل الرسالة واعتمد المعاينة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إلى القنوات",callback_data="channel_pub_start")],[InlineKeyboardButton("🔄 تحديث القائمة",callback_data="channels_manage")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+    if data == "channel_pub_start":
+        if not is_owner(uid): await safe_callback_answer(q,"النشر للقنوات للمالك الأساسي فقط.",show_alert=True); return
+        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
+        if not rows: await q.edit_message_text("لا توجد قنوات مرتبطة. استخدم /addchannel @username بعد منح البوت صلاحية النشر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إدارة القنوات",callback_data="channels_manage")]])); return
+        context.user_data["channel_broadcast_selected"]=[]
+        kb=[[InlineKeyboardButton("⬜ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title in rows[:50]]
+        kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات",callback_data="channel_pub_all")],[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
+        await q.edit_message_text("📡 حدد القنوات التي تريد النشر فيها:",reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("channel_pub_toggle:"):
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        try: cid=int(data.split(":",1)[1])
+        except ValueError: return
+        selected=set(context.user_data.get("channel_broadcast_selected",[]))
+        if cid in selected: selected.remove(cid)
+        else: selected.add(cid)
+        context.user_data["channel_broadcast_selected"]=sorted(selected)
+        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
+        kb=[[InlineKeyboardButton(("✅ " if x in selected else "⬜ ")+title,callback_data=f"channel_pub_toggle:{x}")] for x,title in rows[:50]]
+        kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات",callback_data="channel_pub_all")],[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb)); return
+    if data == "channel_pub_all":
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        context.user_data["channel_broadcast_selected"]=[r[0] for r in db.execute("SELECT chat_id FROM linked_channels ORDER BY title").fetchall()]
+        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
+        kb=[[InlineKeyboardButton("✅ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title in rows[:50]]
+        kb += [[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb)); return
+    if data == "channel_pub_prepare":
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        selected=context.user_data.get("channel_broadcast_selected",[])
+        if not selected: await safe_callback_answer(q,"حدد قناة واحدة على الأقل.",show_alert=True); return
+        context.user_data["awaiting_channel_broadcast"]=True
+        await q.edit_message_text(f"أرسل الآن في الخاص الرسالة أو الصورة أو الفيديو الذي تريد نشره في {len(selected)} قناة. ستظهر معاينة قبل النشر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]])); return
+    if data == "channel_pub_confirm":
+        if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
+        draft=context.user_data.get("channel_broadcast_draft")
+        selected=context.user_data.get("channel_broadcast_selected",[])
+        if not draft or not selected: await q.edit_message_text("انتهت صلاحية مسودة النشر. ابدأ من جديد."); return
+        sent=failed=0
+        for cid in selected:
+            if not db.execute("SELECT 1 FROM linked_channels WHERE chat_id=?",(cid,)).fetchone(): continue
+            try: await context.bot.copy_message(chat_id=cid,from_chat_id=draft["chat_id"],message_id=draft["message_id"]); sent+=1
+            except Exception as exc: failed+=1; log.warning("Channel publish failed %s: %s",cid,exc)
+        for key in ("channel_broadcast_draft","channel_broadcast_selected","awaiting_channel_broadcast"): context.user_data.pop(key,None)
+        await q.edit_message_text(f"✅ انتهى النشر للقنوات.\nنجح: {sent}\nتعذر: {failed}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📡 إدارة القنوات",callback_data="channels_manage")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+    if data == "channel_pub_cancel":
+        for key in ("channel_broadcast_draft","channel_broadcast_selected","awaiting_channel_broadcast"): context.user_data.pop(key,None)
+        await q.edit_message_text("تم إلغاء النشر للقنوات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📡 إدارة القنوات",callback_data="channels_manage")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
 
     # نشر آخر نسخة من المستودع على Render متاح للمالك الأساسي فقط.
     if data in ("update_manager", "update_deploy_latest"):
@@ -2822,7 +3326,7 @@ async def callback(update, context):
     # استدعاء التاق: المالك الأساسي والمفوّض لهما الصلاحية نفسها على القروبات المسجلة.
     if data.startswith(("owner_tag_groups", "owner_tag_toggle:", "owner_tag_all", "owner_tag_send")):
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذه الميزة للمالك الأساسي والمفوّض فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذه الميزة للمالك الأساسي والمفوّض فقط.", show_alert=True)
             return
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
         if data == "owner_tag_groups":
@@ -2837,9 +3341,9 @@ async def callback(update, context):
             try:
                 cid = int(data.split(":",1)[1])
             except ValueError:
-                await q.answer("معرّف قروب غير صحيح.", show_alert=True); return
+                await safe_callback_answer(q, "معرّف قروب غير صحيح.", show_alert=True); return
             if not any(row[0] == cid for row in groups):
-                await q.answer("القروب غير مسجل.", show_alert=True); return
+                await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
             selected = context.user_data.setdefault("owner_tag_selected", [])
             if cid in selected: selected.remove(cid)
             else: selected.append(cid)
@@ -2860,7 +3364,7 @@ async def callback(update, context):
             selected = context.user_data.get("owner_tag_selected", [])
             selected = [cid for cid in selected if any(row[0] == cid for row in groups)]
             if not selected:
-                await q.answer("حدد قروبًا واحدًا على الأقل.", show_alert=True); return
+                await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل.", show_alert=True); return
             sent_groups = failed_groups = mentioned_total = 0
             empty_groups = 0
             for cid in selected:
@@ -2916,13 +3420,13 @@ async def callback(update, context):
             action, chat_raw = data.split(":", 1)
             group_chat_id = int(chat_raw)
         except (ValueError, TypeError):
-            await q.answer("بيانات القروب غير صحيحة.", show_alert=True)
+            await safe_callback_answer(q, "بيانات القروب غير صحيحة.", show_alert=True)
             return
         if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
-            await q.answer("هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
-            await q.answer("القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
+            await safe_callback_answer(q, "القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
             return
         if action == "group_panel_toggle_links":
             current = get_settings(group_chat_id).get("links", 0)
@@ -2948,7 +3452,7 @@ async def callback(update, context):
                 label = html.escape((display_name or "عضو").replace("\n", " ")[:80])
                 mentions.append(f'<a href="tg://user?id={member_id}">{label}</a>')
             if not mentions:
-                await q.answer("لا توجد معرّفات أعضاء مسجلة لهذا القروب بعد.", show_alert=True)
+                await safe_callback_answer(q, "لا توجد معرّفات أعضاء مسجلة لهذا القروب بعد.", show_alert=True)
                 return
             chunks, current = [], "📣 استدعاء أعضاء القروب\n"
             for mention in mentions:
@@ -2966,9 +3470,9 @@ async def callback(update, context):
                     await asyncio.sleep(0.08)
             except Exception as exc:
                 log.warning("Local group mass mention failed for %s: %s", group_chat_id, exc)
-                await q.answer("تعذر إكمال الإرسال. تحقق من صلاحيات البوت وحدود تيليجرام.", show_alert=True)
+                await safe_callback_answer(q, "تعذر إكمال الإرسال. تحقق من صلاحيات البوت وحدود تيليجرام.", show_alert=True)
                 return
-            await q.answer(f"تم إرسال {len(mentions)} منشن مسجل.", show_alert=True)
+            await safe_callback_answer(q, f"تم إرسال {len(mentions)} منشن مسجل.", show_alert=True)
             return
         if action == "group_panel_home":
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
@@ -3058,22 +3562,22 @@ async def callback(update, context):
 
     if data.startswith("reentry_warn:"):
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذه الصلاحية للمالك والمفوّض فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذه الصلاحية للمالك والمفوّض فقط.", show_alert=True)
             return
         try:
             _, chat_raw, user_raw = data.split(":", 2)
             target_chat, target_user = int(chat_raw), int(user_raw)
         except (ValueError, TypeError):
-            await q.answer("بيانات الإنذار غير صحيحة.", show_alert=True)
+            await safe_callback_answer(q, "بيانات الإنذار غير صحيحة.", show_alert=True)
             return
         restriction = db.execute("SELECT display_name, username, status FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (target_chat, target_user)).fetchone()
         if not restriction:
-            await q.answer("لا يوجد سجل عودة لهذا العضو.", show_alert=True)
+            await safe_callback_answer(q, "لا يوجد سجل عودة لهذا العضو.", show_alert=True)
             return
         row = db.execute("SELECT warning_count FROM member_security_warnings WHERE chat_id=? AND user_id=?", (target_chat, target_user)).fetchone()
         count = row[0] if row else 0
         if count >= 3:
-            await q.answer("وصل الحد الأعلى: 3 إنذارات.", show_alert=True)
+            await safe_callback_answer(q, "وصل الحد الأعلى: 3 إنذارات.", show_alert=True)
             return
         count += 1
         db.execute("""INSERT INTO member_security_warnings(chat_id,user_id,warning_count,last_reason,updated_at)
@@ -3082,7 +3586,7 @@ async def callback(update, context):
             (target_chat, target_user, count, restriction[2] or "مغادرة/طرد", now()))
         db.commit()
         log_action(target_chat, target_user, "member_security_warning", f"count={count}; by={uid}")
-        await q.answer(f"تم تسجيل الإنذار {count}/3")
+        await safe_callback_answer(q, f"تم تسجيل الإنذار {count}/3")
         try:
             await q.edit_message_text((q.message.text or "") + f"\\n\\n⚠️ الإنذارات المسجلة: {count}/3\\nسجّل الإنذار: {uid}")
         except Exception as exc:
@@ -3130,13 +3634,13 @@ async def callback(update, context):
 
     if data == "owner_autoreplies":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         groups = await accessible_groups(context.bot, uid)
         await q.edit_message_text("💬 إدارة الردود الآلية\n\nاختر القروب الذي تريد إضافة ردوده أو تعديلها. التغييرات تحفظ في قاعدة البيانات وتعمل تلقائيًا داخل القروب.", reply_markup=owner_autoreply_groups_markup(groups)); return
 
     if data == "owner_ar_all":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         groups = await accessible_groups(context.bot, uid)
         enabled_count = db.execute("SELECT COUNT(*) FROM auto_reply_settings WHERE enabled=1").fetchone()[0]
         rows = [
@@ -3158,7 +3662,7 @@ async def callback(update, context):
 
     if data in ("owner_ar_add_all", "owner_ar_edit_all"):
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         context.user_data["owner_autoreply_state"] = {
             "action": "add_all" if data == "owner_ar_add_all" else "edit_all",
             "chat_id": None
@@ -3174,7 +3678,7 @@ async def callback(update, context):
 
     if data == "owner_ar_delete_all":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         context.user_data["owner_autoreply_state"] = {"action": "delete_all", "chat_id": None}
         await q.edit_message_text(
             "أرسل العبارة المطابقة تمامًا لحذفها من جميع القروبات المسجلة.\n"
@@ -3184,14 +3688,14 @@ async def callback(update, context):
 
     if data in ("owner_ar_on_all", "owner_ar_off_all"):
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القسم للمالك أو المالك المفوّض فقط.", show_alert=True); return
         groups = db.execute("SELECT chat_id FROM watched_groups").fetchall()
         enabled = 1 if data == "owner_ar_on_all" else 0
         for (group_id,) in groups:
             ensure_auto_replies(group_id)
             db.execute("UPDATE auto_reply_settings SET enabled=? WHERE chat_id=?", (enabled, group_id))
         db.commit()
-        await q.answer(f"تم {'تشغيل' if enabled else 'إيقاف'} الردود في {len(groups)} قروب.")
+        await safe_callback_answer(q, f"تم {'تشغيل' if enabled else 'إيقاف'} الردود في {len(groups)} قروب.")
         await q.edit_message_text(
             f"✅ تم {'تشغيل' if enabled else 'إيقاف'} الردود الآلية في جميع القروبات المسجلة ({len(groups)}).",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إدارة الردود الموحدة", callback_data="owner_ar_all")],
@@ -3199,9 +3703,9 @@ async def callback(update, context):
         return
 
     if data.startswith("owner_ar_group:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await safe_callback_answer(q, "للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "رقم القروب غير صحيح.", show_alert=True); return
         ensure_auto_replies(chat_id)
         state = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (chat_id,)).fetchone()
         rules = db.execute("SELECT trigger_text,reply_text,enabled FROM auto_replies WHERE chat_id=? ORDER BY trigger_text", (chat_id,)).fetchall()
@@ -3213,18 +3717,18 @@ async def callback(update, context):
         await q.edit_message_text("\n".join(lines)[:3500], reply_markup=InlineKeyboardMarkup(buttons)); return
 
     if data.startswith(("owner_ar_add:", "owner_ar_edit:")):
-        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await safe_callback_answer(q, "للمالك أو المالك المفوّض فقط.", show_alert=True); return
         action, raw_id = data.split(":",1)
         try: chat_id = int(raw_id)
-        except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "رقم القروب غير صحيح.", show_alert=True); return
         context.user_data["owner_autoreply_state"] = {"action": "add" if action.endswith("add") else "edit", "chat_id": chat_id}
         prompt = "أرسل الآن العبارة والرد بهذا الشكل:\nالعبارة | الرد الذي سيظهر في القروب\n\nمثال: وين البوت؟ | أنا بوت حماية القروبات 🛡️\nاكتب /cancel للإلغاء."
         await q.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"owner_ar_group:{chat_id}")]])); return
 
     if data.startswith("owner_ar_delete:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await safe_callback_answer(q, "للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "رقم القروب غير صحيح.", show_alert=True); return
         rules = db.execute("SELECT trigger_text FROM auto_replies WHERE chat_id=? ORDER BY trigger_text", (chat_id,)).fetchall()
         rows = [[InlineKeyboardButton(f"🗑️ {trigger[:50]}", callback_data=f"owner_ar_delone:{chat_id}:{i}")] for i,(trigger,) in enumerate(rules[:40])]
         context.user_data["owner_ar_delete_choices"] = {"chat_id": chat_id, "triggers": [r[0] for r in rules[:40]]}
@@ -3232,16 +3736,16 @@ async def callback(update, context):
         await q.edit_message_text("اختر الرد الذي تريد حذفه:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("owner_ar_delone:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await safe_callback_answer(q, "للمالك أو المالك المفوّض فقط.", show_alert=True); return
         try:
             _, chat_raw, index_raw = data.split(":",2); chat_id=int(chat_raw); idx=int(index_raw)
             choices=context.user_data.get("owner_ar_delete_choices", {})
             trigger=choices["triggers"][idx]
             if choices.get("chat_id") != chat_id: raise ValueError()
-        except (ValueError, KeyError, IndexError): await q.answer("انتهت صلاحية القائمة. افتحها مجددًا.", show_alert=True); return
+        except (ValueError, KeyError, IndexError): await safe_callback_answer(q, "انتهت صلاحية القائمة. افتحها مجددًا.", show_alert=True); return
         db.execute("DELETE FROM auto_replies WHERE chat_id=? AND trigger_text=?", (chat_id, trigger)); db.commit()
         log_action(chat_id, uid, "auto_reply_deleted", trigger)
-        await q.answer("تم حذف الرد.")
+        await safe_callback_answer(q, "تم حذف الرد.")
         context.user_data.pop("owner_ar_delete_choices", None)
         state = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (chat_id,)).fetchone()
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title=title_row[0] if title_row else str(chat_id)
@@ -3251,14 +3755,14 @@ async def callback(update, context):
         await q.edit_message_text("\n".join(lines)[:3500], reply_markup=InlineKeyboardMarkup(buttons)); return
 
     if data.startswith(("owner_ar_on:", "owner_ar_off:")):
-        if not (is_owner(uid) or is_delegated_owner(uid)): await q.answer("للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid)): await safe_callback_answer(q, "للمالك أو المالك المفوّض فقط.", show_alert=True); return
         action, raw_id=data.split(":",1)
         try: chat_id=int(raw_id)
-        except ValueError: await q.answer("رقم القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "رقم القروب غير صحيح.", show_alert=True); return
         ensure_auto_replies(chat_id)
         enabled = 1 if action.endswith("on") else 0
         db.execute("UPDATE auto_reply_settings SET enabled=? WHERE chat_id=?", (enabled,chat_id)); db.commit()
-        await q.answer("تم تشغيل الردود." if enabled else "تم إيقاف الردود.")
+        await safe_callback_answer(q, "تم تشغيل الردود." if enabled else "تم إيقاف الردود.")
         title_row=db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title=title_row[0] if title_row else str(chat_id)
         rules=db.execute("SELECT trigger_text,reply_text,enabled FROM auto_replies WHERE chat_id=? ORDER BY trigger_text", (chat_id,)).fetchall()
         lines=[f"💬 الردود الآلية — {title}", f"الحالة العامة: {'🟢 مفعّلة' if enabled else '⏸️ متوقفة'}", ""]+[f"{'✅' if en else '⏸️'} {tr} ← {rep}" for tr,rep,en in rules[:35]]
@@ -3303,13 +3807,13 @@ async def callback(update, context):
             _, chat_raw, user_raw = data.split(":", 2)
             chat_id, target_uid = int(chat_raw), int(user_raw)
         except ValueError:
-            await q.answer("بيانات التحقق غير صحيحة.", show_alert=True)
+            await safe_callback_answer(q, "بيانات التحقق غير صحيحة.", show_alert=True)
             return
         if uid != target_uid:
-            await q.answer("زر التحقق مخصص للعضو الجديد فقط.", show_alert=True)
+            await safe_callback_answer(q, "زر التحقق مخصص للعضو الجديد فقط.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM pending_verifications WHERE chat_id=? AND user_id=?", (chat_id, target_uid)).fetchone():
-            await q.answer("تم التحقق مسبقًا أو انتهت المهلة.", show_alert=True)
+            await safe_callback_answer(q, "تم التحقق مسبقًا أو انتهت المهلة.", show_alert=True)
             return
         try:
             await context.bot.restrict_chat_member(
@@ -3325,11 +3829,11 @@ async def callback(update, context):
             await q.edit_message_text("✅ تم التحقق بنجاح، أهلًا بك في القروب!")
         except Exception as exc:
             log.warning("تعذر إكمال التحقق للعضو %s في %s: %s", target_uid, chat_id, exc)
-            await q.answer("تعذر إكمال التحقق. أبلغ مشرف القروب ليتأكد من صلاحيات البوت.", show_alert=True)
+            await safe_callback_answer(q, "تعذر إكمال التحقق. أبلغ مشرف القروب ليتأكد من صلاحيات البوت.", show_alert=True)
         return
 
     if data == "noop" or data.startswith("noop:"):
-        await q.answer("هذا الخيار للتوضيح فقط.", show_alert=False)
+        await safe_callback_answer(q, "هذا الخيار للتوضيح فقط.", show_alert=False)
         return
 
     if data == "media_admin":
@@ -3345,11 +3849,11 @@ async def callback(update, context):
     if data.startswith("media_group:"):
         try: chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
-            await q.answer("التعطيل متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
+            await safe_callback_answer(q, "التعطيل متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,)); db.commit()
         enabled = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -3361,15 +3865,15 @@ async def callback(update, context):
     if data.startswith("media_toggle:"):
         try: chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
-            await q.answer("لا تملك صلاحية تعطيل الوسائط.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية تعطيل الوسائط.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,))
         current = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
         db.execute("UPDATE media_config SET enabled=? WHERE chat_id=?", (0 if current else 1, chat_id)); db.commit()
-        await q.answer("تم إيقاف مركز الوسائط." if current else "تم تشغيل مركز الوسائط للأعضاء.")
+        await safe_callback_answer(q, "تم إيقاف مركز الوسائط." if current else "تم تشغيل مركز الوسائط للأعضاء.")
         # Return to the group control page with current state.
         enabled = 0 if current else 1
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
@@ -3380,9 +3884,9 @@ async def callback(update, context):
     if data.startswith("member_media:"):
         try: chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await q.answer("هذا القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "هذا القروب غير مسجل.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO media_config(chat_id,enabled) VALUES(?,1)", (chat_id,)); db.commit()
         enabled = db.execute("SELECT enabled FROM media_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
         if not enabled:
@@ -3402,10 +3906,10 @@ async def callback(update, context):
         try:
             chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True)
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await q.answer("هذا القروب غير مسجل.", show_alert=True)
+            await safe_callback_answer(q, "هذا القروب غير مسجل.", show_alert=True)
             return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         db.commit()
@@ -3419,7 +3923,7 @@ async def callback(update, context):
         persistent_buttons = [InlineKeyboardButton(meta["title"], callback_data=f"persistent_game:{key}:{chat_id}") for key, meta in PERSISTENT_GAMES.items()]
         rows.extend([persistent_buttons[i:i+2] for i in range(0, len(persistent_buttons), 2)])
         rows.append([InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")])
-        await q.edit_message_text("🎮 مركز الألعاب والتحديات\n\nاختر اللعبة التي تريد المشاركة فيها:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("🎮 مركز الألعاب والتحديات\n\nاختر اللعبة التي تريد المشاركة فيها. بنك الأسئلة والمعلومات مدمج داخل البوت ويعمل دون اتصال بخدمة ذكاء اصطناعي:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data == "public:commands":
@@ -3490,7 +3994,7 @@ async def callback(update, context):
 
     if data == "owner_backup":
         if not is_owner(uid):
-            await q.answer("⛔ النسخ الاحتياطي للمالك الأساسي فقط.", show_alert=True)
+            await safe_callback_answer(q, "⛔ النسخ الاحتياطي للمالك الأساسي فقط.", show_alert=True)
             return
         # Create a consistent SQLite snapshot without exposing the live database file.
         backup_path = None
@@ -3521,7 +4025,7 @@ async def callback(update, context):
 
     if data == "owner_system":
         if not is_owner(uid):
-            await q.answer("⛔ إعدادات النظام العليا للمالك الأساسي فقط.", show_alert=True)
+            await safe_callback_answer(q, "⛔ إعدادات النظام العليا للمالك الأساسي فقط.", show_alert=True)
             return
         groups_count = db.execute("SELECT COUNT(*) FROM watched_groups").fetchone()[0]
         delegated_count = db.execute("SELECT COUNT(*) FROM delegated_owners").fetchone()[0]
@@ -3548,9 +4052,9 @@ async def callback(update, context):
 
     if data.startswith("settings_group:"):
         try: chat_id = int(data.split(":", 1)[1])
-        except ValueError: await q.answer("معرّف القروب غير صحيح", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
         await q.edit_message_text(settings_text(0), reply_markup=settings_page_markup(chat_id, 0))
         return
 
@@ -3559,9 +4063,9 @@ async def callback(update, context):
         try:
             if len(parts) == 3: chat_id, page = int(parts[1]), int(parts[2])
             else: chat_id, page = q.message.chat.id, int(parts[1])
-        except ValueError: await q.answer("بيانات الإعدادات غير صحيحة", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات الإعدادات غير صحيحة", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية إعدادات هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية إعدادات هذا القروب.", show_alert=True); return
         back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
         await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
         return
@@ -3571,15 +4075,119 @@ async def callback(update, context):
         try:
             if len(parts) == 4: chat_id, field, page = int(parts[1]), parts[2], int(parts[3])
             else: field, page, chat_id = parts[1], int(parts[2]), q.message.chat.id
-        except (ValueError, IndexError): await q.answer("بيانات الإعداد غير صحيحة", show_alert=True); return
+        except (ValueError, IndexError): await safe_callback_answer(q, "بيانات الإعداد غير صحيحة", show_alert=True); return
         if field not in SETTING_FIELDS or not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("ليس لديك صلاحية تغيير هذا الإعداد.", show_alert=True); return
+            await safe_callback_answer(q, "ليس لديك صلاحية تغيير هذا الإعداد.", show_alert=True); return
         s = get_settings(chat_id)
         new_value = 0 if s[field] else 1
         set_setting(chat_id, field, new_value)
         log_action(chat_id, uid, "setting", f"{field}={new_value}")
         back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
         await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
+        return
+
+    if data == "bulk_security":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "أوامر الحماية الجماعية للمالك أو المالك المفوّض فقط.", show_alert=True); return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        selected = set(context.user_data.get("bulk_security_selected", []))
+        selected.intersection_update({cid for cid,_ in groups})
+        context.user_data["bulk_security_selected"] = list(selected)
+        await q.edit_message_text(
+            "⚡ أوامر الحماية الجماعية\n\nاختر القروبات التي تريد تنفيذ الأمر عليها، أو حدّد الكل. بعد اختيار نوع الأمر سيطبّقه البوت ويحاول نشر إشعار عام داخل كل قروب.\n\n"
+            f"القروبات المحددة: {len(selected)} من {len(groups)}",
+            reply_markup=bulk_security_groups_markup(groups, selected))
+        return
+
+    if data.startswith("bulksec_toggle:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        try: cid = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone():
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
+        selected=set(context.user_data.get("bulk_security_selected", []))
+        if cid in selected: selected.remove(cid)
+        else: selected.add(cid)
+        context.user_data["bulk_security_selected"]=list(selected)
+        groups=db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        await q.edit_message_text(f"⚡ أوامر الحماية الجماعية\n\nالقروبات المحددة: {len(selected)} من {len(groups)}", reply_markup=bulk_security_groups_markup(groups,selected)); return
+
+    if data in ("bulksec_all", "bulksec_none"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        selected=[cid for cid,_ in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()] if data=="bulksec_all" else []
+        context.user_data["bulk_security_selected"]=selected
+        groups=db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        await q.edit_message_text(f"⚡ أوامر الحماية الجماعية\n\nالقروبات المحددة: {len(selected)} من {len(groups)}", reply_markup=bulk_security_groups_markup(groups,set(selected))); return
+
+    if data == "bulksec_actions":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        selected=context.user_data.get("bulk_security_selected", [])
+        if not selected:
+            await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل أولًا.", show_alert=True); return
+        await q.edit_message_text(f"اختر الأمر المطلوب تنفيذه على {len(selected)} قروب.\nسيُحدّث البوت الإعدادات ويحاول نشر إشعار عام بالقروب.", reply_markup=bulk_security_actions_markup()); return
+
+    if data.startswith("bulksec_do:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        context.user_data["pending_bulk_security_action"] = data
+        try:
+            _, field, raw_value = data.split(":",2); value=int(raw_value)
+            if field not in SETTING_FIELDS or value not in (0,1): raise ValueError()
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "الأمر غير صحيح.", show_alert=True); return
+        selected=context.user_data.get("bulk_security_selected", [])
+        label=dict((f,l) for l,f in BULK_SECURITY_OPTIONS).get(field,field)
+        await q.edit_message_text(f"⚠️ تأكيد أمر الحماية\n\nالإجراء: {'قفل' if value else 'فتح'} {label}\nعدد القروبات: {len(selected)}\n\nهل تريد تنفيذ الأمر الآن؟",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأكيد التنفيذ",callback_data="bulksec_confirm"),InlineKeyboardButton("❌ إلغاء",callback_data="bulksec_cancel")]]))
+        return
+    if data == "bulksec_cancel":
+        context.user_data.pop("pending_bulk_security_action",None)
+        await q.edit_message_text("تم إلغاء أمر الحماية دون تطبيقه.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ العودة لأوامر الحماية",callback_data="bulk_security")]])); return
+    if data == "bulksec_confirm":
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q,"غير مصرح لك.",show_alert=True); return
+        data=context.user_data.pop("pending_bulk_security_action","")
+        if not data.startswith("bulksec_do:"):
+            await safe_callback_answer(q,"لا يوجد أمر بانتظار التأكيد.",show_alert=True); return
+        # Fall through to the validated bulksec_do execution block below.
+    if data.startswith("bulksec_do:"):
+        if not (is_owner(uid) or is_delegated_owner(uid)):
+            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        try:
+            _, field, raw_value = data.split(":",2); value=int(raw_value)
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "الأمر غير صحيح.", show_alert=True); return
+        if field not in SETTING_FIELDS or value not in (0,1) or field not in dict((f,l) for l,f in BULK_SECURITY_OPTIONS):
+            await safe_callback_answer(q, "هذا الإعداد غير متاح للأوامر الجماعية.", show_alert=True); return
+        selected=list(dict.fromkeys(context.user_data.get("bulk_security_selected", [])))
+        if not selected:
+            await safe_callback_answer(q, "انتهى التحديد؛ اختر القروبات من جديد.", show_alert=True); return
+        option_label=dict((f,l) for l,f in BULK_SECURITY_OPTIONS)[field]
+        verb="قفل" if value else "فتح"
+        announcement=f"{'🔒' if value else '🔓'} أمر إداري: تم {verb} {option_label} بواسطة إدارة البوت."
+        success=0; failed=0; announced=0
+        for cid in selected:
+            if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone():
+                failed += 1; continue
+            try:
+                set_setting(cid, field, value)
+                log_action(cid, uid, "bulk_setting", f"{field}={value}")
+                success += 1
+                try:
+                    await context.bot.send_message(chat_id=cid, text=announcement)
+                    announced += 1
+                except Exception as send_exc:
+                    log.info("Setting updated but public notice failed for %s: %s", cid, send_exc)
+            except Exception as exc:
+                failed += 1; log.exception("Bulk security setting failed for %s: %s", cid, exc)
+        await safe_callback_answer(q, "اكتمل تنفيذ الأمر.")
+        await q.edit_message_text(
+            f"✅ نتيجة الأمر الجماعي\n\nالإجراء: {verb} {option_label}\n"
+            f"تم تطبيق الإعدادات: {success} قروب\nتم نشر الإشعار العام: {announced} قروب\nتعذر التنفيذ: {failed} قروب\n\n"
+            "إذا تعذر نشر الإشعار، فقد يكون البوت لا يملك صلاحية إرسال الرسائل في ذلك القروب؛ راجع صلاحياته.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ أمر جماعي آخر", callback_data="bulk_security")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
         return
 
     if data in ("security", "security_groups"):
@@ -3602,9 +4210,9 @@ async def callback(update, context):
 
     if data.startswith("admin_group:"):
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية هذا القروب", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية هذا القروب", show_alert=True); return
         title = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         await q.edit_message_text(
             f"🔨 إدارة القروب — {title[0] if title else chat_id}\n\n"
@@ -3624,12 +4232,12 @@ async def callback(update, context):
     if data.startswith("admin_action:"):
         parts = data.split(":")
         if len(parts) != 3 or parts[1] not in {"ban", "unban", "kick", "mute", "unmute", "delete", "pin"}:
-            await q.answer("الإجراء غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "الإجراء غير صحيح.", show_alert=True); return
         action = parts[1]
         try: chat_id = int(parts[2])
-        except ValueError: await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
         context.user_data["awaiting_admin_action"] = {"action": action, "chat_id": chat_id}
         labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها"}
         action_group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -3667,9 +4275,9 @@ async def callback(update, context):
 
     if data.startswith("games_group:"):
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف القروب غير صحيح.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية الوصول لهذا القروب.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,)); db.commit()
         cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -3693,19 +4301,19 @@ async def callback(update, context):
 
     if data.startswith("game_feature_toggle:"):
         if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
-            await q.answer("إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
+            await safe_callback_answer(q, "إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
         try:
             _, chat_raw, feature = data.split(":", 2)
             chat_id = int(chat_raw)
         except (ValueError, TypeError):
-            await q.answer("تعذر قراءة إعداد اللعبة.", show_alert=True); return
+            await safe_callback_answer(q, "تعذر قراءة إعداد اللعبة.", show_alert=True); return
         allowed_features = {"kingdom","hero","cards","alliance","case","season"}
         if feature not in allowed_features or not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)) or not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية تعديل هذه اللعبة.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية تعديل هذه اللعبة.", show_alert=True); return
         row = db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?", (chat_id, feature)).fetchone()
         new_value = 0 if (row and row[0]) else 1
         db.execute("INSERT INTO persistent_game_flags(chat_id,game_key,enabled) VALUES(?,?,?) ON CONFLICT(chat_id,game_key) DO UPDATE SET enabled=excluded.enabled", (chat_id, feature, new_value)); db.commit()
-        await q.answer("تم إيقاف اللعبة." if not new_value else "تم تشغيل اللعبة.")
+        await safe_callback_answer(q, "تم إيقاف اللعبة." if not new_value else "تم تشغيل اللعبة.")
         # Refresh the management page to show the new state.
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
         cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
@@ -3725,7 +4333,7 @@ async def callback(update, context):
         try:
             _, game_key, chat_raw = data.split(":", 2); chat_id = int(chat_raw)
         except (ValueError, TypeError):
-            await q.answer("بيانات اللعبة غير صحيحة.", show_alert=True); return
+            await safe_callback_answer(q, "بيانات اللعبة غير صحيحة.", show_alert=True); return
         game_names = {
             "kingdom": ("🌍 مملكة القروب", "طوّر مملكتك واجمع الموارد وافتح مناطق جديدة."),
             "hero": ("⚔️ مغامرة البطل", "درّب بطلك وارفع مستواه وواصل التقدم."),
@@ -3735,18 +4343,18 @@ async def callback(update, context):
             "season": ("🏆 موسم التحديات", "أنجز مهمة اليوم وواصل سلسلة إنجازاتك.")
         }
         if game_key not in game_names or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone():
-            await q.answer("اللعبة أو القروب غير متاح.", show_alert=True); return
+            await safe_callback_answer(q, "اللعبة أو القروب غير متاح.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
         if (cfg and not cfg[0]) or (flag and not flag[0]):
-            await q.answer("هذه الألعاب متوقفة حاليًا من لوحة الإدارة.",show_alert=True); return
+            await safe_callback_answer(q, "هذه الألعاب متوقفة حاليًا من لوحة الإدارة.",show_alert=True); return
         uid_player=q.from_user.id; display=q.from_user.full_name or "عضو"; epoch=int(time.time())
         row=db.execute("SELECT progress,coins,last_claim_epoch FROM persistent_game_state WHERE chat_id=? AND user_id=? AND game_key=?",(chat_id,uid_player,game_key)).fetchone()
         progress,coins,last_claim=row if row else (0,0,0)
         title,description=game_names[game_key]
         if epoch-last_claim < 86400:
             remaining=86400-(epoch-last_claim); hours=remaining//3600; minutes=(remaining%3600)//60
-            await q.answer(f"أنجزت مكافأة اليوم. عد بعد {hours} س و{minutes} د.",show_alert=True); return
+            await safe_callback_answer(q, f"أنجزت مكافأة اليوم. عد بعد {hours} س و{minutes} د.",show_alert=True); return
         # تقدم يومي محفوظ مع فصول متدرجة ومهام مختلفة لكل نمط لعب.
         progress += 1
         reward = 5 if progress % 7 == 0 else (3 if game_key in ("kingdom","hero","alliance") else 2)
@@ -3769,16 +4377,16 @@ async def callback(update, context):
 
     if data.startswith("game_toggle:") or data.startswith("game_challenge_toggle:"):
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
         if not (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
-            await q.answer("إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
+            await safe_callback_answer(q, "إيقاف الألعاب وتشغيلها متاح للإشراف والمدراء والمالك فقط.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         field = "enabled" if data.startswith("game_toggle:") else "challenge_enabled"
         current = db.execute(f"SELECT {field} FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()[0]
         db.execute(f"UPDATE game_config SET {field}=? WHERE chat_id=?", (0 if current else 1, chat_id)); db.commit()
-        await q.answer("تم تحديث إعداد الألعاب.")
+        await safe_callback_answer(q, "تم تحديث إعداد الألعاب.")
         # Return to the group games page.
         cfg = db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(); title = title_row[0] if title_row else str(chat_id)
@@ -3795,45 +4403,45 @@ async def callback(update, context):
 
     if data.startswith("game_quiz:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await q.answer("القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         rows = [[InlineKeyboardButton(title, callback_data=f"game_quiz_cat:{chat_id}:{key}")]
                 for key,(title,_questions) in QUIZ_CATEGORIES.items()]
         rows.append([InlineKeyboardButton("🎯 مسابقة متنوعة من 5 مراحل", callback_data=f"game_quiz_cat:{chat_id}:mixed")])
         rows.append([InlineKeyboardButton("⬅️ الألعاب", callback_data=f"member_games:{chat_id}")])
-        await q.edit_message_text("🧠 المسابقات والمعلومات المتنوعة\n\nاختر المجال، أو ابدأ مسابقة متنوعة من خمس مراحل. كل إجابة صحيحة تمنح نقاطًا، وتظهر معلومة مختصرة بعد الإجابة.", reply_markup=InlineKeyboardMarkup(rows)); return
+        await q.edit_message_text("🧠 المسابقات والمعلومات المتنوعة\n\nاختر المجال، أو ابدأ مسابقة متنوعة من خمس مراحل. بنك المعلومات داخلي ويعمل دون API؛ كل إجابة صحيحة تمنح نقاطًا وتعرض معلومة مختصرة.", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("game_quiz_cat:"):
         try: _,chat_raw,category=data.split(":",2); chat_id=int(chat_raw)
-        except ValueError: await q.answer("بيانات المسابقة غير صحيحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات المسابقة غير صحيحة.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await q.answer("القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         if category == "mixed": category=random.choice(list(QUIZ_CATEGORIES.keys()))
-        if category not in QUIZ_CATEGORIES: await q.answer("هذا المجال غير متاح.", show_alert=True); return
-        await q.answer("بدأت المسابقة!")
+        if category not in QUIZ_CATEGORIES: await safe_callback_answer(q, "هذا المجال غير متاح.", show_alert=True); return
+        await safe_callback_answer(q, "بدأت المسابقة!")
         await send_quiz_stage(context, chat_id, category, 1)
         await q.edit_message_text("🚀 بدأت المسابقة في القروب! انتقل إلى القروب للإجابة، ثم أكمل المراحل الخمس.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 مركز الألعاب", callback_data=f"member_games:{chat_id}")]])); return
 
     if data.startswith("game_stage_answer:"):
         try: _,token,choice_raw=data.split(":",2); choice=int(choice_raw)
-        except ValueError: await q.answer("الإجابة غير صالحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "الإجابة غير صالحة.", show_alert=True); return
         row=db.execute("SELECT chat_id,answer,completed FROM game_rounds WHERE token=? AND kind='quiz_stage'", (token,)).fetchone()
-        if not row: await q.answer("انتهت هذه الجولة؛ ابدأ مسابقة جديدة.", show_alert=True); return
+        if not row: await safe_callback_answer(q, "انتهت هذه الجولة؛ ابدأ مسابقة جديدة.", show_alert=True); return
         chat_id,answer_data,completed=row
-        if q.message.chat.id != chat_id: await q.answer("هذه الجولة تخص قروبًا آخر.", show_alert=True); return
-        if completed: await q.answer("تم حسم هذه المرحلة بالفعل.", show_alert=True); return
+        if q.message.chat.id != chat_id: await safe_callback_answer(q, "هذه الجولة تخص قروبًا آخر.", show_alert=True); return
+        if completed: await safe_callback_answer(q, "تم حسم هذه المرحلة بالفعل.", show_alert=True); return
         try: category,stage_raw,question_raw,correct_raw=answer_data.split("|"); stage=int(stage_raw); question_index=int(question_raw); correct=int(correct_raw)
-        except ValueError: await q.answer("تعذر قراءة بيانات المرحلة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "تعذر قراءة بيانات المرحلة.", show_alert=True); return
         title,questions=QUIZ_CATEGORIES[category]; question,options,correct_index,explanation=questions[question_index]
         if choice != correct:
-            await q.answer("❌ ليست الإجابة الصحيحة؛ جرّب مرة أخرى.", show_alert=True); return
+            await safe_callback_answer(q, "❌ ليست الإجابة الصحيحة؛ جرّب مرة أخرى.", show_alert=True); return
         changed=db.execute("UPDATE game_rounds SET completed=1 WHERE token=? AND completed=0", (token,)).rowcount
-        if not changed: await q.answer("تم حسم هذه المرحلة بالفعل.", show_alert=True); return
+        if not changed: await safe_callback_answer(q, "تم حسم هذه المرحلة بالفعل.", show_alert=True); return
         name=q.from_user.full_name or "عضو"
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         db.execute("UPDATE game_scores SET points=points+5,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?", (name,chat_id,uid))
@@ -3849,14 +4457,14 @@ async def callback(update, context):
 
     if data.startswith("game_stage_next:"):
         try: _,chat_raw,category,stage_raw=data.split(":",3); chat_id=int(chat_raw); stage=int(stage_raw)
-        except ValueError: await q.answer("بيانات المرحلة غير صحيحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات المرحلة غير صحيحة.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await q.answer("القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("أوقف الإشراف الألعاب في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "أوقف الإشراف الألعاب في هذا القروب.", show_alert=True); return
         if category not in QUIZ_CATEGORIES or stage < 2 or stage > 5:
-            await q.answer("المرحلة غير متاحة.", show_alert=True); return
-        await q.answer(f"المرحلة {stage} بدأت")
+            await safe_callback_answer(q, "المرحلة غير متاحة.", show_alert=True); return
+        await safe_callback_answer(q, f"المرحلة {stage} بدأت")
         await send_quiz_stage(context,chat_id,category,stage)
         try: await q.edit_message_text(f"🚀 نُشرت المرحلة {stage} من 5 في القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 مركز الألعاب", callback_data=f"member_games:{chat_id}")]]))
         except Exception: pass
@@ -3864,7 +4472,7 @@ async def callback(update, context):
 
     if data.startswith("game_answer:"):
         try: _,chat_raw,correct_raw=data.split(":",2); chat_id=int(chat_raw); correct=int(correct_raw)
-        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         if correct:
@@ -3877,10 +4485,10 @@ async def callback(update, context):
 
     if data.startswith("game_word:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         target, hint = random.choice(WORD_BANK)
         distractors = [word for word, _hint in WORD_BANK if word != target]
         options = random.sample(distractors, min(3, len(distractors))) + [target]
@@ -3892,7 +4500,7 @@ async def callback(update, context):
 
     if data.startswith("game_word_answer:"):
         try: _,chat_raw,correct_raw=data.split(":",2); chat_id=int(chat_raw); correct=int(correct_raw)
-        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         if correct:
@@ -3904,10 +4512,10 @@ async def callback(update, context):
 
     if data.startswith("game_rps:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         import random
         bot_choice=random.choice(["حجر","ورقة","مقص"])
         context.user_data[f"rps:{chat_id}"]=bot_choice
@@ -3916,10 +4524,10 @@ async def callback(update, context):
 
     if data.startswith("game_rps_pick:"):
         try: _,chat_raw,choice=data.split(":",2); chat_id=int(chat_raw)
-        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         bot_choice=context.user_data.pop(f"rps:{chat_id}", None)
-        if not bot_choice: await q.answer("انتهت الجولة؛ ابدأ لعبة جديدة.", show_alert=True); return
+        if not bot_choice: await safe_callback_answer(q, "انتهت الجولة؛ ابدأ لعبة جديدة.", show_alert=True); return
         wins={"حجر":"مقص","ورقة":"حجر","مقص":"ورقة"}
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
@@ -3935,10 +4543,10 @@ async def callback(update, context):
 
     if data.startswith("game_challenge:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled,challenge_enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and (not cfg[0] or not cfg[1]): await q.answer("تحدي الخاسر غير مفعّل.", show_alert=True); return
+        if cfg and (not cfg[0] or not cfg[1]): await safe_callback_answer(q, "تحدي الخاسر غير مفعّل.", show_alert=True); return
         import random
         tasks=["اكتب في القروب: أنا بطل التحديات 😎", "أرسل ثلاثة إيموجيات تعبّر عن مزاجك 🎭", "امدح عضوًا في القروب بكلمة لطيفة 🌟", "اكتب حقيقة ممتعة عن نفسك (اختياري) 🧠"]
         task=random.choice(tasks)
@@ -3951,33 +4559,33 @@ async def callback(update, context):
         challenge_token=data.split(":",1)[1]
         challenge=db.execute("SELECT chat_id,user_id,completed FROM game_challenges WHERE token=?", (challenge_token,)).fetchone()
         if not challenge:
-            await q.answer("انتهى هذا التحدي أو أنه غير صالح.", show_alert=True); return
+            await safe_callback_answer(q, "انتهى هذا التحدي أو أنه غير صالح.", show_alert=True); return
         chat_id, challenge_user_id, completed=challenge
         if challenge_user_id != uid:
-            await q.answer("هذا التحدي مخصص للعضو الذي استلمه.", show_alert=True); return
+            await safe_callback_answer(q, "هذا التحدي مخصص للعضو الذي استلمه.", show_alert=True); return
         if completed:
-            await q.answer("تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("UPDATE game_challenges SET completed=1 WHERE token=? AND completed=0", (challenge_token,))
         if db.execute("SELECT changes()").fetchone()[0] != 1:
-            db.commit(); await q.answer("تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
+            db.commit(); await safe_callback_answer(q, "تم احتساب هذا التحدي مسبقًا.", show_alert=True); return
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)", (chat_id,uid,name))
         db.execute("UPDATE game_scores SET points=points+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id, uid, 1, "challenge"); db.commit()
         await q.edit_message_text("👏 أحسنت! تم تسجيل نقطة مشاركة ⭐", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 العودة للألعاب", callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_scores:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         rows=db.execute("SELECT display_name,points,wins,losses FROM game_scores WHERE chat_id=? ORDER BY points DESC,wins DESC LIMIT 10",(chat_id,)).fetchall()
         body="\n".join(f"{i}. {name or 'عضو'} — ⭐ {points} | 🏆 {wins} فوز | ❌ {losses} خسارة" for i,(name,points,wins,losses) in enumerate(rows,1)) or "لا توجد نتائج بعد. ابدأ اللعب لتظهر هنا!"
         await q.edit_message_text("🏆 المتصدرون في هذا القروب\n\n"+body, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب", callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_periods:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         rows=[[InlineKeyboardButton("📅 المتصدرون هذا الأسبوع", callback_data=f"game_period_scores:{chat_id}:week")],
               [InlineKeyboardButton("🗓️ المتصدرون هذا الشهر", callback_data=f"game_period_scores:{chat_id}:month")],
               [InlineKeyboardButton("🏆 الترتيب العام", callback_data=f"game_scores:{chat_id}")],
@@ -3986,8 +4594,8 @@ async def callback(update, context):
 
     if data.startswith("game_period_scores:"):
         try: _, chat_raw, period = data.split(":",2); chat_id=int(chat_raw)
-        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
-        if period not in ("week","month") or not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if period not in ("week","month") or not await can_access_group(context.bot, uid, chat_id): await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
         from datetime import timedelta
         cutoff=(datetime.now(timezone.utc)-timedelta(days=7 if period=="week" else 30)).isoformat()
         rows=db.execute("SELECT e.user_id, COALESCE(s.display_name,'عضو'), SUM(e.points) pts FROM game_score_events e LEFT JOIN game_scores s ON s.chat_id=e.chat_id AND s.user_id=e.user_id WHERE e.chat_id=? AND e.created_at>=? GROUP BY e.user_id ORDER BY pts DESC LIMIT 10", (chat_id,cutoff)).fetchall()
@@ -3997,10 +4605,10 @@ async def callback(update, context):
 
     if data.startswith("game_scramble:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         answer, _hint = random.choice(WORD_BANK)
         scrambled = "".join(random.sample(list(answer), len(answer)))
@@ -4014,10 +4622,10 @@ async def callback(update, context):
 
     if data.startswith("game_speed:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?", (chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.", show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.", show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_rounds(token,chat_id,kind,answer,created_at) VALUES(?,?,?,?,?)",(token,chat_id,"speed","الرياض",now())); db.commit()
         buttons=[[InlineKeyboardButton("جدة", callback_data=f"game_round_answer:{token}:جدة"), InlineKeyboardButton("الرياض", callback_data=f"game_round_answer:{token}:الرياض")], [InlineKeyboardButton("أبها", callback_data=f"game_round_answer:{token}:أبها"), InlineKeyboardButton("تبوك", callback_data=f"game_round_answer:{token}:تبوك")]]
@@ -4026,15 +4634,15 @@ async def callback(update, context):
 
     if data.startswith("game_round_answer:"):
         try: _,token,answer=data.split(":",2)
-        except ValueError: await q.answer("بيانات غير صحيحة.", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         row=db.execute("SELECT chat_id,kind,answer,completed,created_at FROM game_rounds WHERE token=?",(token,)).fetchone()
-        if not row: await q.answer("انتهت الجولة أو غير موجودة.",show_alert=True); return
+        if not row: await safe_callback_answer(q, "انتهت الجولة أو غير موجودة.",show_alert=True); return
         chat_id,kind,correct,completed,created_at=row
-        if completed: await q.answer("سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
-        if answer != correct: await q.answer("ليست الإجابة الصحيحة، حاول مجددًا.",show_alert=True); return
-        if (datetime.now(timezone.utc)-datetime.fromisoformat(created_at)).total_seconds()>180: await q.answer("انتهى وقت الجولة.",show_alert=True); return
+        if completed: await safe_callback_answer(q, "سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
+        if answer != correct: await safe_callback_answer(q, "ليست الإجابة الصحيحة، حاول مجددًا.",show_alert=True); return
+        if (datetime.now(timezone.utc)-datetime.fromisoformat(created_at)).total_seconds()>180: await safe_callback_answer(q, "انتهى وقت الجولة.",show_alert=True); return
         db.execute("UPDATE game_rounds SET completed=1 WHERE token=? AND completed=0",(token,))
-        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await q.answer("سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
+        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await safe_callback_answer(q, "سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
         name=q.from_user.full_name or str(uid); points=3 if kind=="speed" else 2
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid,name))
         db.execute("UPDATE game_scores SET points=points+?,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(points,name,chat_id,uid)); record_game_points(chat_id,uid,points,kind); db.commit()
@@ -4043,76 +4651,92 @@ async def callback(update, context):
 
     if data.startswith("game_daily:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب.",show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await safe_callback_answer(q, "هذا القروب غير مسجل.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
-        day=datetime.now(timezone.utc).date().isoformat()
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        day=datetime.now(ZoneInfo("Asia/Riyadh")).date().isoformat()
         existing=db.execute("SELECT completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
         if existing:
-            await q.answer("تم نشر تحدي اليوم بالفعل في هذا القروب.",show_alert=True); return
-        answer="القمر"; question="ما الشيء الذي يظهر ليلًا ويعكس ضوء الشمس؟"
-        db.execute("INSERT INTO daily_game_challenges(chat_id,challenge_date,answer) VALUES(?,?,?)",(chat_id,day,answer)); db.commit()
-        buttons=[[InlineKeyboardButton(x,callback_data=f"game_daily_answer:{chat_id}:{day}:{x}")] for x in ["الشمس","القمر","السحاب","النجوم"]]
+            await safe_callback_answer(q, "تم نشر تحدي اليوم بالفعل في هذا القروب.",show_alert=True); return
+        # Draw today's challenge from the embedded offline question bank.
+        bank_category = random.choice(list(QUIZ_CATEGORIES.keys()))
+        question, options, correct_index, explanation = random.choice(QUIZ_CATEGORIES[bank_category][1])
+        answer = options[correct_index]
+        # Store index + answer + explanation; callback data stays short and within Telegram's 64-byte limit.
+        db_answer = f"{correct_index}|{answer}|{explanation}"
+        db.execute("INSERT INTO daily_game_challenges(chat_id,challenge_date,answer) VALUES(?,?,?)",(chat_id,day,db_answer)); db.commit()
+        buttons=[[InlineKeyboardButton(x,callback_data=f"game_daily_answer:{chat_id}:{day}:{i}")] for i,x in enumerate(options)]
         try:
-            sent=await context.bot.send_message(chat_id,f"🎯 تحدي اليوم\n\n{question}\nأول إجابة صحيحة تحصل على 5 نقاط ⭐",reply_markup=InlineKeyboardMarkup(buttons))
+            sent=await context.bot.send_message(chat_id,f"🎯 تحدي اليوم — {QUIZ_CATEGORIES[bank_category][0]}\n\n{question}\nأول إجابة صحيحة تحصل على 5 نقاط ⭐\n\n💡 معلومة: تظهر بعد حسم الجولة.",reply_markup=InlineKeyboardMarkup(buttons))
             db.execute("UPDATE daily_game_challenges SET message_id=? WHERE chat_id=? AND challenge_date=?",(sent.message_id,chat_id,day)); db.commit()
         except Exception:
             db.execute("DELETE FROM daily_game_challenges WHERE chat_id=? AND challenge_date=? AND completed=0",(chat_id,day)); db.commit()
-            await q.answer("تعذر نشر التحدي. تأكد أن البوت يستطيع إرسال الرسائل.",show_alert=True); return
+            await safe_callback_answer(q, "تعذر نشر التحدي. تأكد أن البوت يستطيع إرسال الرسائل.",show_alert=True); return
         await q.edit_message_text("تم نشر تحدي اليوم في القروب 🎯",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب",callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("game_daily_answer:"):
-        try: _,chat_raw,day,answer=data.split(":",3); chat_id=int(chat_raw)
-        except ValueError: await q.answer("بيانات غير صحيحة.",show_alert=True); return
+        try: _,chat_raw,day,answer_raw=data.split(":",3); chat_id=int(chat_raw)
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.",show_alert=True); return
         row=db.execute("SELECT answer,completed FROM daily_game_challenges WHERE chat_id=? AND challenge_date=?",(chat_id,day)).fetchone()
-        if not row or row[1]: await q.answer("انتهى تحدي اليوم أو فاز به عضو آخر.",show_alert=True); return
-        if answer != row[0]: await q.answer("إجابة غير صحيحة، حاول مرة أخرى.",show_alert=True); return
+        if not row or row[1]: await safe_callback_answer(q, "انتهى تحدي اليوم أو فاز به عضو آخر.",show_alert=True); return
+        stored_answer = str(row[0])
+        if "|" in stored_answer:
+            try: correct_index_raw, correct_answer, explanation = stored_answer.split("|", 2)
+            except ValueError: await safe_callback_answer(q, "تعذر قراءة بيانات التحدي.", show_alert=True); return
+            if answer_raw != correct_index_raw:
+                await safe_callback_answer(q, "إجابة غير صحيحة، حاول مرة أخرى.",show_alert=True); return
+        else:
+            # Backward compatibility for daily challenges created by older bot versions.
+            correct_answer, explanation = stored_answer, "أحسنت! إجابة صحيحة من بنك المعلومات الداخلي."
+            if answer_raw != correct_answer:
+                await safe_callback_answer(q, "إجابة غير صحيحة، حاول مرة أخرى.",show_alert=True); return
         db.execute("UPDATE daily_game_challenges SET completed=1,winner_id=? WHERE chat_id=? AND challenge_date=? AND completed=0",(uid,chat_id,day))
-        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await q.answer("سبق أن فاز عضو آخر.",show_alert=True); return
+        if db.execute("SELECT changes()").fetchone()[0]!=1: db.commit(); await safe_callback_answer(q, "سبق أن فاز عضو آخر.",show_alert=True); return
         name=q.from_user.full_name or str(uid)
         db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,uid,name))
         db.execute("UPDATE game_scores SET points=points+5,wins=wins+1,display_name=? WHERE chat_id=? AND user_id=?",(name,chat_id,uid)); record_game_points(chat_id,uid,5,"daily"); db.commit()
         try: await context.bot.send_message(chat_id,f"🎉 مبروك {name}! فزت بتحدي اليوم وربحت 5 نقاط ⭐")
         except Exception: pass
-        await q.answer("إجابة صحيحة! تم تسجيل نقاطك.",show_alert=True); return
+        await safe_callback_answer(q, f"إجابة صحيحة! {correct_answer}. {explanation} تم تسجيل 5 نقاط.",show_alert=True); return
 
     if data.startswith("game_xo_start:"):
         try: chat_id=int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح.",show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await q.answer("القروب غير مسجل.",show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone(): await safe_callback_answer(q, "القروب غير مسجل.",show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
-        if cfg and not cfg[0]: await q.answer("الألعاب متوقفة في هذا القروب.",show_alert=True); return
+        if cfg and not cfg[0]: await safe_callback_answer(q, "الألعاب متوقفة في هذا القروب.",show_alert=True); return
         token=uuid.uuid4().hex[:12]
         db.execute("INSERT INTO game_xo(token,chat_id,player_x,board,turn,status,created_at) VALUES(?,?,?,'         ','X','waiting',?)",(token,chat_id,uid,now())); db.commit()
         try:
             sent=await context.bot.send_message(chat_id,f"⭕ تحدي إكس أو\nاللاعب الأول: {q.from_user.full_name} (❌)\nمن يرغب بالمنافسة يضغط الانضمام:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🙋 انضم كلاعب ⭕",callback_data=f"xo_join:{token}")]]))
             db.execute("UPDATE game_xo SET message_id=? WHERE token=?",(sent.message_id,token)); db.commit()
         except Exception:
-            db.execute("DELETE FROM game_xo WHERE token=?",(token,)); db.commit(); await q.answer("تعذر إرسال اللعبة إلى القروب.",show_alert=True); return
+            db.execute("DELETE FROM game_xo WHERE token=?",(token,)); db.commit(); await safe_callback_answer(q, "تعذر إرسال اللعبة إلى القروب.",show_alert=True); return
         await q.edit_message_text("تم نشر تحدي إكس أو في القروب. ينتظر لاعبًا ثانيًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الألعاب",callback_data=f"games_group:{chat_id}")]])); return
 
     if data.startswith("xo_join:"):
         token=data.split(":",1)[1]; row=db.execute("SELECT chat_id,player_x,player_o,board,turn,status,message_id FROM game_xo WHERE token=?",(token,)).fetchone()
-        if not row: await q.answer("اللعبة غير موجودة.",show_alert=True); return
+        if not row: await safe_callback_answer(q, "اللعبة غير موجودة.",show_alert=True); return
         chat_id,px,po,board,turn,status,message_id=row
-        if status!="waiting": await q.answer("اللعبة بدأت أو انتهت.",show_alert=True); return
-        if uid==px: await q.answer("تحتاج لاعبًا ثانيًا.",show_alert=True); return
+        if status!="waiting": await safe_callback_answer(q, "اللعبة بدأت أو انتهت.",show_alert=True); return
+        if uid==px: await safe_callback_answer(q, "تحتاج لاعبًا ثانيًا.",show_alert=True); return
         db.execute("UPDATE game_xo SET player_o=?,status='playing' WHERE token=? AND status='waiting'",(uid,token)); db.commit()
         text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {uid}\nالدور: ❌ اللاعب الأول"
         try: await q.edit_message_text(text,reply_markup=game_board_markup(token,board))
-        except Exception: await q.answer("تعذر تحديث لوحة اللعبة.",show_alert=True); return
+        except Exception: await safe_callback_answer(q, "تعذر تحديث لوحة اللعبة.",show_alert=True); return
         return
 
     if data.startswith("xo_move:"):
         try: _,token,pos_raw=data.split(":",2); pos=int(pos_raw)
-        except ValueError: await q.answer("حركة غير صحيحة.",show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "حركة غير صحيحة.",show_alert=True); return
         row=db.execute("SELECT chat_id,player_x,player_o,board,turn,status,message_id FROM game_xo WHERE token=?",(token,)).fetchone()
-        if not row: await q.answer("اللعبة غير موجودة.",show_alert=True); return
+        if not row: await safe_callback_answer(q, "اللعبة غير موجودة.",show_alert=True); return
         chat_id,px,po,board,turn,status,message_id=row
-        if status!="playing" or uid not in (px,po): await q.answer("لست لاعبًا في هذه الجولة.",show_alert=True); return
-        if (turn=="X" and uid!=px) or (turn=="O" and uid!=po): await q.answer("ليس دورك الآن.",show_alert=True); return
-        if pos<0 or pos>8 or board[pos]!=" ": await q.answer("هذا المربع غير متاح.",show_alert=True); return
+        if status!="playing" or uid not in (px,po): await safe_callback_answer(q, "لست لاعبًا في هذه الجولة.",show_alert=True); return
+        if (turn=="X" and uid!=px) or (turn=="O" and uid!=po): await safe_callback_answer(q, "ليس دورك الآن.",show_alert=True); return
+        if pos<0 or pos>8 or board[pos]!=" ": await safe_callback_answer(q, "هذا المربع غير متاح.",show_alert=True); return
         symbol=turn; board=board[:pos]+symbol+board[pos+1:]
         wins_x=((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
         winner=symbol if any(all(board[i]==symbol for i in line) for line in wins_x) else None
@@ -4130,7 +4754,7 @@ async def callback(update, context):
             text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {po}\nالدور: {'❌ اللاعب الأول' if next_turn=='X' else '⭕ اللاعب الثاني'}"
         db.commit()
         try: await q.edit_message_text(text,reply_markup=None if winner or draw else game_board_markup(token,board))
-        except Exception: await q.answer("تم تسجيل الحركة، لكن تعذر تحديث اللوحة.",show_alert=True)
+        except Exception: await safe_callback_answer(q, "تم تسجيل الحركة، لكن تعذر تحديث اللوحة.",show_alert=True)
         return
 
     if data == "statistics":
@@ -4146,7 +4770,7 @@ async def callback(update, context):
             return
         chat_id = int(data.split(":")[1])
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية الاطلاع على هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية الاطلاع على هذا القروب.", show_alert=True); return
         group = db.execute("SELECT title,added_at FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         total = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=?", (chat_id,)).fetchone()[0]
         deletes = db.execute("SELECT COUNT(*) FROM logs WHERE chat_id=? AND action LIKE '%delete%'", (chat_id,)).fetchone()[0]
@@ -4170,7 +4794,7 @@ async def callback(update, context):
     if data.startswith("welcome_group:"):
         chat_id = int(data.split(":", 1)[1])
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True); return
+            await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
         group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         if not group:
             await q.edit_message_text("لم يتم العثور على القروب.")
@@ -4190,7 +4814,7 @@ async def callback(update, context):
     if data.startswith("welcome_set:"):
         chat_id = int(data.split(":", 1)[1])
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("ليس لديك صلاحية هذا القروب", show_alert=True); return
+            await safe_callback_answer(q, "ليس لديك صلاحية هذا القروب", show_alert=True); return
         context.user_data["awaiting_welcome_chat"] = chat_id
         await q.edit_message_text("أرسل رسالة الترحيب الجديدة في الخاص مع البوت. استخدم {name} لاسم العضو و {group} لاسم القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"welcome_group:{chat_id}")]]))
         return
@@ -4198,7 +4822,7 @@ async def callback(update, context):
     if data.startswith("welcome_off:"):
         chat_id = int(data.split(":", 1)[1])
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("ليس لديك صلاحية هذا القروب", show_alert=True); return
+            await safe_callback_answer(q, "ليس لديك صلاحية هذا القروب", show_alert=True); return
         db.execute("DELETE FROM welcome_messages WHERE chat_id=?", (chat_id,))
         db.commit()
         log_action(chat_id, uid, "welcome_off", "تم إيقاف الترحيب")
@@ -4207,7 +4831,7 @@ async def callback(update, context):
 
     if data == "roles_groups":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("⛔ لا تملك صلاحية توزيع الرتب.", show_alert=True)
+            await safe_callback_answer(q, "⛔ لا تملك صلاحية توزيع الرتب.", show_alert=True)
             return
         groups = await accessible_groups(context.bot, uid)
         rows = [[InlineKeyboardButton(f"👥 {title or cid}", callback_data=f"roles_group:{cid}")] for cid, title in groups[:30]]
@@ -4221,10 +4845,10 @@ async def callback(update, context):
         try:
             chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True)
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
             return
         if not await can_access_group(context.bot, uid, chat_id):
-            await q.answer("لا تملك صلاحية هذا القروب.", show_alert=True)
+            await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True)
             return
         group_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         title = group_row[0] if group_row else str(chat_id)
@@ -4262,7 +4886,7 @@ async def callback(update, context):
 
     if data == "broadcast_start":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("هذا القسم للمالك الأساسي أو المالك المفوّض.", show_alert=True)
+            await safe_callback_answer(q, "هذا القسم للمالك الأساسي أو المالك المفوّض.", show_alert=True)
             return
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
         allowed = [(cid, title) for cid, title in groups if await can_publish_to_live(context.bot, uid, cid)]
@@ -4285,15 +4909,15 @@ async def callback(update, context):
 
     if data.startswith("broadcast_toggle:"):
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("ليس لديك صلاحية.", show_alert=True)
+            await safe_callback_answer(q, "ليس لديك صلاحية.", show_alert=True)
             return
         try:
             chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("معرّف القروب غير صحيح.", show_alert=True)
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
             return
         if not await can_publish_to_live(context.bot, uid, chat_id):
-            await q.answer("النشر متاح فقط في القروبات المسجلة التي أنت عضو فيها.", show_alert=True)
+            await safe_callback_answer(q, "النشر متاح فقط في القروبات المسجلة التي أنت عضو فيها.", show_alert=True)
             return
         selected = set(context.user_data.get("broadcast_selected_groups", []))
         if chat_id in selected: selected.remove(chat_id)
@@ -4309,7 +4933,7 @@ async def callback(update, context):
 
     if data == "broadcast_select_all":
         if not (is_owner(uid) or is_delegated_owner(uid)):
-            await q.answer("ليس لديك صلاحية النشر.", show_alert=True)
+            await safe_callback_answer(q, "ليس لديك صلاحية النشر.", show_alert=True)
             return
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
         allowed = [(cid, title) for cid, title in groups if await can_publish_to_live(context.bot, uid, cid)]
@@ -4324,7 +4948,7 @@ async def callback(update, context):
         selected = [cid for cid in selected if await can_publish_to_live(context.bot, uid, cid)]
         context.user_data["broadcast_selected_groups"] = selected
         if not selected:
-            await q.answer("حدد قروبًا واحدًا على الأقل تملك صلاحية النشر فيه.", show_alert=True)
+            await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل تملك صلاحية النشر فيه.", show_alert=True)
             return
         context.user_data.pop("awaiting_admin_action", None)
         context.user_data["awaiting_broadcast"] = True
@@ -4380,7 +5004,7 @@ async def callback(update, context):
 
     if data.startswith("archive_group:"):
         if not is_owner(uid):
-            await q.answer("هذا السجل للمالك الأساسي فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذا السجل للمالك الأساسي فقط.", show_alert=True)
             return
         chat_id = int(data.split(":", 1)[1])
         rows = db.execute("SELECT chat_title,display_name,username,message_text,created_at FROM message_archive WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,)).fetchall()
@@ -4410,10 +5034,10 @@ async def callback(update, context):
 
     if data == "delegated_add_start":
         if not is_owner(uid):
-            await q.answer("إضافة المالك المفوّض للمالك الأساسي فقط.", show_alert=True)
+            await safe_callback_answer(q, "إضافة المالك المفوّض للمالك الأساسي فقط.", show_alert=True)
             return
         if q.message.chat.type != ChatType.PRIVATE:
-            await q.answer("افتح اللوحة في الخاص مع البوت.", show_alert=True)
+            await safe_callback_answer(q, "افتح اللوحة في الخاص مع البوت.", show_alert=True)
             return
         context.user_data["awaiting_delegated_owner_id"] = True
         await q.edit_message_text(
@@ -4424,11 +5048,11 @@ async def callback(update, context):
 
     if data.startswith("delegated_manage:"):
         if not is_owner(uid):
-            await q.answer("إدارة صلاحيات المالك المفوض للمالك الأساسي فقط.", show_alert=True)
+            await safe_callback_answer(q, "إدارة صلاحيات المالك المفوض للمالك الأساسي فقط.", show_alert=True)
             return
         try: target_uid = int(data.split(":", 1)[1])
         except ValueError:
-            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
         if not is_delegated_owner(target_uid) or is_owner(target_uid):
             await q.edit_message_text("هذا المالك المفوض لم يعد مسجلًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")]])); return
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
@@ -4443,15 +5067,15 @@ async def callback(update, context):
 
     if data.startswith("pubperm_toggle:"):
         if not is_owner(uid):
-            await q.answer("هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
         try: _, target_raw, chat_raw = data.split(":", 2); target_uid=int(target_raw); chat_id=int(chat_raw)
         except ValueError:
-            await q.answer("بيانات غير صحيحة.", show_alert=True); return
+            await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         if not is_delegated_owner(target_uid) or is_owner(target_uid):
-            await q.answer("المالك المفوض غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "المالك المفوض غير مسجل.", show_alert=True); return
         group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         if not group:
-            await q.answer("القروب غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         all_granted = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone()
         exists = db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,chat_id)).fetchone()
         if all_granted:
@@ -4467,7 +5091,7 @@ async def callback(update, context):
             db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,chat_id,uid,now()))
             action = "تم منح صلاحية النشر"
         db.commit()
-        await q.answer(action)
+        await safe_callback_answer(q, action)
         # Re-render permissions page.
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
         all_granted = bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone())
@@ -4481,37 +5105,37 @@ async def callback(update, context):
 
     if data.startswith("delegated_all:"):
         if not is_owner(uid):
-            await q.answer("هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+            await safe_callback_answer(q, "هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
         try: _, target_raw, enable_raw = data.split(":", 2); target_uid=int(target_raw); enable=int(enable_raw)
         except ValueError:
-            await q.answer("بيانات غير صحيحة.", show_alert=True); return
+            await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         if not is_delegated_owner(target_uid) or is_owner(target_uid):
-            await q.answer("المالك المفوض غير مسجل.", show_alert=True); return
+            await safe_callback_answer(q, "المالك المفوض غير مسجل.", show_alert=True); return
         if enable:
             db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,0,?,?)", (target_uid,uid,now()))
         else:
             db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
         db.commit()
-        await q.answer("تم تحديث الصلاحية.")
+        await safe_callback_answer(q, "تم تحديث الصلاحية.")
         # Reuse the management view by re-entering it.
         await q.edit_message_text("تم تحديث الصلاحيات. افتح إدارة هذا المالك المفوض مجددًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↻ تحديث الصلاحيات", callback_data=f"delegated_manage:{target_uid}")], [InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")]]))
         return
 
     if data.startswith("delegated_remove_confirm:"):
         if not is_owner(uid):
-            await q.answer("عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
+            await safe_callback_answer(q, "عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
         try: target_uid=int(data.split(":",1)[1])
         except ValueError:
-            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
         await q.edit_message_text(f"⚠️ هل تريد عزل {user_display_name(target_uid)} وإلغاء كل صلاحياته؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نعم، عزله", callback_data=f"delegated_remove:{target_uid}"), InlineKeyboardButton("لا، رجوع", callback_data=f"delegated_manage:{target_uid}")]]))
         return
 
     if data.startswith("delegated_remove:"):
         if not is_owner(uid):
-            await q.answer("عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
+            await safe_callback_answer(q, "عزل المالك المفوض للمالك الأساسي فقط.", show_alert=True); return
         try: target_uid=int(data.split(":",1)[1])
         except ValueError:
-            await q.answer("رقم المستخدم غير صحيح.", show_alert=True); return
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
         name = user_display_name(target_uid)
         db.execute("DELETE FROM delegated_owners WHERE user_id=?", (target_uid,))
         db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
@@ -4547,8 +5171,8 @@ async def callback(update, context):
 
     if data.startswith("logs_group:"):
         try: chat_id = int(data.split(":",1)[1])
-        except ValueError: await q.answer("معرّف غير صحيح", show_alert=True); return
-        if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب", show_alert=True); return
+        except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
+        if not await can_access_group(context.bot, uid, chat_id): await safe_callback_answer(q, "لا تملك صلاحية هذا القروب", show_alert=True); return
         rows = db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 25", (chat_id,)).fetchall()
         title = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         body = "\n".join(f"• {created} — {action}: {details or ''}" for action,details,created in rows) or "لا توجد عمليات مسجلة بعد."
@@ -4559,7 +5183,7 @@ async def callback(update, context):
             await q.edit_message_text("⛔ ليس لديك صلاحية الإعدادات."); return
         if q.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             chat_id = q.message.chat.id
-            if not await can_access_group(context.bot, uid, chat_id): await q.answer("لا تملك صلاحية هذا القروب", show_alert=True); return
+            if not await can_access_group(context.bot, uid, chat_id): await safe_callback_answer(q, "لا تملك صلاحية هذا القروب", show_alert=True); return
             await q.edit_message_text(settings_text(0), reply_markup=settings_page_markup(chat_id, 0)); return
         groups = await accessible_groups(context.bot, uid)
         rows = [[InlineKeyboardButton(f"⚙️ {title or cid}", callback_data=f"settings_group:{cid}")] for cid,title in groups[:30]]
@@ -4689,10 +5313,9 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    if context.user_data.pop("owner_autoreply_state", None):
-        await update.effective_message.reply_text("تم إلغاء إعداد الرد الآلي.")
-    else:
-        await update.effective_message.reply_text("لا توجد عملية رد آلي قيد التنفيذ.")
+    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_inquiry", "staff_inquiry_reply_id", "awaiting_staff_notice", "awaiting_staff_note", "awaiting_staff_calculation")
+    cancelled = any(context.user_data.pop(key, None) is not None for key in keys)
+    await update.effective_message.reply_text("تم إلغاء العملية الحالية." if cancelled else "لا توجد عملية قيد التنفيذ.")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -4729,6 +5352,8 @@ def main():
         "exam": student_exam_cmd, "exams": student_events_cmd, "delexam": student_event_delete_cmd,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
         "grantpublish": grantpublish, "revokepublish": revokepublish,
+        "addchannel": addchannel_cmd, "delchannel": delchannel_cmd, "channels": channels_cmd,
+        "publishchannels": publish_channels_cmd, "ask": ask_cmd,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
         "addmanager": addmanager, "delmanager": delmanager, "managers": managers,
         "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
@@ -4741,6 +5366,7 @@ def main():
     for name, fn in command_handlers.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("cancel", cancel_owner_autoreply), group=-2)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, process_private_workflows), group=-5)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, assistant_private_text), group=-4)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, assistant_private_document), group=-4)
 
@@ -4750,6 +5376,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, owner_autoreply_text_handler), group=-2)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, broadcast_draft_message), group=-1)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_listener), group=-1)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members), group=1)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ArabicTextCommand), group=2)
