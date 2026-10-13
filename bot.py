@@ -949,7 +949,6 @@ def panel_markup(uid):
     if is_delegated_owner(uid) and not is_owner(uid):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("🚫🔓 الحظر وفك الحظر وكشف ID", callback_data="moderation_center")],
             [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
             [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
             [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
@@ -961,7 +960,6 @@ def panel_markup(uid):
         ])
     owner_rows = [
         [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
-        [InlineKeyboardButton("🚫🔓 الحظر وفك الحظر وكشف ID", callback_data="moderation_center")],
         [InlineKeyboardButton("⚡ أوامر الحماية الجماعية", callback_data="bulk_security")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
@@ -1173,12 +1171,54 @@ async def process_private_workflows(update, context):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
+    raw = (msg.text or "").strip()
     # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
     if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
         or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
         or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id")
         or context.user_data.get("awaiting_admin_action")):
         context.user_data["_skip_assistant_private_message_id"] = msg.message_id
+    # Allow the owner/delegated owner to award a badge directly with ID|badge|reason,
+    # without first opening the staff panel. Keep this ahead of the assistant fallback.
+    if (not context.user_data.get("staff_task_state")
+            and not context.user_data.get("staff_shift_state")
+            and not context.user_data.get("staff_appeal_state")
+            and not context.user_data.get("staff_inquiry_state")
+            and not context.user_data.get("inquiry_reply_id")
+            and not context.user_data.get("awaiting_general_inquiry")
+            and not context.user_data.get("awaiting_channel_broadcast")
+            and not context.user_data.get("owner_autoreply_state")
+            and not context.user_data.get("awaiting_broadcast")
+            and not context.user_data.get("awaiting_delegated_owner_id")
+            and not context.user_data.get("awaiting_admin_action")
+            and not context.user_data.get("staff_badge_state")
+            and (is_owner(user.id) or is_delegated_owner(user.id))
+            and raw.count("|") >= 2):
+        badge_parts = [part.strip() for part in raw.split("|", 2)]
+        if len(badge_parts) == 3 and badge_parts[0].isdigit() and badge_parts[1]:
+            target = int(badge_parts[0])
+            badge = badge_parts[1][:80]
+            reason = badge_parts[2][:300]
+            db.execute(
+                "INSERT INTO staff_badges(user_id,badge,awarded_by,reason,created_at) VALUES(?,?,?,?,?)",
+                (target, badge, user.id, reason, now()),
+            )
+            db.commit()
+            log_action(0, user.id, "staff_badge_awarded", f"target={target}; badge={badge}; reason={reason}")
+            notified = True
+            try:
+                await context.bot.send_message(
+                    target,
+                    f"🏅 حصلت على وسام: {badge}\nالسبب: {reason or 'تقدير لجهودك'}",
+                )
+            except Exception:
+                notified = False
+            await msg.reply_text(
+                f"✅ تم حفظ الوسام للعضو {target}.\n🏅 الوسام: {badge}\n"
+                f"📝 السبب: {reason or 'لم يُحدّد'}\n"
+                + ("📩 تم إرسال إشعار للعضو." if notified else "ℹ️ حُفظ الوسام، لكن تعذّر إشعار العضو في الخاص؛ قد يحتاج إلى بدء محادثة مع البوت.")
+            )
+            return
     # Primary-owner inquiry replies are deliberately not delegated.
     staff_task_state = context.user_data.get("staff_task_state")
     if staff_task_state:
@@ -2240,21 +2280,7 @@ async def group_role_command(update, context):
 
 
 async def id_cmd(update, context):
-    """Show the replied-to member's ID, or the sender's ID when not replying."""
-    msg = update.effective_message
-    if not msg:
-        return
-    replied = msg.reply_to_message
-    target = replied.from_user if replied and replied.from_user else update.effective_user
-    if not target:
-        return
-    if target.id == update.effective_user.id:
-        label = "رقمك"
-    else:
-        label = "رقم العضو الذي رددت على رسالته"
-    username = f"\n👤 اسم المستخدم: @{target.username}" if target.username else ""
-    name = f"\nالاسم: {target.full_name}" if getattr(target, "full_name", None) else ""
-    await msg.reply_text(f"🆔 {label}: {target.id}{name}{username}")
+    await update.effective_message.reply_text(f"🆔 رقمك: {update.effective_user.id}")
 
 async def idgroup(update, context):
     await update.effective_message.reply_text(f"🆔 رقم القروب: {update.effective_chat.id}")
@@ -2293,7 +2319,6 @@ async def unban(update, context):
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        log_action(update.effective_chat.id, update.effective_user.id, "unban", str(uid))
         await update.message.reply_text("✅ تم فك الحظر.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر فك الحظر: {e}")
@@ -4286,19 +4311,6 @@ async def callback(update, context):
         await q.edit_message_text("🛡️ الحماية وإعدادات القروبات\nاختر قروبًا أنت عضو فيه لتغيير إعداداته. تتطلب إجراءات الحذف صلاحيات إدارية للبوت في تيليجرام.", reply_markup=InlineKeyboardMarkup(rows))
         return
 
-    if data == "moderation_center":
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "هذه الميزة للمالك الأساسي والمفوّض فقط.", show_alert=True)
-            return
-        groups = await accessible_groups(context.bot, uid)
-        rows = [[InlineKeyboardButton(f"👥 {title or cid}", callback_data=f"admin_group:{cid}")] for cid, title in groups[:50]]
-        rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
-        if not groups:
-            await q.edit_message_text("لا توجد قروبات مسجلة متاحة للإدارة. أضف البوت إلى القروب وفعّله أولًا.", reply_markup=InlineKeyboardMarkup(rows))
-        else:
-            await q.edit_message_text("🚫🔓 الحظر وفك الحظر وكشف ID\n\nاختر القروب، ثم اختر الحظر أو فك الحظر أو الطرد أو الكتم. للحصول على ID عضو داخل القروب، ردّ على رسالته بالأمر /id.", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
     if data in ("administration", "administration_groups"):
         if not (is_owner(uid) or is_general_manager(uid) or is_delegated_owner(uid)):
             await q.edit_message_text("⛔ ليس لديك صلاحية الإدارة."); return
@@ -4317,7 +4329,6 @@ async def callback(update, context):
         await q.edit_message_text(
             f"🔨 إدارة القروب — {title[0] if title else chat_id}\n\n"
             "اختر الإجراء، ثم أرسل رقم المستخدم أو رقم الرسالة في الخاص. "
-            "لإظهار ID عضو داخل القروب، ردّ على رسالته بالأمر /id. "
             "تتطلب الإجراءات صلاحيات مشرف البوت المناسبة داخل تيليجرام.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{chat_id}")],
