@@ -116,6 +116,10 @@ CREATE TABLE IF NOT EXISTS staff_permissions(
 CREATE INDEX IF NOT EXISTS idx_staff_tasks_user ON staff_tasks(assigned_to,status);
 CREATE INDEX IF NOT EXISTS idx_staff_shifts_user ON staff_shifts(user_id,status);
 CREATE INDEX IF NOT EXISTS idx_staff_appeals_status ON staff_appeals(status);
+CREATE TABLE IF NOT EXISTS group_mutes(
+ chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, muted_by INTEGER NOT NULL,
+ muted_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id)
+);
 
 """)
 db.commit()
@@ -879,10 +883,10 @@ def role_name(uid):
     return "👤 عضو"
 
 GROUP_ROLE_PERMISSIONS = {
-    "مشرف": {"delete", "mute"},
-    "مشرف عام": {"delete", "mute", "kick", "pin", "protection"},
-    "مدير": {"delete", "mute", "kick", "pin", "protection"},
-    "مدير عام": {"delete", "mute", "kick", "pin", "protection", "manage_roles", "logs", "welcome", "stats"},
+    "مشرف": {"delete", "mute", "unmute"},
+    "مشرف عام": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
+    "مدير": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
+    "مدير عام": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection", "manage_roles", "logs", "welcome", "stats"},
 }
 
 
@@ -2270,7 +2274,7 @@ async def group_role_command(update, context):
                (chat.id, target.id, role, user.id, now()))
     db.commit()
     log_action(chat.id, user.id, "group_role_granted", f"target={target.id};role={role}")
-    labels = {"delete": "حذف الرسائل", "mute": "الكتم وفك الكتم", "kick": "الطرد والحظر", "pin": "تثبيت الرسائل", "protection": "قفل وفتح الروابط وبقية إعدادات الحماية", "manage_roles": "إدارة رتب القروب", "logs": "عرض السجلات", "welcome": "إدارة الترحيب", "stats": "عرض الإحصائيات"}
+    labels = {"delete": "حذف الرسائل", "mute": "الكتم", "unmute": "فك الكتم ومسح قائمة المكتومين", "kick": "الطرد", "ban": "الحظر", "unban": "فك الحظر", "pin": "تثبيت الرسائل", "protection": "قفل وفتح الروابط وبقية إعدادات الحماية", "manage_roles": "إدارة رتب القروب", "logs": "عرض السجلات", "welcome": "إدارة الترحيب", "stats": "عرض الإحصائيات"}
     permissions = "، ".join(labels.get(item, item) for item in sorted(GROUP_ROLE_PERMISSIONS[role]))
     await msg.reply_text(
         f"✅ تم رفع {target.full_name} إلى رتبة {role} داخل البوت.\n"
@@ -2280,7 +2284,44 @@ async def group_role_command(update, context):
 
 
 async def id_cmd(update, context):
-    await update.effective_message.reply_text(f"🆔 رقمك: {update.effective_user.id}")
+    msg = update.effective_message
+    replied = msg.reply_to_message if msg else None
+    if replied and replied.from_user:
+        target = replied.from_user
+        await msg.reply_text(f"🆔 رقم العضو: {target.id}\n👤 الاسم: {target.full_name}")
+        return
+    if context.args and context.args[0].lstrip("-").isdigit():
+        await msg.reply_text(f"🆔 الرقم المدخل: {int(context.args[0])}")
+        return
+    await msg.reply_text(f"🆔 رقمك: {update.effective_user.id}\n💡 لمعرفة رقم عضو، استخدم /id بالرد على رسالته.")
+
+async def badges_cmd(update, context):
+    user = update.effective_user
+    msg = update.effective_message
+    target_id = int(context.args[0]) if context.args and context.args[0].isdigit() and (is_owner(user.id) or is_delegated_owner(user.id)) else user.id
+    rows = db.execute("SELECT id,badge,reason,created_at FROM staff_badges WHERE user_id=? ORDER BY id DESC LIMIT 30", (target_id,)).fetchall()
+    if not rows:
+        await msg.reply_text(f"🏅 لا توجد أوسمة مسجلة للعضو {target_id}.")
+        return
+    lines = [f"🏅 أوسمة العضو {target_id}"]
+    for badge_id, badge, reason, created_at in rows:
+        lines.append(f"\n#{badge_id} · {badge}\n📝 {reason or 'دون سبب مسجل'}\n🗓️ {created_at}")
+    lines.append("\nلحذف وسام (للمالك/المفوّض): /badge_remove رقم_الوسام")
+    await msg.reply_text("\n".join(lines))
+
+async def badge_remove_cmd(update, context):
+    uid = update.effective_user.id
+    if not (is_owner(uid) or is_delegated_owner(uid)):
+        await update.effective_message.reply_text("⛔ حذف الأوسمة للمالك والمفوّض فقط."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الصيغة: /badge_remove رقم_الوسام\nاعرض الأوسمة أولًا عبر /badges رقم_العضو."); return
+    badge_id = int(context.args[0])
+    row = db.execute("SELECT user_id,badge FROM staff_badges WHERE id=?", (badge_id,)).fetchone()
+    if not row:
+        await update.effective_message.reply_text("لم يتم العثور على هذا الوسام."); return
+    db.execute("DELETE FROM staff_badges WHERE id=?", (badge_id,)); db.commit()
+    log_action(0, uid, "staff_badge_removed", f"badge_id={badge_id}; target={row[0]}; badge={row[1]}")
+    await update.effective_message.reply_text(f"✅ تم حذف الوسام #{badge_id} ({row[1]}) من سجل العضو {row[0]}.")
 
 async def idgroup(update, context):
     await update.effective_message.reply_text(f"🆔 رقم القروب: {update.effective_chat.id}")
@@ -2297,7 +2338,7 @@ def target_from_update(update, context):
     return None
 
 async def ban(update, context):
-    if not await require_group_permission(update, "kick"): return
+    if not await require_group_permission(update, "ban"): return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم الأمر بالرد على رسالة العضو أو /ban رقم_المستخدم")
@@ -2311,7 +2352,7 @@ async def ban(update, context):
         await update.message.reply_text(f"❌ تعذر الحظر: {e}")
 
 async def unban(update, context):
-    if not await require_admin(update): return
+    if not await require_group_permission(update, "unban"): return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم /unban رقم_المستخدم أو بالرد.")
@@ -2319,6 +2360,7 @@ async def unban(update, context):
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
+        log_action(update.effective_chat.id, update.effective_user.id, "unban", str(uid))
         await update.message.reply_text("✅ تم فك الحظر.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر فك الحظر: {e}")
@@ -2333,6 +2375,7 @@ async def kick(update, context):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
+        log_action(update.effective_chat.id, update.effective_user.id, "kick", str(uid))
         await update.message.reply_text("✅ تم طرد العضو.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر الطرد: {e}")
@@ -2349,12 +2392,15 @@ async def mute(update, context):
             update.effective_chat.id, uid,
             permissions=ChatPermissions(can_send_messages=False)
         )
-        await update.message.reply_text("✅ تم كتم العضو.")
+        db.execute("INSERT OR REPLACE INTO group_mutes(chat_id,user_id,muted_by,muted_at) VALUES(?,?,?,?)", (update.effective_chat.id, uid, update.effective_user.id, now()))
+        db.commit()
+        log_action(update.effective_chat.id, update.effective_user.id, "mute", str(uid))
+        await update.message.reply_text("✅ تم كتم العضو وتسجيله في قائمة المكتومين.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر الكتم: {e}")
 
 async def unmute(update, context):
-    if not await require_group_permission(update, "mute"): return
+    if not await require_group_permission(update, "unmute"): return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم /unmute بالرد على رسالة العضو.")
@@ -2371,9 +2417,40 @@ async def unmute(update, context):
                 can_add_web_page_previews=True
             )
         )
-        await update.message.reply_text("✅ تم فك الكتم.")
+        db.execute("DELETE FROM group_mutes WHERE chat_id=? AND user_id=?", (update.effective_chat.id, uid)); db.commit()
+        log_action(update.effective_chat.id, update.effective_user.id, "unmute", str(uid))
+        await update.message.reply_text("✅ تم فك الكتم وإزالة العضو من قائمة المكتومين.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر فك الكتم: {e}")
+
+async def muted_cmd(update, context):
+    if not await require_group_permission(update, "unmute"): return
+    rows = db.execute("SELECT user_id,muted_at FROM group_mutes WHERE chat_id=? ORDER BY muted_at DESC LIMIT 50", (update.effective_chat.id,)).fetchall()
+    if not rows:
+        await update.message.reply_text("🔇 لا توجد أسماء في قائمة المكتومين التي يتابعها البوت."); return
+    body = "\n".join(f"• {uid} — {when}" for uid, when in rows)
+    await update.message.reply_text("🔇 قائمة المكتومين المسجلين لدى البوت:\n" + body + "\n\nلفك كتم عضو: /unmute بالرد على رسالته أو /unmute رقم_العضو")
+
+async def unmuteall_cmd(update, context):
+    if not await require_group_permission(update, "unmute"): return
+    chat_id = update.effective_chat.id
+    rows = db.execute("SELECT user_id FROM group_mutes WHERE chat_id=?", (chat_id,)).fetchall()
+    if not rows:
+        await update.message.reply_text("لا توجد قائمة مكتومين مسجلة لدى البوت."); return
+    success, failed = 0, 0
+    for (uid,) in rows:
+        try:
+            await context.bot.restrict_chat_member(chat_id, uid, permissions=ChatPermissions(
+                can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                can_add_web_page_previews=True))
+            db.execute("DELETE FROM group_mutes WHERE chat_id=? AND user_id=?", (chat_id, uid))
+            log_action(chat_id, update.effective_user.id, "unmute", str(uid)); success += 1
+        except Exception as exc:
+            log.warning("تعذر فك كتم %s في %s: %s", uid, chat_id, exc); failed += 1
+    db.commit()
+    await update.message.reply_text(f"🧹 اكتملت محاولة مسح المكتومين المسجلين لدى البوت.\n✅ تم فك الكتم: {success}\n⚠️ تعذر فك الكتم: {failed}\nℹ️ لا يستطيع تيليجرام إتاحة قائمة شاملة بالمكتومين سابقًا؛ تشمل العملية فقط من سجّل البوت كتمهم.")
 
 async def del_cmd(update, context):
     if not await require_group_permission(update, "delete"): return
@@ -2677,7 +2754,7 @@ async def weekly_stats_worker(app):
                 ).fetchall()
                 top_text = "\n".join(f"{idx}. {html.escape(name)} — {count} رسالة" for idx, (name, count) in enumerate(top_rows, 1)) or "لا توجد بيانات كافية"
                 report = (f"📊 التقرير الأسبوعي للقروب\n👥 {html.escape(title or str(chat_id))}\n"
-                    f"📅 الأسبوع المنتهي يوم السبت\n💬 الرسائل المرصودة: {messages:,}\n"
+                    f"📅 الأسبوع من الاثنين إلى الأحد\n💬 الرسائل المرصودة: {messages:,}\n"
                     f"🗣️ الأعضاء المتفاعلون: {active:,}\n📈 نسبة التفاعل التقديرية: {rate:.1f}%\n"
                     f"🆕 المنضمون المرصودون: {joins}\n🚪 المغادرون المرصودون: {leaves}\n"
                     f"👤 الأعضاء المسجلون لدى البوت: {known}\n"
@@ -3178,9 +3255,10 @@ async def broadcast_draft_message(update, context):
         action = pending_action.get("action")
         target_id = int(raw)
         chat_id = int(pending_action.get("chat_id"))
-        if not await can_access_group(context.bot, user.id, chat_id):
+        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}.get(action)
+        if not await can_access_group(context.bot, user.id, chat_id) or not permission_for_action or not has_group_permission(chat_id, user.id, permission_for_action):
             context.user_data.pop("awaiting_admin_action", None)
-            await msg.reply_text("⛔ لم تعد تملك صلاحية إدارة هذا القروب.")
+            await msg.reply_text("⛔ لا تملك الصلاحية المطلوبة لهذا الإجراء في هذا القروب.")
             return
         try:
             if action == "ban":
@@ -3192,8 +3270,10 @@ async def broadcast_draft_message(update, context):
                 await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
             elif action == "mute":
                 await context.bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False))
+                db.execute("INSERT OR REPLACE INTO group_mutes(chat_id,user_id,muted_by,muted_at) VALUES(?,?,?,?)", (chat_id, target_id, user.id, now())); db.commit()
             elif action == "unmute":
                 await context.bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+                db.execute("DELETE FROM group_mutes WHERE chat_id=? AND user_id=?", (chat_id, target_id)); db.commit()
             elif action == "delete":
                 await context.bot.delete_message(chat_id, target_id)
             elif action == "pin":
@@ -4350,6 +4430,9 @@ async def callback(update, context):
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
+        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}[action]
+        if not has_group_permission(chat_id, uid, permission_for_action):
+            await safe_callback_answer(q, "رتبتك لا تسمح بهذا الإجراء في هذا القروب.", show_alert=True); return
         context.user_data["awaiting_admin_action"] = {"action": action, "chat_id": chat_id}
         labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها"}
         action_group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -5529,8 +5612,9 @@ def main():
         "publishchannels": publish_channels_cmd, "ask": ask_cmd,
         "addprotect": addprotect, "delprotect": delprotect, "permissions": permissions_cmd,
         "addmanager": addmanager, "delmanager": delmanager, "managers": managers,
-        "id": id_cmd, "idgroup": idgroup, "ban": ban, "unban": unban,
-        "kick": kick, "mute": mute, "unmute": unmute, "del": del_cmd, "pin": pin,
+        "id": id_cmd, "idgroup": idgroup, "badges": badges_cmd, "badge_remove": badge_remove_cmd,
+        "ban": ban, "unban": unban, "kick": kick, "mute": mute, "unmute": unmute,
+        "muted": muted_cmd, "unmuteall": unmuteall_cmd, "del": del_cmd, "pin": pin,
         "alerts": alerts, "logs": logs_cmd, "settings": settings_cmd, "locks": locks,
         "archive": archive_cmd, "archive_on": archive_on, "archive_off": archive_off,
         "autoreplies": auto_replies_list, "autoreplies_on": auto_replies_on,
