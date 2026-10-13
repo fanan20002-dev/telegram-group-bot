@@ -109,6 +109,13 @@ CREATE TABLE IF NOT EXISTS staff_inquiries(
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL DEFAULT 0,
  body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS support_tickets(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, chat_title TEXT DEFAULT '',
+ user_id INTEGER NOT NULL, username TEXT DEFAULT '', display_name TEXT DEFAULT '',
+ body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new', created_at TEXT NOT NULL,
+ owner_reply TEXT DEFAULT '', replied_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status, id);
 CREATE TABLE IF NOT EXISTS staff_permissions(
  chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, permission TEXT NOT NULL,
  granted_by INTEGER NOT NULL, granted_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id,permission)
@@ -203,6 +210,17 @@ CREATE TABLE IF NOT EXISTS watched_groups(
     added_at TEXT
 )
 """)
+# Per-group runtime switch. Existing groups stay enabled by default; the primary owner
+# can disable services for one group without affecting the others.
+db.execute("""
+CREATE TABLE IF NOT EXISTS group_runtime_status(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_by INTEGER DEFAULT 0,
+    updated_at TEXT DEFAULT ''
+)
+""")
+db.commit()
 db.execute("""
 CREATE TABLE IF NOT EXISTS delegated_owners(
     user_id INTEGER PRIMARY KEY,
@@ -776,6 +794,20 @@ def log_action(chat_id, user_id, action, details=""):
 def is_owner(uid):
     return bool(OWNER_ID and uid == OWNER_ID)
 
+def is_group_bot_enabled(chat_id):
+    """Return the per-group service state; legacy/unseen groups default to enabled."""
+    row = db.execute("SELECT enabled FROM group_runtime_status WHERE chat_id=?", (chat_id,)).fetchone()
+    return True if row is None else bool(row[0])
+
+
+def set_group_bot_enabled(chat_id, enabled, actor_id):
+    db.execute(
+        "INSERT INTO group_runtime_status(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (chat_id, int(bool(enabled)), int(actor_id or 0), now())
+    )
+    db.commit()
+
 def user_display_name(user_id):
     row = db.execute("SELECT display_name, username FROM delegated_owners WHERE user_id=?", (user_id,)).fetchone()
     if row:
@@ -923,6 +955,9 @@ async def require_admin(update):
         await update.effective_message.reply_text("هذا الأمر يعمل داخل القروب فقط.")
         return False
     uid = update.effective_user.id
+    if not is_group_bot_enabled(update.effective_chat.id):
+        await update.effective_message.reply_text("⏸️ خدمات البوت متوقفة في هذا القروب بقرار من المالك الأساسي.")
+        return False
     if not (is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid)
             or group_role(update.effective_chat.id, uid)):
         await update.effective_message.reply_text("⛔ ليس لديك صلاحية الإدارة في هذا القروب.")
@@ -942,6 +977,7 @@ def register_group(chat):
         "VALUES(?,?,COALESCE((SELECT added_at FROM watched_groups WHERE chat_id=?),?))",
         (chat.id, chat.title or "", chat.id, now())
     )
+    db.execute("INSERT OR IGNORE INTO group_runtime_status(chat_id,enabled,updated_by,updated_at) VALUES(?,1,0,?)", (chat.id, now()))
     db.commit()
     # Install default auto-replies immediately when the group is first registered.
     # INSERT OR IGNORE preserves an explicit on/off choice made by an administrator.
@@ -973,12 +1009,14 @@ def panel_markup(uid):
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center")],
+        [InlineKeyboardButton("🛠️ طلبات الدعم الفني للقروبات", callback_data="support_tickets_inbox")],
         [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
         [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
         [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
     if is_owner(uid):
+        owner_rows.insert(1, [InlineKeyboardButton("⏯️ تشغيل / إيقاف البوت لكل قروب", callback_data="owner_runtime_groups")])
         owner_rows.append([InlineKeyboardButton("🔄 إدارة تحديثات البوت", callback_data="update_manager")])
     return InlineKeyboardMarkup(owner_rows)
 
@@ -1177,7 +1215,7 @@ async def process_private_workflows(update, context):
         return
     raw = (msg.text or "").strip()
     # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
-    if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
+    if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry") or context.user_data.get("support_ticket_chat_id") or context.user_data.get("support_ticket_reply_id")
         or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
         or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id")
         or context.user_data.get("awaiting_admin_action")):
@@ -1190,6 +1228,7 @@ async def process_private_workflows(update, context):
             and not context.user_data.get("staff_inquiry_state")
             and not context.user_data.get("inquiry_reply_id")
             and not context.user_data.get("awaiting_general_inquiry")
+            and not context.user_data.get("support_ticket_chat_id") and not context.user_data.get("support_ticket_reply_id")
             and not context.user_data.get("awaiting_channel_broadcast")
             and not context.user_data.get("owner_autoreply_state")
             and not context.user_data.get("awaiting_broadcast")
@@ -1268,6 +1307,48 @@ async def process_private_workflows(update, context):
         try: await context.bot.send_message(target,f"🏅 حصلت على وسام: {badge}\nالسبب: {reason or 'تقدير لجهودك'}")
         except Exception: pass
         await msg.reply_text("✅ تم تسجيل الوسام وإرسال إشعار للمشرف إن أمكن."); return
+    support_reply_id = context.user_data.get("support_ticket_reply_id")
+    if support_reply_id:
+        if not is_owner(user.id):
+            context.user_data.pop("support_ticket_reply_id", None)
+            await msg.reply_text("⛔ الرد على طلبات الدعم للمالك الأساسي فقط."); return
+        if raw.lower() == "/cancel":
+            context.user_data.pop("support_ticket_reply_id", None); await msg.reply_text("تم إلغاء الرد."); return
+        if not raw or raw.startswith("/") or len(raw) > 3000:
+            await msg.reply_text("أرسل ردًا واضحًا لا يتجاوز 3000 حرف، أو /cancel للإلغاء."); return
+        ticket = db.execute("SELECT user_id,chat_id,status FROM support_tickets WHERE id=?", (int(support_reply_id),)).fetchone()
+        if not ticket:
+            context.user_data.pop("support_ticket_reply_id", None); await msg.reply_text("طلب الدعم غير موجود."); return
+        try:
+            await context.bot.send_message(ticket[0], f"🛠️ رد الدعم الفني على طلبك #{support_reply_id} للقروب {ticket[1]}:\n\n{raw}")
+            db.execute("UPDATE support_tickets SET status='answered',owner_reply=?,replied_at=? WHERE id=?", (raw, now(), int(support_reply_id))); db.commit()
+            await msg.reply_text(f"✅ تم إرسال الرد لصاحب طلب الدعم #{support_reply_id}.")
+        except Exception:
+            await msg.reply_text("تعذر إرسال الرد في الخاص. يجب أن يكون مقدم الطلب قد بدأ محادثة مع البوت.")
+        context.user_data.pop("support_ticket_reply_id", None); return
+    support_chat_id = context.user_data.get("support_ticket_chat_id")
+    if support_chat_id:
+        if raw.lower() == "/cancel":
+            context.user_data.pop("support_ticket_chat_id", None); await msg.reply_text("تم إلغاء طلب الدعم الفني."); return
+        if not raw or raw.startswith("/") or len(raw) > 3000:
+            await msg.reply_text("أرسل وصفًا واضحًا للمشكلة أو التعديل المطلوب، بحد أقصى 3000 حرف، أو /cancel للإلغاء."); return
+        group_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (int(support_chat_id),)).fetchone()
+        if not group_row:
+            context.user_data.pop("support_ticket_chat_id", None); await msg.reply_text("القروب غير مسجل في البوت. افتح لوحة القروب وحاول مجددًا."); return
+        cur = db.execute("INSERT INTO support_tickets(chat_id,chat_title,user_id,username,display_name,body,status,created_at) VALUES(?,?,?,?,?,?,'new',?)",
+            (int(support_chat_id), group_row[0] or str(support_chat_id), user.id, user.username or "", user.full_name or "", raw[:3000], now()))
+        ticket_id = cur.lastrowid; db.commit(); context.user_data.pop("support_ticket_chat_id", None)
+        await msg.reply_text(f"✅ تم رفع طلب الدعم الفني #{ticket_id}. سيظهر للمالك في لوحة التحكم، ويمكنه الرد عليك هنا.")
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(OWNER_ID,
+                    f"🛠️ طلب دعم فني جديد #{ticket_id}\nالقروب: {group_row[0] or support_chat_id} ({support_chat_id})\nمقدم الطلب: {user.full_name} ({user.id})\nاسم المستخدم: @{user.username or 'غير متوفر'}\n\nالطلب:\n{raw[:2500]}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📂 فتح الطلب", callback_data=f"support_ticket_view:{ticket_id}")],[InlineKeyboardButton("✍️ الرد على الطلب", callback_data=f"support_ticket_reply:{ticket_id}"), InlineKeyboardButton("✅ إغلاق الطلب", callback_data=f"support_ticket_close:{ticket_id}")]]))
+            except Exception as exc:
+                log.warning("could not notify owner about support ticket %s: %s", ticket_id, exc)
+                await msg.reply_text("تم حفظ الطلب، لكن تعذر تنبيه المالك. تأكد من أن المالك بدأ محادثة مع البوت.")
+        return
+
     staff_inquiry_state = context.user_data.get("staff_inquiry_state")
     if staff_inquiry_state:
         context.user_data.pop("staff_inquiry_state", None)
@@ -1910,6 +1991,7 @@ def group_owner_panel_markup(chat_id):
         [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"), InlineKeyboardButton("🪪 إدارة الرتب والصلاحيات", callback_data=f"group_panel_roles:{chat_id}")],
         [InlineKeyboardButton("📋 سجلات هذا القروب", callback_data=f"group_panel_logs:{chat_id}"),
          InlineKeyboardButton("📊 إحصائيات هذا القروب", callback_data=f"group_panel_stats:{chat_id}")],
+        [InlineKeyboardButton("🛠️ التواصل مع الدعم الفني / طلب إصلاح أو تعديل", callback_data=f"group_support_start:{chat_id}")],
         [InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")],
     ])
 
@@ -2780,6 +2862,8 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
+    if not is_group_bot_enabled(chat.id):
+        return
     if msg.from_user and not msg.from_user.is_bot:
         week_key = _week_start()
         db.execute("INSERT INTO weekly_message_activity(chat_id,week_start,user_id,message_count) VALUES(?,?,?,1) ON CONFLICT(chat_id,week_start,user_id) DO UPDATE SET message_count=weekly_message_activity.message_count+1", (chat.id, week_key, msg.from_user.id))
@@ -2925,6 +3009,8 @@ async def edited_filter(update, context):
     msg = update.edited_message
     if not msg or not update.effective_chat:
         return
+    if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not is_group_bot_enabled(update.effective_chat.id):
+        return
     if not is_manager(msg.from_user.id if msg.from_user else 0):
         s = get_settings(update.effective_chat.id)
         if s["edit"]:
@@ -2981,6 +3067,8 @@ async def chat_member_handler(update, context):
         return
     chat_id = cm.chat.id
     register_group(cm.chat)
+    if not is_group_bot_enabled(chat_id):
+        return
     # Define transition values before using them in membership statistics.
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
@@ -3056,6 +3144,9 @@ async def new_members(update, context):
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat or not msg.new_chat_members:
+        return
+    register_group(chat)
+    if not is_group_bot_enabled(chat.id):
         return
 
     try:
@@ -3365,6 +3456,81 @@ async def callback(update, context):
     uid = q.from_user.id
     data = q.data or ""
 
+    # Primary-owner-only runtime controls for individual registered groups.
+    if data == "owner_runtime_groups":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "إدارة تشغيل البوت حصرية للمالك الأساسي.", show_alert=True)
+            return
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+        rows = []
+        for group_chat_id, title in groups[:50]:
+            enabled = is_group_bot_enabled(group_chat_id)
+            state = "🟢 يعمل" if enabled else "⏸️ متوقف"
+            rows.append([InlineKeyboardButton(f"{state} · {title or group_chat_id}", callback_data=f"owner_runtime_group:{group_chat_id}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("لا توجد قروبات مسجلة", callback_data="noop")])
+        rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        await q.edit_message_text("⏯️ إدارة تشغيل البوت لكل قروب\n\nاختر قروبًا لعرض حالته وتشغيل خدماته أو إيقافها. التغيير يؤثر في القروب المحدد فقط.", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("owner_runtime_group:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "إدارة تشغيل البوت حصرية للمالك الأساسي.", show_alert=True)
+            return
+        try:
+            group_chat_id = int(data.split(":", 1)[1])
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
+            return
+        group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+        if not group:
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True)
+            return
+        enabled = is_group_bot_enabled(group_chat_id)
+        label = "🟢 يعمل" if enabled else "⏸️ متوقف"
+        action_label = "⏸️ إيقاف خدمات البوت في هذا القروب" if enabled else "▶️ إعادة تشغيل خدمات البوت في هذا القروب"
+        await q.edit_message_text(
+            f"⏯️ تشغيل البوت في القروب\n\n👥 القروب: {html.escape(group[0] or str(group_chat_id))}\nالحالة الحالية: {label}\n\nإيقاف الخدمات يوقف الحماية التلقائية والردود والترحيب ومتابعة العضوية وأوامر الإدارة التي تمر بفحص الصلاحية في هذا القروب، ولا يؤثر في بقية القروبات. قد تبقى بعض الخدمات العامة متاحة إلى أن نكمل ربط جميعها بمفتاح التشغيل. تبقى لوحة المالك متاحة لإعادة التشغيل.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(action_label, callback_data=f"owner_runtime_toggle:{group_chat_id}")],
+                [InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="owner_runtime_groups")],
+                [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")],
+            ])
+        )
+        return
+
+    if data.startswith("owner_runtime_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "إدارة تشغيل البوت حصرية للمالك الأساسي.", show_alert=True)
+            return
+        try:
+            group_chat_id = int(data.split(":", 1)[1])
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
+            return
+        group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+        if not group:
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True)
+            return
+        new_enabled = not is_group_bot_enabled(group_chat_id)
+        set_group_bot_enabled(group_chat_id, new_enabled, uid)
+        log_action(group_chat_id, uid, "group_runtime", "enabled" if new_enabled else "disabled")
+        await safe_callback_answer(q, "تم تحديث حالة البوت.", show_alert=True)
+        enabled = is_group_bot_enabled(group_chat_id)
+        label = "🟢 يعمل" if enabled else "⏸️ متوقف"
+        action_label = "⏸️ إيقاف خدمات البوت في هذا القروب" if enabled else "▶️ إعادة تشغيل خدمات البوت في هذا القروب"
+        await q.edit_message_text(
+            f"⏯️ تشغيل البوت في القروب\n\n👥 القروب: {html.escape(group[0] or str(group_chat_id))}\nالحالة الحالية: {label}\n\nتم حفظ الحالة في قاعدة البيانات.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(action_label, callback_data=f"owner_runtime_toggle:{group_chat_id}")],
+                [InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="owner_runtime_groups")],
+                [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")],
+            ])
+        )
+        return
+
     if data == "staff_center":
         if not (is_owner(uid) or is_delegated_owner(uid)):
             await safe_callback_answer(q, "إدارة الطاقم حصرية للمالك الأساسي والمالك المفوّض.", show_alert=True); return
@@ -3636,6 +3802,54 @@ async def callback(update, context):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 استدعاء آخر", callback_data="owner_tag_groups")],[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
             )
             return
+
+    if data == "support_tickets_inbox":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "صندوق الدعم الفني للمالك الأساسي فقط.", show_alert=True); return
+        rows = db.execute("SELECT id,chat_title,display_name,status FROM support_tickets WHERE status!='closed' ORDER BY id DESC LIMIT 30").fetchall()
+        buttons = [[InlineKeyboardButton(f"#{iid} · {title or 'قروب'} · {name or 'مشرف'} · {('جديد' if status=='new' else 'تم الرد' if status=='answered' else status)}", callback_data=f"support_ticket_view:{iid}")] for iid,title,name,status in rows]
+        if not buttons: buttons = [[InlineKeyboardButton("لا توجد طلبات دعم مفتوحة", callback_data="noop")]]
+        buttons.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        await q.edit_message_text("🛠️ طلبات الدعم الفني للقروبات\nاختر طلبًا لمراجعته والرد عليه.", reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("group_support_start:"):
+        try: group_chat_id = int(data.split(":",1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
+            await safe_callback_answer(q, "رفع طلب الدعم متاح لمالك القروب ومشرفيه فقط.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
+            await safe_callback_answer(q, "القروب غير مسجل في البوت بعد.", show_alert=True); return
+        try:
+            await context.bot.send_message(uid, f"🛠️ طلب دعم فني للقروب {group_chat_id}\nاكتب وصف الإصلاح أو التعديل المطلوب في رسالة واحدة. لا يظهر وصف المشكلة لأعضاء القروب. أرسل /cancel للإلغاء.")
+            context.user_data["support_ticket_chat_id"] = group_chat_id
+            await safe_callback_answer(q, "تم فتح طلب الدعم في الخاص مع البوت.", show_alert=True)
+        except Exception:
+            await safe_callback_answer(q, "افتح البوت في الخاص واضغط /start أولًا، ثم ارجع واضغط زر الدعم مرة أخرى.", show_alert=True)
+        return
+    if data.startswith("support_ticket_view:"):
+        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        row=db.execute("SELECT chat_id,chat_title,user_id,username,display_name,body,status,owner_reply FROM support_tickets WHERE id=?",(iid,)).fetchone()
+        if not row: await safe_callback_answer(q,"طلب الدعم غير موجود.",show_alert=True); return
+        text=f"🛠️ طلب الدعم الفني #{iid}\nالقروب: {row[1] or row[0]} ({row[0]})\nالحالة: {row[6]}\nمقدم الطلب: {row[4] or 'غير معروف'} ({row[2]})\nالمستخدم: @{row[3] or 'غير متوفر'}\n\nالطلب:\n{row[5]}\n\nآخر رد:\n{row[7] or 'لا يوجد'}"
+        await q.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"support_ticket_reply:{iid}"),InlineKeyboardButton("✅ إغلاق",callback_data=f"support_ticket_close:{iid}")],[InlineKeyboardButton("⬅️ صندوق الدعم",callback_data="support_tickets_inbox")]])); return
+    if data.startswith("support_ticket_reply:"):
+        if not is_owner(uid): await safe_callback_answer(q,"الرد للمالك الأساسي فقط.",show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        if not db.execute("SELECT 1 FROM support_tickets WHERE id=?",(iid,)).fetchone(): await safe_callback_answer(q,"طلب الدعم غير موجود.",show_alert=True); return
+        context.user_data["support_ticket_reply_id"]=iid
+        await q.message.reply_text(f"✍️ أرسل ردك على طلب الدعم الفني #{iid} برسالة واحدة. سيصل الرد لمقدم الطلب في الخاص. /cancel للإلغاء."); return
+    if data.startswith("support_ticket_close:"):
+        if not is_owner(uid): await safe_callback_answer(q,"الإغلاق للمالك الأساسي فقط.",show_alert=True); return
+        try: iid=int(data.split(":",1)[1])
+        except ValueError: return
+        db.execute("UPDATE support_tickets SET status='closed' WHERE id=?",(iid,)); db.commit()
+        await safe_callback_answer(q,"تم إغلاق طلب الدعم.")
+        try: await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔒 تم إغلاق الطلب",callback_data="noop")],[InlineKeyboardButton("⬅️ صندوق الدعم",callback_data="support_tickets_inbox")]]))
+        except Exception: pass
+        return
 
     # لوحة القروب المحلية: كل callback يعيد التحقق من كون المستخدم مشرف Telegram في القروب نفسه.
     if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:")):
