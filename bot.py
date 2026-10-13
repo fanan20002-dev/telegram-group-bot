@@ -243,6 +243,19 @@ CREATE TABLE IF NOT EXISTS publish_permissions(
     PRIMARY KEY(user_id, chat_id)
 )
 """)
+# Explicit scope for delegated owners: only assigned groups are visible/manageable.
+db.execute("""CREATE TABLE IF NOT EXISTS delegated_group_access(
+    user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+    granted_by INTEGER NOT NULL, granted_at TEXT NOT NULL,
+    PRIMARY KEY(user_id,chat_id)
+)""")
+# Revocable system-level access to inquiry/support inboxes; never implies group access.
+db.execute("""CREATE TABLE IF NOT EXISTS delegated_capabilities(
+    user_id INTEGER NOT NULL, capability TEXT NOT NULL,
+    granted_by INTEGER NOT NULL, granted_at TEXT NOT NULL,
+    PRIMARY KEY(user_id,capability)
+)""")
+db.commit()
 
 db.execute("""
 CREATE TABLE IF NOT EXISTS group_roles(
@@ -824,21 +837,49 @@ def remember_delegated_user(user):
                    (user.full_name or '', user.username or '', user.id))
         db.commit()
 
+def delegated_has_group_access(uid, chat_id):
+    if is_owner(uid):
+        return True
+    return bool(db.execute("SELECT 1 FROM delegated_group_access WHERE user_id=? AND chat_id=?", (uid, chat_id)).fetchone())
+
+def delegated_has_capability(uid, capability):
+    if is_owner(uid):
+        return True
+    return bool(db.execute("SELECT 1 FROM delegated_capabilities WHERE user_id=? AND capability=?", (uid, capability)).fetchone())
+
+def delegated_manage_view(target_uid):
+    groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+    all_access = bool(groups) and all(delegated_has_group_access(target_uid, cid) for cid,_ in groups)
+    rows = [[InlineKeyboardButton("🌐 سحب صلاحيات كل القروبات" if all_access else "🌐 منح كل القروبات", callback_data=f"delegated_groups_all:{target_uid}")]]
+    for cid, title in groups[:35]:
+        granted = delegated_has_group_access(target_uid, cid)
+        rows.append([InlineKeyboardButton(("✅ " if granted else "⬜️ ") + (title or str(cid)), callback_data=f"delegated_group_toggle:{target_uid}:{cid}")])
+    rows.append([InlineKeyboardButton(("✅ " if delegated_has_capability(target_uid,"inquiries") else "⬜️ ")+"صندوق الاستفسارات العامة", callback_data=f"delegated_cap_toggle:{target_uid}:inquiries")])
+    rows.append([InlineKeyboardButton(("✅ " if delegated_has_capability(target_uid,"support") else "⬜️ ")+"صندوق الدعم الفني", callback_data=f"delegated_cap_toggle:{target_uid}:support")])
+    rows.append([InlineKeyboardButton(("✅ " if delegated_has_capability(target_uid,"staff_inquiries") else "⬜️ ")+"استفسارات الطاقم", callback_data=f"delegated_cap_toggle:{target_uid}:staff_inquiries")])
+    rows.append([InlineKeyboardButton("🛑 عزل هذا المالك المفوض", callback_data=f"delegated_remove_confirm:{target_uid}")])
+    rows.append([InlineKeyboardButton("⬅️ قائمة المالكين", callback_data="delegated_owner")])
+    text=(f"👑 إدارة تفويض المالك\nالمفوّض: {user_display_name(target_uid)}\n\n"
+          "القروبات المحددة فقط ستظهر له في لوحته. عند منح قروب، يحتفظ بصلاحياته التشغيلية الحالية داخله.\n"
+          "يمكنك منح/سحب صناديق الاستفسارات والدعم بشكل مستقل.\n\n"
+          "✅ ممنوح  |  ⬜️ غير ممنوح")
+    return text, InlineKeyboardMarkup(rows)
+
 def can_publish_to(uid, chat_id):
     """المالك والمفوّض ينشران في جميع القروبات المسجلة التي يوجد فيها البوت."""
     if is_owner(uid):
         return True
     if not is_delegated_owner(uid):
         return False
-    return bool(db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone())
+    return delegated_has_group_access(uid, chat_id) and bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND (chat_id=? OR chat_id=0)", (uid, chat_id)).fetchone())
 
 async def can_publish_to_live(bot, uid, chat_id):
     """السماح للمالك والمفوّض بالنشر إلى القروبات المسجلة؛ صلاحية الإرسال الفعلية تعتمد على وجود البوت فيها."""
     if is_owner(uid):
         return True
-    return is_delegated_owner(uid) and bool(
+    return is_delegated_owner(uid) and delegated_has_group_access(uid, chat_id) and bool(
         db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
-    )
+    ) and bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND (chat_id=? OR chat_id=0)", (uid, chat_id)).fetchone())
 
 async def is_telegram_group_admin(bot, uid, chat_id):
     """تحقق فعلي من أن المستخدم مالك/مشرف في هذا القروب عبر Telegram."""
@@ -855,7 +896,9 @@ async def can_access_group(bot, uid, chat_id):
         return False
     if is_owner(uid):
         return True
-    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+    if is_delegated_owner(uid):
+        return delegated_has_group_access(uid, chat_id)
+    if is_general_manager(uid) or is_protection_manager(uid):
         return True
     if group_role(chat_id, uid):
         try:
@@ -867,7 +910,7 @@ async def can_access_group(bot, uid, chat_id):
 
 async def accessible_groups(bot, uid):
     groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-    if is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+    if is_owner(uid) or (not is_delegated_owner(uid) and (is_general_manager(uid) or is_protection_manager(uid))):
         return groups
     allowed = []
     for chat_id, title in groups:
@@ -931,7 +974,7 @@ def has_group_permission(chat_id, uid, permission):
     if is_owner(uid):
         return True
     if is_delegated_owner(uid):
-        return True  # مفوّض البوت يملك إدارة تشغيلية للقروبات التي هو عضو فيها
+        return delegated_has_group_access(uid, chat_id)
     if is_general_manager(uid) or is_protection_manager(uid):
         return True
     return permission in GROUP_ROLE_PERMISSIONS.get(group_role(chat_id, uid), set())
@@ -984,41 +1027,64 @@ def register_group(chat):
     ensure_auto_replies(chat.id)
 
 def panel_markup(uid):
-    """واجهة مرتبة حسب الدور، مع الحفاظ على جميع أقسام الإدارة السابقة."""
-    # يجمع نص الزر الأيقونة الوظيفية الجديدة مع مسمى القسم السابق حتى لا تضيع أي وظيفة.
+    """لوحة إدارة منظمة حسب الوظيفة والدور؛ تحافظ على معرّفات الأزرار الحالية."""
     if is_delegated_owner(uid) and not is_owner(uid):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
-            [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
-            [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
-            [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
-            [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
-            [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
-            [InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
-            [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
-        ])
-    owner_rows = [
-        [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration")],
+        rows = [
+            [InlineKeyboardButton("🛡️ الحماية والرادار الأمني", callback_data="security_groups"),
+             InlineKeyboardButton("👥 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
+            [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"),
+             InlineKeyboardButton("🏅 الرتب الإدارية", callback_data="roles_groups")],
+            [InlineKeyboardButton("📣 مركز الإعلانات والنشر", callback_data="broadcast_start"),
+             InlineKeyboardButton("📣 استدعاء التاق", callback_data="owner_tag_groups")],
+            [InlineKeyboardButton("👋 الترحيب الذكي", callback_data="welcome"),
+             InlineKeyboardButton("💬 الردود الآلية للقروبات المصرح بها", callback_data="owner_autoreplies")],
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
+             InlineKeyboardButton("📋 سجل المخالفات والعمليات", callback_data="logs")],
+            [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"),
+             InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
+            [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"),
+             InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
+            [InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center"),
+             InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
+        ]
+        if delegated_has_capability(uid, "inquiries"):
+            rows.append([InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox")])
+        if delegated_has_capability(uid, "support"):
+            rows.append([InlineKeyboardButton("🛠️ طلبات الدعم الفني", callback_data="support_tickets_inbox")])
+        if delegated_has_capability(uid, "staff_inquiries"):
+            rows.append([InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox")])
+        return InlineKeyboardMarkup(rows)
+
+    rows = [
+        [InlineKeyboardButton("🛡️ الحماية والرادار الأمني", callback_data="security"),
+         InlineKeyboardButton("👥 إدارة الأعضاء والإشراف", callback_data="administration")],
         [InlineKeyboardButton("⚡ أوامر الحماية الجماعية", callback_data="bulk_security")],
-        [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
-        [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
-        [InlineKeyboardButton("🎮🕹️ الألعاب والتحديات", callback_data="games"), InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
-        [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
-        [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
-        [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
-        [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
-        [InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center")],
-        [InlineKeyboardButton("🛠️ طلبات الدعم الفني للقروبات", callback_data="support_tickets_inbox")],
-        [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
-        [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
-        [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
-        [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"), InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
+        [InlineKeyboardButton("⏯️ تشغيل / إيقاف البوت لكل قروب", callback_data="owner_runtime_groups")],
+        [InlineKeyboardButton("📣 مركز الإعلانات والنشر", callback_data="broadcast_start"),
+         InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
+        [InlineKeyboardButton("👋 الترحيب الذكي", callback_data="welcome"),
+         InlineKeyboardButton("💬 الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
+         InlineKeyboardButton("📋 سجل المخالفات والعمليات", callback_data="logs")],
+        [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"),
+         InlineKeyboardButton("🏅 الرتب الإدارية", callback_data="roles_groups")],
+        [InlineKeyboardButton("🎮 الألعاب والتحديات", callback_data="games"),
+         InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
+        [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"),
+         InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
+        [InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox"),
+         InlineKeyboardButton("🛠️ طلبات الدعم الفني", callback_data="support_tickets_inbox")],
+        [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"),
+         InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center")],
+        [InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks"),
+         InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
+        [InlineKeyboardButton("👑 إدارة المالكين المفوضين", callback_data="delegated_owner"),
+         InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
+        [InlineKeyboardButton("🔐 أرشيف الرسائل الخاصة", callback_data="archive"),
+         InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
+        [InlineKeyboardButton("🔄 إدارة تحديثات البوت", callback_data="update_manager")],
     ]
-    if is_owner(uid):
-        owner_rows.insert(1, [InlineKeyboardButton("⏯️ تشغيل / إيقاف البوت لكل قروب", callback_data="owner_runtime_groups")])
-        owner_rows.append([InlineKeyboardButton("🔄 إدارة تحديثات البوت", callback_data="update_manager")])
-    return InlineKeyboardMarkup(owner_rows)
+    return InlineKeyboardMarkup(rows)
 
 def settings_page_markup(chat_id, page=0, back_callback="home"):
     items = [
@@ -3578,8 +3644,8 @@ async def callback(update, context):
         body="\n\n".join(f"#{i} · قروب {c} · العضو {u}\n{t}" for i,c,u,t,st in rows) or "لا توجد اعتراضات جديدة. استقبال الاعتراضات يحتاج تفعيل مسار تقديمها في القروب."
         await q.edit_message_text("⚖️ مراجعة الاعتراضات\n\n"+body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")]])); return
     if data == "staff_inquiries_inbox":
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q,"صندوق الطاقم للمالك والمفوّض فقط.",show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"staff_inquiries")):
+            await safe_callback_answer(q,"لا تملك صلاحية صندوق استفسارات الطاقم.",show_alert=True); return
         rows=db.execute("SELECT id,user_id,body,status FROM staff_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 20").fetchall()
         body="\n\n".join(f"#{i} · {u} · {st}\n{b[:400]}" for i,u,b,st in rows) or "لا توجد استفسارات طاقم مفتوحة."
         await q.edit_message_text("📨 استفسارات الطاقم\n\n"+body,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ مركز الطاقم",callback_data="staff_center")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
@@ -3590,23 +3656,23 @@ async def callback(update, context):
         await q.message.reply_text("💬 اكتب استفسارك هنا في الخاص. سيصل إلى المالك الأساسي فقط، ولن يظهر في القروب. أرسل /cancel للإلغاء.")
         return
     if data == "inquiries_inbox":
-        if not is_owner(uid):
-            await safe_callback_answer(q, "صندوق الاستفسارات للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"inquiries")):
+            await safe_callback_answer(q, "لا تملك صلاحية صندوق الاستفسارات.", show_alert=True); return
         rows = db.execute("SELECT id,display_name,inquiry_text,status FROM general_inquiries WHERE status!='closed' ORDER BY id DESC LIMIT 20").fetchall()
         if not rows:
             await q.edit_message_text("📨 لا توجد استفسارات مفتوحة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
         kb = [[InlineKeyboardButton(f"#{iid} · {name or 'عضو'} · {'جديد' if status=='new' else 'تم الرد' if status=='answered' else status}", callback_data=f"inquiry_view:{iid}")] for iid,name,body,status in rows]
         kb.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
-        await q.edit_message_text("📨 صندوق الاستفسارات العامة — المالك الأساسي فقط", reply_markup=InlineKeyboardMarkup(kb)); return
+        await q.edit_message_text("📨 صندوق الاستفسارات العامة — حسب الصلاحيات الممنوحة", reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("inquiry_view:"):
-        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"inquiries")): await safe_callback_answer(q, "لا تملك صلاحية صندوق الاستفسارات.", show_alert=True); return
         try: iid=int(data.split(":",1)[1])
         except ValueError: return
         row=db.execute("SELECT user_id,username,display_name,inquiry_text,status,reply_text FROM general_inquiries WHERE id=?",(iid,)).fetchone()
         if not row: await safe_callback_answer(q,"الاستفسار غير موجود.",show_alert=True); return
         await q.edit_message_text(f"📨 الاستفسار #{iid}\nالحالة: {row[4]}\nالاسم: {row[2]}\nالمستخدم: @{row[1] or 'غير متوفر'}\nالمعرّف: {row[0]}\n\n{row[3]}\n\nالرد السابق: {row[5] or 'لا يوجد'}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد", callback_data=f"inquiry_reply:{iid}"),InlineKeyboardButton("✅ إغلاق", callback_data=f"inquiry_close:{iid}")],[InlineKeyboardButton("⬅️ الصندوق",callback_data="inquiries_inbox")]])); return
     if data.startswith("inquiry_reply:"):
-        if not is_owner(uid): await safe_callback_answer(q,"الرد للمالك الأساسي فقط.",show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"inquiries")): await safe_callback_answer(q,"لا تملك صلاحية الرد على الاستفسارات.",show_alert=True); return
         try: iid=int(data.split(":",1)[1])
         except ValueError: return
         if not db.execute("SELECT 1 FROM general_inquiries WHERE id=?",(iid,)).fetchone(): await safe_callback_answer(q,"الاستفسار غير موجود.",show_alert=True); return
@@ -3614,7 +3680,7 @@ async def callback(update, context):
         await q.message.reply_text(f"✍️ أرسل الآن ردك على الاستفسار #{iid} في رسالة واحدة. /cancel للإلغاء.")
         return
     if data.startswith("inquiry_close:"):
-        if not is_owner(uid): await safe_callback_answer(q,"الإغلاق للمالك الأساسي فقط.",show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"inquiries")): await safe_callback_answer(q,"لا تملك صلاحية إغلاق الاستفسارات.",show_alert=True); return
         try: iid=int(data.split(":",1)[1])
         except ValueError: return
         db.execute("UPDATE general_inquiries SET status='closed' WHERE id=?",(iid,)); db.commit()
@@ -3804,8 +3870,8 @@ async def callback(update, context):
             return
 
     if data == "support_tickets_inbox":
-        if not is_owner(uid):
-            await safe_callback_answer(q, "صندوق الدعم الفني للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"support")):
+            await safe_callback_answer(q, "لا تملك صلاحية صندوق الدعم الفني.", show_alert=True); return
         rows = db.execute("SELECT id,chat_title,display_name,status FROM support_tickets WHERE status!='closed' ORDER BY id DESC LIMIT 30").fetchall()
         buttons = [[InlineKeyboardButton(f"#{iid} · {title or 'قروب'} · {name or 'مشرف'} · {('جديد' if status=='new' else 'تم الرد' if status=='answered' else status)}", callback_data=f"support_ticket_view:{iid}")] for iid,title,name,status in rows]
         if not buttons: buttons = [[InlineKeyboardButton("لا توجد طلبات دعم مفتوحة", callback_data="noop")]]
@@ -3815,6 +3881,8 @@ async def callback(update, context):
         try: group_chat_id = int(data.split(":",1)[1])
         except ValueError:
             await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if is_delegated_owner(uid) and not is_owner(uid) and not delegated_has_group_access(uid, group_chat_id):
+            await safe_callback_answer(q, "لم يمنحك المالك الأساسي صلاحية هذا القروب.", show_alert=True); return
         if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
             await safe_callback_answer(q, "رفع طلب الدعم متاح لمالك القروب ومشرفيه فقط.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
@@ -3835,14 +3903,14 @@ async def callback(update, context):
         text=f"🛠️ طلب الدعم الفني #{iid}\nالقروب: {row[1] or row[0]} ({row[0]})\nالحالة: {row[6]}\nمقدم الطلب: {row[4] or 'غير معروف'} ({row[2]})\nالمستخدم: @{row[3] or 'غير متوفر'}\n\nالطلب:\n{row[5]}\n\nآخر رد:\n{row[7] or 'لا يوجد'}"
         await q.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ الرد",callback_data=f"support_ticket_reply:{iid}"),InlineKeyboardButton("✅ إغلاق",callback_data=f"support_ticket_close:{iid}")],[InlineKeyboardButton("⬅️ صندوق الدعم",callback_data="support_tickets_inbox")]])); return
     if data.startswith("support_ticket_reply:"):
-        if not is_owner(uid): await safe_callback_answer(q,"الرد للمالك الأساسي فقط.",show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"support")): await safe_callback_answer(q,"لا تملك صلاحية الرد على طلبات الدعم.",show_alert=True); return
         try: iid=int(data.split(":",1)[1])
         except ValueError: return
         if not db.execute("SELECT 1 FROM support_tickets WHERE id=?",(iid,)).fetchone(): await safe_callback_answer(q,"طلب الدعم غير موجود.",show_alert=True); return
         context.user_data["support_ticket_reply_id"]=iid
         await q.message.reply_text(f"✍️ أرسل ردك على طلب الدعم الفني #{iid} برسالة واحدة. سيصل الرد لمقدم الطلب في الخاص. /cancel للإلغاء."); return
     if data.startswith("support_ticket_close:"):
-        if not is_owner(uid): await safe_callback_answer(q,"الإغلاق للمالك الأساسي فقط.",show_alert=True); return
+        if not (is_owner(uid) or delegated_has_capability(uid,"support")): await safe_callback_answer(q,"لا تملك صلاحية إغلاق طلبات الدعم.",show_alert=True); return
         try: iid=int(data.split(":",1)[1])
         except ValueError: return
         db.execute("UPDATE support_tickets SET status='closed' WHERE id=?",(iid,)); db.commit()
@@ -3859,8 +3927,10 @@ async def callback(update, context):
         except (ValueError, TypeError):
             await safe_callback_answer(q, "بيانات القروب غير صحيحة.", show_alert=True)
             return
+        if is_delegated_owner(uid) and not is_owner(uid) and not delegated_has_group_access(uid, group_chat_id):
+            await safe_callback_answer(q, "لم يمنحك المالك الأساسي صلاحية هذا القروب.", show_alert=True); return
         if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
-            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض المصرح له ومشرفي هذا القروب فقط.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
             await safe_callback_answer(q, "القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
@@ -5432,9 +5502,9 @@ async def callback(update, context):
             await q.edit_message_text("⛔ هذا القسم للمالك الأساسي فقط.")
             return
         rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
-        text = "👑 المالكون المفوّضون وصلاحيات النشر\n\n"
+        text = "👑 المالكون المفوّضون وتوزيع القروبات والصلاحيات\n\n"
         text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in rows) if rows else "لا يوجد مالكون مفوّضون."
-        text += "\n\nاختر مالكًا مفوضًا لإدارة صلاحياته. الإضافة والعزل تتمان من هذه اللوحة في الخاص."
+        text += "\n\nاختر المالك المفوض لتحديد القروبات التي تظهر له وصلاحيات صناديق الاستفسارات والدعم. الإضافة والعزل من هذه اللوحة في الخاص."
         buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — الصلاحيات", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
         buttons.insert(0, [InlineKeyboardButton("➕ إضافة مالك مفوّض", callback_data="delegated_add_start")])
         buttons += [[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
@@ -5464,15 +5534,59 @@ async def callback(update, context):
             await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
         if not is_delegated_owner(target_uid) or is_owner(target_uid):
             await q.edit_message_text("هذا المالك المفوض لم يعد مسجلًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ المالكون المفوضون", callback_data="delegated_owner")]])); return
-        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-        all_granted = bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=0", (target_uid,)).fetchone())
-        buttons = [[InlineKeyboardButton(("🌐 سحب صلاحية جميع القروبات" if all_granted else "🌐 منح صلاحية جميع القروبات"), callback_data=f"delegated_all:{target_uid}:{0 if all_granted else 1}")]]
-        for chat_id,title in groups[:30]:
-            granted = all_granted or bool(db.execute("SELECT 1 FROM publish_permissions WHERE user_id=? AND chat_id=?", (target_uid,chat_id)).fetchone())
-            buttons.append([InlineKeyboardButton(("✅ " if granted else "⬜️ ") + (title or str(chat_id)), callback_data=f"pubperm_toggle:{target_uid}:{chat_id}")])
-        buttons += [[InlineKeyboardButton("🛑 عزل هذا المالك المفوض", callback_data=f"delegated_remove_confirm:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة المالكين", callback_data="delegated_owner")]]
-        await q.edit_message_text(f"👑 إدارة صلاحيات النشر\nالمالك المفوض: {user_display_name(target_uid)}\n\n✅ = لديه صلاحية النشر في القروب\n⬜️ = لا يملك صلاحية النشر", reply_markup=InlineKeyboardMarkup(buttons))
+        text, markup = delegated_manage_view(target_uid)
+        await q.edit_message_text(text[:3900], reply_markup=markup)
         return
+
+    if data.startswith("delegated_group_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+        try: _, target_raw, chat_raw = data.split(":", 2); target_uid=int(target_raw); chat_id=int(chat_raw)
+        except ValueError:
+            await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q, "المالك المفوض غير مسجل.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
+        if delegated_has_group_access(target_uid, chat_id):
+            db.execute("DELETE FROM delegated_group_access WHERE user_id=? AND chat_id=?", (target_uid,chat_id)); note="تم سحب صلاحية القروب"
+        else:
+            db.execute("INSERT OR REPLACE INTO delegated_group_access(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,chat_id,uid,now())); note="تم منح صلاحية القروب"
+        db.commit(); await safe_callback_answer(q, note)
+        text, markup = delegated_manage_view(target_uid)
+        await q.edit_message_text(text[:3900], reply_markup=markup); return
+
+    if data.startswith("delegated_groups_all:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+        try: target_uid=int(data.split(":",1)[1])
+        except ValueError: return
+        if not db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q, "المالك المفوض غير مسجل.", show_alert=True); return
+        groups=db.execute("SELECT chat_id FROM watched_groups").fetchall()
+        all_access=bool(groups) and all(delegated_has_group_access(target_uid,cid) for cid, in groups)
+        if all_access:
+            db.execute("DELETE FROM delegated_group_access WHERE user_id=?", (target_uid,)); note="تم سحب صلاحيات جميع القروبات"
+        else:
+            for cid, in groups:
+                db.execute("INSERT OR REPLACE INTO delegated_group_access(user_id,chat_id,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,cid,uid,now()))
+            note="تم منح صلاحيات جميع القروبات"
+        db.commit(); await safe_callback_answer(q,note)
+        text, markup=delegated_manage_view(target_uid); await q.edit_message_text(text[:3900], reply_markup=markup); return
+
+    if data.startswith("delegated_cap_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذا الإجراء للمالك الأساسي فقط.", show_alert=True); return
+        try: _, target_raw, capability=data.split(":",2); target_uid=int(target_raw)
+        except ValueError: return
+        if capability not in {"inquiries","support","staff_inquiries"} or not db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q,"بيانات الصلاحية غير صحيحة.",show_alert=True); return
+        if delegated_has_capability(target_uid,capability):
+            db.execute("DELETE FROM delegated_capabilities WHERE user_id=? AND capability=?", (target_uid,capability)); note="تم سحب الصلاحية"
+        else:
+            db.execute("INSERT OR REPLACE INTO delegated_capabilities(user_id,capability,granted_by,granted_at) VALUES(?,?,?,?)", (target_uid,capability,uid,now())); note="تم منح الصلاحية"
+        db.commit(); await safe_callback_answer(q,note)
+        text, markup=delegated_manage_view(target_uid); await q.edit_message_text(text[:3900], reply_markup=markup); return
 
     if data.startswith("pubperm_toggle:"):
         if not is_owner(uid):
@@ -5524,6 +5638,8 @@ async def callback(update, context):
             db.execute("INSERT OR REPLACE INTO publish_permissions(user_id,chat_id,granted_by,granted_at) VALUES(?,0,?,?)", (target_uid,uid,now()))
         else:
             db.execute("DELETE FROM publish_permissions WHERE user_id=?", (target_uid,))
+        db.execute("DELETE FROM delegated_group_access WHERE user_id=?", (target_uid,))
+        db.execute("DELETE FROM delegated_capabilities WHERE user_id=?", (target_uid,))
         db.commit()
         await safe_callback_answer(q, "تم تحديث الصلاحية.")
         # Reuse the management view by re-entering it.
