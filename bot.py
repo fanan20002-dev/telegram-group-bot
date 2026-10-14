@@ -1366,10 +1366,10 @@ def role_name(uid):
     return "👤 عضو"
 
 GROUP_ROLE_PERMISSIONS = {
-    "مشرف": {"delete", "mute", "unmute"},
-    "مشرف عام": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
-    "مدير": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
-    "مدير عام": {"delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection", "manage_roles", "logs", "welcome", "stats"},
+    "مشرف": {"links", "delete", "mute", "unmute"},
+    "مشرف عام": {"links", "delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
+    "مدير": {"links", "delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection"},
+    "مدير عام": {"links", "delete", "mute", "unmute", "kick", "ban", "unban", "pin", "protection", "manage_roles", "logs", "welcome", "stats"},
 }
 
 
@@ -2766,15 +2766,15 @@ async def group_role_command(update, context):
     user = update.effective_user
     if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    # مالك البوت/المفوّض يدير رتب البوت، كما يمكن لمالك القروب ومشرفيه
-    # إدارة الرتب المحلية داخل قروبهم فقط بعد التحقق من صلاحيات Telegram.
-    if not (is_owner(user.id) or is_delegated_owner(user.id)):
-        if not await is_telegram_group_admin(context.bot, user.id, chat.id):
-            await msg.reply_text("⛔ إدارة الرتب متاحة لمالك القروب ومشرفيه فقط.")
-            return
-    elif is_delegated_owner(user.id) and not is_owner(user.id):
+    # Security: Telegram admin status alone must not grant bot-role delegation.
+    # Only the bot owner/delegate, or a bot-assigned role with manage_roles, may assign/remove local roles.
+    if not (is_owner(user.id) or is_delegated_owner(user.id)
+            or has_group_permission(chat.id, user.id, "manage_roles")):
+        await msg.reply_text("⛔ توزيع رتب البوت يتطلب تفويضًا من المالك الأساسي أو المالك المفوّض.")
+        return
+    if is_delegated_owner(user.id) and not is_owner(user.id):
         if not await can_access_group(context.bot, user.id, chat.id):
-            await msg.reply_text("⛔ يجب أن تكون عضوًا في القروب لإدارة رتب البوت فيه.")
+            await msg.reply_text("⛔ لا تملك صلاحية إدارة هذا القروب.")
             return
     text = (msg.text or "").strip()
     match = re.fullmatch(r"(?:رفع|ترقية)\s+(مشرف عام|مدير عام|مشرف|مدير)", text)
@@ -2804,7 +2804,7 @@ async def group_role_command(update, context):
                (chat.id, target.id, role, user.id, now()))
     db.commit()
     log_action(chat.id, user.id, "group_role_granted", f"target={target.id};role={role}")
-    labels = {"delete": "حذف الرسائل", "mute": "الكتم", "unmute": "فك الكتم ومسح قائمة المكتومين", "kick": "الطرد", "ban": "الحظر", "unban": "فك الحظر", "pin": "تثبيت الرسائل", "protection": "قفل وفتح الروابط وبقية إعدادات الحماية", "manage_roles": "إدارة رتب القروب", "logs": "عرض السجلات", "welcome": "إدارة الترحيب", "stats": "عرض الإحصائيات"}
+    labels = {"links": "السماح بنشر الروابط", "delete": "حذف الرسائل", "mute": "الكتم", "unmute": "فك الكتم ومسح قائمة المكتومين", "kick": "الطرد", "ban": "الحظر", "unban": "فك الحظر", "pin": "تثبيت الرسائل", "protection": "قفل وفتح الروابط وبقية إعدادات الحماية", "manage_roles": "إدارة رتب القروب", "logs": "عرض السجلات", "welcome": "إدارة الترحيب", "stats": "عرض الإحصائيات"}
     permissions = "، ".join(labels.get(item, item) for item in sorted(GROUP_ROLE_PERMISSIONS[role]))
     await msg.reply_text(
         f"✅ تم رفع {target.full_name} إلى رتبة {role} داخل البوت.\n"
@@ -2902,7 +2902,11 @@ async def ban(update, context):
         await update.message.reply_text(f"❌ تعذر الحظر: {e}")
 
 async def unban(update, context):
-    if not await require_group_permission(update, "unban"): return
+    # Re-entry policy: only the primary owner or an authorized delegated owner may lift a ban.
+    actor_id = update.effective_user.id if update.effective_user else 0
+    if not (is_owner(actor_id) or is_delegated_owner(actor_id)):
+        await update.message.reply_text("⛔ فك الحظر والسماح بالعودة من صلاحية المالك الأساسي أو المالك المفوّض فقط.")
+        return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم /unban رقم_المستخدم أو بالرد.")
@@ -2923,10 +2927,11 @@ async def kick(update, context):
         return
     uid = target.id if hasattr(target, "id") else target
     try:
+        # Keep the Telegram ban in place so the member cannot rejoin or submit another join request
+        # until the primary/delegated owner explicitly approves the return.
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
-        await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
         log_action(update.effective_chat.id, update.effective_user.id, "kick", str(uid))
-        await update.message.reply_text("✅ تم طرد العضو.")
+        await update.message.reply_text("✅ تم طرد العضو وإبقاؤه محظورًا من العودة حتى يرفع المالك الأساسي أو المالك المفوّض الحظر.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر الطرد: {e}")
 
@@ -3430,8 +3435,13 @@ async def message_filter(update, context):
     delete = False
     reason = ""
 
+    # Allow links only for bot-authorized roles; Telegram admin status alone does not
+    # grant an implicit bypass. This keeps the whitelist controlled by the owner/delegate.
     if s["links"] and has_link(msg.text or msg.caption):
-        delete, reason = True, "رابط"
+        sender_id = msg.from_user.id if msg.from_user and not msg.from_user.is_bot else 0
+        link_allowed = bool(sender_id) and has_group_permission(chat.id, sender_id, "links")
+        if not link_allowed:
+            delete, reason = True, "رابط"
     if s["photos"] and msg.photo:
         delete, reason = True, "صورة"
     if s["videos"] and (msg.video or msg.video_note):
@@ -3814,10 +3824,15 @@ async def broadcast_draft_message(update, context):
             if action == "ban":
                 await context.bot.ban_chat_member(chat_id, target_id)
             elif action == "unban":
+                if not (is_owner(user.id) or is_delegated_owner(user.id)):
+                    await msg.reply_text("⛔ فك الحظر والسماح بالعودة من صلاحية المالك الأساسي أو المالك المفوّض فقط.")
+                    context.user_data.pop("awaiting_admin_action", None)
+                    return
                 await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
+                db.execute("UPDATE reentry_restrictions SET status='approved' WHERE chat_id=? AND user_id=?", (chat_id, target_id)); db.commit()
             elif action == "kick":
+                # Persistent ban: the member remains blocked until owner/delegated owner lifts it.
                 await context.bot.ban_chat_member(chat_id, target_id)
-                await context.bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
             elif action == "mute":
                 await context.bot.restrict_chat_member(chat_id, target_id, permissions=ChatPermissions(can_send_messages=False))
                 db.execute("INSERT OR REPLACE INTO group_mutes(chat_id,user_id,muted_by,muted_at) VALUES(?,?,?,?)", (chat_id, target_id, user.id, now())); db.commit()
@@ -5890,8 +5905,9 @@ async def callback(update, context):
             f"👥 إدارة الرتب — {title}\n\n"
             "بالقروب المحدد، رد على رسالة العضو بأحد الأوامر التالية:\n"
             "• رفع مشرف\n• رفع مشرف عام\n• رفع مدير\n• رفع مدير عام\n• تنزيل رتبة\n\n"
-            "🛡️ تُمنح الصلاحيات المعرّفة لكل رتبة تلقائيًا داخل البوت.\n"
-            "🔒 لا يمكن ترقية المالك الأساسي أو المالك المفوّض، ولا تتغير صلاحيات تيليجرام الأصلية تلقائيًا.",
+            "🛡️ تُمنح الصلاحيات المعرّفة لكل رتبة تلقائيًا داخل البوت، وتشمل صلاحية نشر الروابط للرتب المعتمدة.\n"
+            "🔒 لا يمكن ترقية المالك الأساسي أو المالك المفوّض، ولا تتغير صلاحيات تيليجرام الأصلية تلقائيًا.\n"
+            "⚠️ توزيع الرتب يتطلب تفويضًا داخل البوت؛ صفة مشرف Telegram وحدها لا تكفي.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القروبات", callback_data="roles_groups")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
         )
         return
