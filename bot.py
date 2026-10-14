@@ -2010,28 +2010,53 @@ async def assistant_private_text(update, context):
     if context.user_data.pop("_skip_assistant_private_message_id", None) == msg.message_id:
         return
     # Never send workflow input (IDs, broadcast text, delegated-owner IDs, etc.)
-    # to the offline assistant. These states are handled by their dedicated
-    # message handlers in later handler groups.
+    # to the assistant. These states are handled by their dedicated message handlers.
     workflow_states = (
-        "owner_autoreply_state",
-        "awaiting_welcome_chat",
-        "awaiting_broadcast",
-        "awaiting_broadcast_confirmation",
-        "awaiting_channel_broadcast",
-        "awaiting_delegated_owner_id",
-        "awaiting_admin_action",
-        "staff_task_state",
-        "staff_shift_state",
-        "staff_appeal_state",
-        "staff_inquiry_state",
-        "staff_badge_state",
-        "inquiry_reply_id",
-        "awaiting_general_inquiry",
+        "owner_autoreply_state", "awaiting_welcome_chat", "awaiting_broadcast",
+        "awaiting_broadcast_confirmation", "awaiting_channel_broadcast",
+        "awaiting_delegated_owner_id", "awaiting_admin_action", "staff_task_state",
+        "staff_shift_state", "staff_appeal_state", "staff_inquiry_state",
+        "staff_badge_state", "inquiry_reply_id", "awaiting_general_inquiry",
         "channel_broadcast_stage",
     )
     if any(context.user_data.get(key) for key in workflow_states):
         return
+
     remember_assistant_user(user)
+
+    # Free-text AI replies in private are restricted to the primary owner and
+    # explicitly enabled delegated owners. Other users retain the existing offline helper.
+    allowed_ai_user = False
+    if is_owner(user.id):
+        allowed_ai_user = _ai_setting("owner_ai_enabled", "1") == "1"
+    elif is_delegated_owner(user.id):
+        allowed_ai_user = _ai_setting("delegated_ai_enabled", "0") == "1"
+
+    if allowed_ai_user and OPENAI_API_KEY:
+        if not _ai_request_allowed(user.id):
+            await msg.reply_text(
+                f"⏳ وصلت إلى الحد اليومي للمساعد الذكي ({AI_DAILY_REQUEST_LIMIT} طلبات). حاول غدًا، أو استخدم أوامر الخدمات مثل /note و/remind."
+            )
+            return
+        _ai_increment_usage(user.id)
+        try:
+            answer = await _ai_reply(
+                msg.text,
+                "أنت مساعد عربي مهذب للمالك الأساسي والمالكين المفوضين لبوت حماية قروبات طلابية. "
+                "أجب بوضوح وباختصار، وساعد في الشرح والصياغة والتنظيم الدراسي. "
+                "لا تدّعِ تنفيذ أوامر تيليجرام أو تغيير إعدادات البوت بنفسك؛ اشرح الخطوات فقط. "
+                "لا تكشف مفاتيح أو توكنات أو بيانات خاصة."
+            )
+            await msg.reply_text(answer[:3900] or "لم أتمكن من صياغة إجابة، حاول مرة أخرى.")
+            return
+        except Exception as exc:
+            log.warning("Private AI request failed: %s", exc)
+            await msg.reply_text(
+                "⚠️ تعذر الحصول على رد من الذكاء الاصطناعي. تحقق من مفتاح OpenAI وصلاحيته والفوترة في Render."
+            )
+            return
+
+    # Keep the existing non-AI services for users without AI permission.
     answer = await offline_assistant_response(user.id, msg.text)
     await msg.reply_text(answer)
 
