@@ -526,10 +526,10 @@ async def ai_panel_cmd(update, context):
         await msg.reply_text("⛔ لوحة إعدادات الذكاء الاصطناعي للمالك الأساسي فقط.")
         return
     await msg.reply_text(
-        "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
-        f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
-        f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
-        "القروبات المسموح بها: اختر من القائمة التالية.\\n\\n"
+        "🧠 إعدادات الذكاء الاصطناعي\n\n"
+        f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\n"
+        f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\n"
+        "القروبات المسموح بها: اختر من القائمة التالية.\n\n"
         "هذه الإعدادات مستقلة عن الحماية الأساسية.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
@@ -567,7 +567,7 @@ async def ai_group_cmd(update, context):
         return
     prompt = " ".join(context.args).strip()
     if not prompt and msg.reply_to_message and msg.reply_to_message.text:
-        prompt = "السياق: " + msg.reply_to_message.text[:1500] + "\\n\\nما المطلوب؟"
+        prompt = "السياق: " + msg.reply_to_message.text[:1500] + "\n\nما المطلوب؟"
     if not prompt:
         await msg.reply_text("استخدم الأمر هكذا:\n/ai سؤالك هنا\nأو ردّ على رسالة واكتب /ai ثم طلبك.")
         return
@@ -629,7 +629,7 @@ async def ai_moderate_cmd(update, context):
             "قيّم الرسالة التالية من ناحية مخالفة قواعد قروب عامة، واذكر السبب المحتمل والإجراء المقترح فقط، دون تنفيذ أي إجراء.\nالرسالة: " + content,
             "أنت مساعد للمشرفين. قدّم تقييمًا حذرًا بالعربية، وميّز بين المخالفة المؤكدة والاشتباه، ولا تقترح الحظر إلا عند وجود سبب واضح. هذا تحليل استشاري فقط والقرار النهائي للمشرف."
         )
-        await msg.reply_text("🛡️ تقييم استشاري للمشرف (لا ينفّذ إجراء تلقائيًا):\\n\\n" + answer[:3500])
+        await msg.reply_text("🛡️ تقييم استشاري للمشرف (لا ينفّذ إجراء تلقائيًا):\n\n" + answer[:3500])
     except Exception as exc:
         log.warning("AI moderation request failed: %s", exc)
         await msg.reply_text("⚠️ تعذر تحليل الرسالة حاليًا. حاول لاحقًا.")
@@ -3683,9 +3683,9 @@ async def callback(update, context):
         _set_ai_setting("owner_ai_enabled", new_value)
         await safe_callback_answer(q, "تم تحديث إعداد الذكاء الاصطناعي.")
         await q.edit_message_text(
-            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
-            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
-            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
+            "🧠 إعدادات الذكاء الاصطناعي\n\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\n"
+            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\n"
             "القروبات المسموح بها تُدار من زر القروبات.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
@@ -3700,8 +3700,8 @@ async def callback(update, context):
         _set_ai_setting("delegated_ai_enabled", new_value)
         await safe_callback_answer(q, "تم تحديث صلاحية الذكاء الاصطناعي للمفوضين.")
         await q.edit_message_text(
-            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
-            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
+            "🧠 إعدادات الذكاء الاصطناعي\n\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\n"
             f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
@@ -3730,12 +3730,12 @@ async def callback(update, context):
         if page < pages-1: nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"ai_groups_page:{page+1}"))
         if nav: rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ إعدادات الذكاء الاصطناعي", callback_data="ai_panel_back")])
-        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\\n✅ = مسموح | ⬜️ = ممنوع\\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\n✅ = مسموح | ⬜️ = ممنوع\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("ai_group_toggle:"):
         try:
-            # Callback format: ai_group_toggle:<chat_id>:<page>
+            # callback_data is ai_group_toggle:<chat_id>:<page>
             _, chat_raw, page_raw = data.split(":", 2)
             chat_id, page = int(chat_raw), int(page_raw)
         except Exception:
@@ -3761,14 +3761,14 @@ async def callback(update, context):
         if page<pages-1: nav.append(InlineKeyboardButton("التالي ➡️",callback_data=f"ai_groups_page:{page+1}"))
         if nav: rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ إعدادات الذكاء الاصطناعي",callback_data="ai_panel_back")])
-        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\\n✅ = مسموح | ⬜️ = ممنوع\\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\n✅ = مسموح | ⬜️ = ممنوع\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data == "ai_panel_back":
         await q.edit_message_text(
-            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
-            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
-            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
+            "🧠 إعدادات الذكاء الاصطناعي\n\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\n"
+            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\n"
             "القروبات المسموح بها تُدار من زر القروبات.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
@@ -4290,13 +4290,13 @@ async def callback(update, context):
         log_action(target_chat, target_user, "member_security_warning", f"count={count}; by={uid}")
         await safe_callback_answer(q, f"تم تسجيل الإنذار {count}/3")
         try:
-            await q.edit_message_text((q.message.text or "") + f"\\n\\n⚠️ الإنذارات المسجلة: {count}/3\\nسجّل الإنذار: {uid}")
+            await q.edit_message_text((q.message.text or "") + f"\n\n⚠️ الإنذارات المسجلة: {count}/3\nسجّل الإنذار: {uid}")
         except Exception as exc:
             log.info("تعذر تحديث رسالة الإنذار: %s", exc)
         if count == 3:
-            alert = (f"🚨 بلغ العضو الحد الأعلى من الإنذارات (3/3).\\nالقروب: {target_chat}\\n"
-                     f"الاسم: {restriction[0] or target_user}\\nاسم المستخدم: @{restriction[1] or 'غير متوفر'}\\n"
-                     f"المعرّف الثابت: {target_user}\\nيرجى مراجعة طلب العودة واتخاذ القرار.")
+            alert = (f"🚨 بلغ العضو الحد الأعلى من الإنذارات (3/3).\nالقروب: {target_chat}\n"
+                     f"الاسم: {restriction[0] or target_user}\nاسم المستخدم: @{restriction[1] or 'غير متوفر'}\n"
+                     f"المعرّف الثابت: {target_user}\nيرجى مراجعة طلب العودة واتخاذ القرار.")
             recipients = {OWNER_ID} if OWNER_ID else set()
             recipients.update(r[0] for r in db.execute("SELECT user_id FROM delegated_owners").fetchall())
             for recipient in recipients:
