@@ -471,9 +471,9 @@ def _ai_today_key():
     return datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d")
 
 def _ai_request_allowed(user_id):
-    row = db.execute("SELECT requests FROM ai_usage_daily WHERE usage_date=? AND user_id=?",
-                     (_ai_today_key(), int(user_id))).fetchone()
-    return (int(row[0]) if row else 0) < AI_DAILY_REQUEST_LIMIT
+    # No per-user daily question cap. OpenAI billing/rate limits still apply.
+    # Keep usage tracking for diagnostics and future cost monitoring.
+    return True
 
 def _ai_increment_usage(user_id):
     db.execute("""INSERT INTO ai_usage_daily(usage_date,user_id,requests) VALUES(?,?,1)
