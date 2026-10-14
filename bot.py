@@ -2009,7 +2009,27 @@ async def assistant_private_text(update, context):
     # Do not answer workflow drafts as if they were ordinary assistant prompts.
     if context.user_data.pop("_skip_assistant_private_message_id", None) == msg.message_id:
         return
-    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_channel_broadcast"):
+    # Never send workflow input (IDs, broadcast text, delegated-owner IDs, etc.)
+    # to the offline assistant. These states are handled by their dedicated
+    # message handlers in later handler groups.
+    workflow_states = (
+        "owner_autoreply_state",
+        "awaiting_welcome_chat",
+        "awaiting_broadcast",
+        "awaiting_broadcast_confirmation",
+        "awaiting_channel_broadcast",
+        "awaiting_delegated_owner_id",
+        "awaiting_admin_action",
+        "staff_task_state",
+        "staff_shift_state",
+        "staff_appeal_state",
+        "staff_inquiry_state",
+        "staff_badge_state",
+        "inquiry_reply_id",
+        "awaiting_general_inquiry",
+        "channel_broadcast_stage",
+    )
+    if any(context.user_data.get(key) for key in workflow_states):
         return
     remember_assistant_user(user)
     answer = await offline_assistant_response(user.id, msg.text)
