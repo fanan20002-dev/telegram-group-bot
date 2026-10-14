@@ -10,6 +10,8 @@ import time
 import random
 import json
 import html
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -30,6 +32,12 @@ DB_PATH = os.environ.get("DB_PATH", "bot.db")
 # Optional Render deploy integration. Configure both values in Render Environment.
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
+
+# Optional OpenAI API integration. AI replies are opt-in via /ai; moderation is advisory only.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+AI_DAILY_REQUEST_LIMIT = max(1, int(os.environ.get("AI_DAILY_REQUEST_LIMIT", "10") or 10))
+AI_MAX_OUTPUT_TOKENS = max(80, min(600, int(os.environ.get("AI_MAX_OUTPUT_TOKENS", "350") or 350)))
 
 
 logging.basicConfig(level=logging.INFO)
@@ -423,6 +431,208 @@ DEFAULT_AUTO_REPLIES = [
 ]
 _auto_reply_last = {}
 _AUTO_REPLY_COOLDOWN_SECONDS = 30
+
+# Local usage counter for low-cost safeguards (stored in the existing SQLite database).
+db.execute("""CREATE TABLE IF NOT EXISTS ai_usage_daily(
+    usage_date TEXT NOT NULL, user_id INTEGER NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(usage_date, user_id)
+)""")
+db.commit()
+
+# Persistent owner-controlled AI settings (additive; existing tables/features are preserved).
+db.execute("""CREATE TABLE IF NOT EXISTS ai_control_settings(
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS ai_allowed_groups(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1
+)""")
+for _k, _v in (("owner_ai_enabled", "1"), ("delegated_ai_enabled", "0")):
+    db.execute("INSERT OR IGNORE INTO ai_control_settings(setting_key,setting_value) VALUES(?,?)", (_k, _v))
+db.commit()
+
+def _ai_setting(key, default="0"):
+    row = db.execute("SELECT setting_value FROM ai_control_settings WHERE setting_key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+def _set_ai_setting(key, value):
+    db.execute("""INSERT INTO ai_control_settings(setting_key,setting_value) VALUES(?,?)
+                  ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value""",
+               (key, str(value)))
+    db.commit()
+
+def _ai_group_is_allowed(chat_id):
+    row = db.execute("SELECT enabled FROM ai_allowed_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
+    # Existing registered groups are not automatically enabled for delegated AI; owner chooses explicitly.
+    return bool(row and row[0])
+
+def _ai_today_key():
+    return datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d")
+
+def _ai_request_allowed(user_id):
+    row = db.execute("SELECT requests FROM ai_usage_daily WHERE usage_date=? AND user_id=?",
+                     (_ai_today_key(), int(user_id))).fetchone()
+    return (int(row[0]) if row else 0) < AI_DAILY_REQUEST_LIMIT
+
+def _ai_increment_usage(user_id):
+    db.execute("""INSERT INTO ai_usage_daily(usage_date,user_id,requests) VALUES(?,?,1)
+                  ON CONFLICT(usage_date,user_id) DO UPDATE SET requests=requests+1""",
+               (_ai_today_key(), int(user_id)))
+    db.commit()
+
+def _openai_chat_sync(prompt, system_prompt):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY غير مضبوط في إعدادات Render.")
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt[:6000]},
+        ],
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+        "temperature": 0.4,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(f"تعذر طلب الذكاء الاصطناعي (HTTP {exc.code}). تحقق من الفوترة وصلاحيات المفتاح.") from exc
+    choices = result.get("choices") or []
+    if not choices:
+        raise RuntimeError("لم تصل إجابة من خدمة الذكاء الاصطناعي.")
+    return (choices[0].get("message", {}).get("content") or "").strip()
+
+async def _ai_reply(prompt, system_prompt):
+    return await asyncio.to_thread(_openai_chat_sync, prompt, system_prompt)
+
+async def ai_panel_cmd(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    if not is_owner(user.id):
+        await msg.reply_text("⛔ لوحة إعدادات الذكاء الاصطناعي للمالك الأساسي فقط.")
+        return
+    await msg.reply_text(
+        "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
+        f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
+        f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
+        "القروبات المسموح بها: اختر من القائمة التالية.\\n\\n"
+        "هذه الإعدادات مستقلة عن الحماية الأساسية.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
+            [InlineKeyboardButton("السماح/المنع للمفوضين", callback_data="ai_delegated_toggle")],
+            [InlineKeyboardButton("تحديد القروبات المسموحة", callback_data="ai_groups_page:0")],
+        ])
+    )
+
+async def ai_group_cmd(update, context):
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat:
+        return
+    # AI access is controlled by the primary owner and an explicit delegated-owner switch.
+    if is_owner(user.id):
+        if _ai_setting("owner_ai_enabled", "1") != "1":
+            await msg.reply_text("⛔ المساعد الذكي متوقف حاليًا من لوحة المالك.")
+            return
+    elif is_delegated_owner(user.id):
+        if _ai_setting("delegated_ai_enabled", "0") != "1":
+            await msg.reply_text("⛔ استخدام الذكاء الاصطناعي للمالكين المفوضين متوقف من المالك الأساسي.")
+            return
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not _ai_group_is_allowed(chat.id):
+            await msg.reply_text("⛔ الذكاء الاصطناعي غير مفعّل لهذا القروب من المالك الأساسي.")
+            return
+    else:
+        await msg.reply_text("⛔ المساعد الذكي متاح للمالك الأساسي وللمفوضين عند السماح لهم فقط.")
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE):
+        return
+    if not OPENAI_API_KEY:
+        await msg.reply_text("⚠️ المساعد الذكي غير مفعّل حاليًا. يحتاج إلى مفتاح API صالح في إعدادات الخدمة.")
+        return
+    if not _ai_request_allowed(user.id):
+        await msg.reply_text(f"⏳ وصلت إلى الحد اليومي للمساعد الذكي ({AI_DAILY_REQUEST_LIMIT} طلبات). حاول غدًا.")
+        return
+    prompt = " ".join(context.args).strip()
+    if not prompt and msg.reply_to_message and msg.reply_to_message.text:
+        prompt = "السياق: " + msg.reply_to_message.text[:1500] + "\\n\\nما المطلوب؟"
+    if not prompt:
+        await msg.reply_text("استخدم الأمر هكذا:\n/ai سؤالك هنا\nأو ردّ على رسالة واكتب /ai ثم طلبك.")
+        return
+    _ai_increment_usage(user.id)
+    try:
+        answer = await _ai_reply(
+            prompt,
+            "أنت مساعد عربي مهذب داخل قروبات تيليجرام. أجب باختصار ووضوح. لا تدّعِ امتلاك صلاحيات تنفيذ أو الاطلاع على معلومات غير متاحة. لا تكشف أسرارًا أو بيانات خاصة. إذا كان السؤال غير واضح فاطلب التوضيح."
+        )
+        await msg.reply_text(answer[:3900] or "لم أتمكن من صياغة إجابة، حاول مرة أخرى.")
+    except Exception as exc:
+        log.warning("AI group request failed: %s", exc)
+        await msg.reply_text("⚠️ تعذر الحصول على رد ذكي الآن. تحقق من إعدادات API والفوترة ثم حاول لاحقًا.")
+
+async def ai_moderate_cmd(update, context):
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE):
+        return
+    # Moderation AI follows the same owner-controlled access and group allowlist.
+    if is_owner(user.id):
+        if _ai_setting("owner_ai_enabled", "1") != "1":
+            await msg.reply_text("⛔ المساعد الذكي متوقف حاليًا من لوحة المالك.")
+            return
+    elif is_delegated_owner(user.id):
+        if _ai_setting("delegated_ai_enabled", "0") != "1":
+            await msg.reply_text("⛔ استخدام الذكاء الاصطناعي للمالكين المفوضين متوقف من المالك الأساسي.")
+            return
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not _ai_group_is_allowed(chat.id):
+            await msg.reply_text("⛔ الذكاء الاصطناعي غير مفعّل لهذا القروب من المالك الأساسي.")
+            return
+    else:
+        await msg.reply_text("⛔ مساعد الإشراف الذكي متاح للمالك الأساسي وللمفوضين عند السماح لهم فقط.")
+        return
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not msg.reply_to_message:
+        await msg.reply_text("ردّ على الرسالة المطلوب تقييمها واكتب /aimoderate.")
+        return
+    if chat.type == ChatType.PRIVATE and not msg.reply_to_message:
+        await msg.reply_text("في الخاص، استخدم /aimoderate ثم اكتب نص الرسالة بعد الأمر لتحليلها.")
+        return
+    if not msg.reply_to_message or not (msg.reply_to_message.text or msg.reply_to_message.caption):
+        await msg.reply_text("ردّ على الرسالة المطلوب تقييمها واكتب /aimoderate.")
+        return
+    if not OPENAI_API_KEY:
+        await msg.reply_text("⚠️ المساعد الذكي غير مفعّل حاليًا.")
+        return
+    if not _ai_request_allowed(user.id):
+        await msg.reply_text(f"⏳ وصلت إلى الحد اليومي للمساعد الذكي ({AI_DAILY_REQUEST_LIMIT} طلبات).")
+        return
+    _ai_increment_usage(user.id)
+    if msg.reply_to_message:
+        content = (msg.reply_to_message.text or msg.reply_to_message.caption or "")[:2500]
+    else:
+        content = " ".join(context.args).strip()[:2500]
+        if not content:
+            await msg.reply_text("استخدم: /aimoderate نص الرسالة المطلوب تقييمها")
+            return
+    try:
+        answer = await _ai_reply(
+            "قيّم الرسالة التالية من ناحية مخالفة قواعد قروب عامة، واذكر السبب المحتمل والإجراء المقترح فقط، دون تنفيذ أي إجراء.\nالرسالة: " + content,
+            "أنت مساعد للمشرفين. قدّم تقييمًا حذرًا بالعربية، وميّز بين المخالفة المؤكدة والاشتباه، ولا تقترح الحظر إلا عند وجود سبب واضح. هذا تحليل استشاري فقط والقرار النهائي للمشرف."
+        )
+        await msg.reply_text("🛡️ تقييم استشاري للمشرف (لا ينفّذ إجراء تلقائيًا):\\n\\n" + answer[:3500])
+    except Exception as exc:
+        log.warning("AI moderation request failed: %s", exc)
+        await msg.reply_text("⚠️ تعذر تحليل الرسالة حاليًا. حاول لاحقًا.")
 
 def split_mentions_for_telegram(mentions, header="#all\n", max_chars=3900):
     """Split HTML mention strings into Telegram-safe messages without splitting a mention."""
@@ -1812,10 +2022,10 @@ async def start(update, context):
         remember_assistant_user(update.effective_user)
         await update.effective_message.reply_text(
             "🤖 أهلًا بك في مساعد الخدمات الشخصية والطلابية\n\n"
-            "هذا الإصدار يعمل دون ذكاء اصطناعي ودون مفتاح API، ولا يرسل نصوصك إلى مزود خارجي.\n"
+            "المساعد الذكي داخل القروبات متاح عبر /ai عند ضبط مفتاح API. لتحليل رسالة للمشرفين، ردّ عليها واكتب /aimoderate.\n"
             "/note و/notes — الملاحظات\n/remind و/reminders — التذكيرات\n/task و/tasks — المهام\n/expense و/expenses — المصاريف\n"
             "/studyadd و/studyschedule — الجدول الدراسي\n/exam و/exams — الاختبارات والمواعيد\n/summarize — تلخيص استخراجي للنص أو الملف\n/quiz — قالب مراجعة تدريبي\n/panel — لوحة القروبات للمصرح لهم\n\n"
-            "ℹ️ الردود النصية محدودة بأوامر وخدمات محددة ولا تمثل محادثة ذكاء اصطناعي.",
+            "ℹ️ داخل القروبات: /ai سؤالك — سؤال للمساعد، و/aimoderate بالرد على رسالة — تقييم استشاري للمشرفين.",
             reply_markup=assistant_menu_markup()
         )
     else:
@@ -3463,6 +3673,109 @@ async def callback(update, context):
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data.startswith("ai_") and not is_owner(uid):
+        await safe_callback_answer(q, "إعدادات الذكاء الاصطناعي للمالك الأساسي فقط.", show_alert=True)
+        return
+
+    if data == "ai_owner_toggle":
+        new_value = "0" if _ai_setting("owner_ai_enabled", "1") == "1" else "1"
+        _set_ai_setting("owner_ai_enabled", new_value)
+        await safe_callback_answer(q, "تم تحديث إعداد الذكاء الاصطناعي.")
+        await q.edit_message_text(
+            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
+            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
+            "القروبات المسموح بها تُدار من زر القروبات.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
+                [InlineKeyboardButton("السماح/المنع للمفوضين", callback_data="ai_delegated_toggle")],
+                [InlineKeyboardButton("تحديد القروبات المسموحة", callback_data="ai_groups_page:0")],
+            ])
+        )
+        return
+
+    if data == "ai_delegated_toggle":
+        new_value = "0" if _ai_setting("delegated_ai_enabled", "0") == "1" else "1"
+        _set_ai_setting("delegated_ai_enabled", new_value)
+        await safe_callback_answer(q, "تم تحديث صلاحية الذكاء الاصطناعي للمفوضين.")
+        await q.edit_message_text(
+            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
+            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
+                [InlineKeyboardButton("السماح/المنع للمفوضين", callback_data="ai_delegated_toggle")],
+                [InlineKeyboardButton("تحديد القروبات المسموحة", callback_data="ai_groups_page:0")],
+            ])
+        )
+        return
+
+    if data.startswith("ai_groups_page:"):
+        try: page = max(0, int(data.split(":", 1)[1]))
+        except ValueError: page = 0
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title COLLATE NOCASE").fetchall()
+        if not groups:
+            await q.edit_message_text("لا توجد قروبات مسجلة. أضف البوت إلى القروب أولًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="ai_panel_back")]]))
+            return
+        per_page = 15
+        pages = max(1, (len(groups) + per_page - 1) // per_page)
+        page = min(page, pages-1)
+        rows = []
+        for chat_id, title in groups[page*per_page:(page+1)*per_page]:
+            enabled = _ai_group_is_allowed(chat_id)
+            rows.append([InlineKeyboardButton(f"{'✅' if enabled else '⬜️'} {(title or str(chat_id))[:45]}", callback_data=f"ai_group_toggle:{chat_id}:{page}")])
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"ai_groups_page:{page-1}"))
+        if page < pages-1: nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"ai_groups_page:{page+1}"))
+        if nav: rows.append(nav)
+        rows.append([InlineKeyboardButton("⬅️ إعدادات الذكاء الاصطناعي", callback_data="ai_panel_back")])
+        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\\n✅ = مسموح | ⬜️ = ممنوع\\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("ai_group_toggle:"):
+        try:
+            _, _, chat_raw, page_raw = data.split(":")
+            chat_id, page = int(chat_raw), int(page_raw)
+        except Exception:
+            await safe_callback_answer(q, "تعذر قراءة القروب.", show_alert=True); return
+        if db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone() is None:
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
+        if _ai_group_is_allowed(chat_id):
+            db.execute("DELETE FROM ai_allowed_groups WHERE chat_id=?", (chat_id,))
+        else:
+            db.execute("INSERT OR REPLACE INTO ai_allowed_groups(chat_id,enabled) VALUES(?,1)", (chat_id,))
+        db.commit()
+        await safe_callback_answer(q, "تم تحديث السماح للقروب.")
+        groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title COLLATE NOCASE").fetchall()
+        per_page = 15
+        pages = max(1, (len(groups)+per_page-1)//per_page)
+        page = min(page,pages-1)
+        rows = []
+        for cid, title in groups[page*per_page:(page+1)*per_page]:
+            enabled = _ai_group_is_allowed(cid)
+            rows.append([InlineKeyboardButton(f"{'✅' if enabled else '⬜️'} {(title or str(cid))[:45]}", callback_data=f"ai_group_toggle:{cid}:{page}")])
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("⬅️ السابق",callback_data=f"ai_groups_page:{page-1}"))
+        if page<pages-1: nav.append(InlineKeyboardButton("التالي ➡️",callback_data=f"ai_groups_page:{page+1}"))
+        if nav: rows.append(nav)
+        rows.append([InlineKeyboardButton("⬅️ إعدادات الذكاء الاصطناعي",callback_data="ai_panel_back")])
+        await q.edit_message_text("🧠 القروبات المسموح للمالكين المفوضين باستخدام الذكاء الاصطناعي فيها\\n✅ = مسموح | ⬜️ = ممنوع\\nاختر القروب لتغيير الحالة:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "ai_panel_back":
+        await q.edit_message_text(
+            "🧠 إعدادات الذكاء الاصطناعي\\n\\n"
+            f"حالة المالك الأساسي: {'🟢 مفعّل' if _ai_setting('owner_ai_enabled','1') == '1' else '🔴 متوقف'}\\n"
+            f"السماح للمالكين المفوضين: {'🟢 مسموح' if _ai_setting('delegated_ai_enabled','0') == '1' else '🔴 ممنوع'}\\n"
+            "القروبات المسموح بها تُدار من زر القروبات.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("تشغيل/إيقاف AI للمالك", callback_data="ai_owner_toggle")],
+                [InlineKeyboardButton("السماح/المنع للمفوضين", callback_data="ai_delegated_toggle")],
+                [InlineKeyboardButton("تحديد القروبات المسموحة", callback_data="ai_groups_page:0")],
+            ])
+        )
+        return
 
     if data == "monitor_groups" or data.startswith("monitor_groups_page:"):
         if not is_owner(uid):
@@ -5772,7 +6085,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "aipanel": ai_panel_cmd, "ai": ai_group_cmd, "aimoderate": ai_moderate_cmd, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
