@@ -3735,7 +3735,8 @@ async def callback(update, context):
 
     if data.startswith("ai_group_toggle:"):
         try:
-            _, _, chat_raw, page_raw = data.split(":")
+            # Callback format: ai_group_toggle:<chat_id>:<page>
+            _, chat_raw, page_raw = data.split(":", 2)
             chat_id, page = int(chat_raw), int(page_raw)
         except Exception:
             await safe_callback_answer(q, "تعذر قراءة القروب.", show_alert=True); return
