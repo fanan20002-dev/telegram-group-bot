@@ -318,6 +318,15 @@ CREATE TABLE IF NOT EXISTS welcome_messages(
 )
 """)
 db.execute("""
+CREATE TABLE IF NOT EXISTS welcome_settings(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1
+)
+""")
+db.execute("INSERT OR IGNORE INTO welcome_settings(chat_id, enabled) SELECT chat_id, 1 FROM watched_groups")
+db.commit()
+
+db.execute("""
 CREATE TABLE IF NOT EXISTS notification_preferences(
     user_id INTEGER NOT NULL,
     event TEXT NOT NULL,
@@ -1425,6 +1434,8 @@ def register_group(chat):
         "VALUES(?,?,COALESCE((SELECT added_at FROM watched_groups WHERE chat_id=?),?))",
         (chat.id, chat.title or "", chat.id, now())
     )
+    db.commit()
+    db.execute("INSERT OR IGNORE INTO welcome_settings(chat_id, enabled) VALUES(?, 1)", (chat.id,))
     db.commit()
     # Install default auto-replies immediately when the group is first registered.
     # INSERT OR IGNORE preserves an explicit on/off choice made by an administrator.
@@ -3435,11 +3446,15 @@ async def message_filter(update, context):
     delete = False
     reason = ""
 
-    # Allow links only for bot-authorized roles; Telegram admin status alone does not
-    # grant an implicit bypass. This keeps the whitelist controlled by the owner/delegate.
+    # Link-lock exceptions are evaluated per group:
+    # 1) bot owner/delegated owner/managers and explicitly authorized bot roles;
+    # 2) actual Telegram group owner/admins, detected live through Telegram.
+    # Ordinary members remain blocked when the link lock is enabled.
     if s["links"] and has_link(msg.text or msg.caption):
         sender_id = msg.from_user.id if msg.from_user and not msg.from_user.is_bot else 0
         link_allowed = bool(sender_id) and has_group_permission(chat.id, sender_id, "links")
+        if sender_id and not link_allowed:
+            link_allowed = await is_telegram_group_admin(context.bot, sender_id, chat.id)
         if not link_allowed:
             delete, reason = True, "رابط"
     if s["photos"] and msg.photo:
@@ -3635,6 +3650,16 @@ async def new_members(update, context):
         configured_welcome = ""
 
     group_title = chat.title or "القروب"
+    try:
+        welcome_state = db.execute("SELECT enabled FROM welcome_settings WHERE chat_id=?", (chat.id,)).fetchone()
+        welcome_enabled = bool(welcome_state[0]) if welcome_state else True
+        if welcome_state is None:
+            db.execute("INSERT OR IGNORE INTO welcome_settings(chat_id, enabled) VALUES(?, 1)", (chat.id,))
+            db.commit()
+    except Exception:
+        log.exception("WELCOME_STATE_READ_FAILED chat_id=%s; using enabled default", chat.id)
+        welcome_enabled = True
+
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
@@ -3651,12 +3676,13 @@ async def new_members(update, context):
         except Exception:
             log.exception("MEMBER_ACTIVITY_SAVE_FAILED chat_id=%s member_id=%s", chat.id, member.id)
 
-        # Send the welcome first: unrelated owner-DM issues must not block it.
-        if configured_welcome:
-            welcome_text = configured_welcome.replace("{name}", display_name).replace("{group}", group_title)
+        # Send a configured or default welcome unless an administrator explicitly disabled it.
+        if welcome_enabled:
+            welcome_template = configured_welcome or "👋 أهلًا {name} في {group}!\n\nنتمنى لك وقتًا ممتعًا، ونرجو الالتزام بقوانين القروب واحترام الجميع. 🌷"
+            welcome_text = welcome_template.replace("{name}", display_name).replace("{group}", group_title)
             try:
                 await context.bot.send_message(chat_id=chat.id, text=welcome_text[:4000])
-                log.info("WELCOME_SENT chat_id=%s member_id=%s custom=1", chat.id, member.id)
+                log.info("WELCOME_SENT chat_id=%s member_id=%s custom=%s", chat.id, member.id, int(bool(configured_welcome)))
             except Exception as exc:
                 log.warning(
                     "WELCOME_SEND_FAILED chat_id=%s member_id=%s bot_must_be_able_to_send_messages error=%r",
@@ -3667,13 +3693,13 @@ async def new_members(update, context):
                         context,
                         f"⚠️ تعذر إرسال الترحيب\nالقروب: {group_title} ({chat.id})\n"
                         f"العضو: {display_name} (ID: {member.id})\n"
-                        "تحقق من أن البوت لم يُحظر وأن لديه صلاحية إرسال الرسائل.",
+                        "تحقق من وجود البوت في القروب وصلاحية إرسال الرسائل.",
                         "security"
                     )
                 except Exception:
                     log.exception("WELCOME_FAILURE_OWNER_ALERT_FAILED chat_id=%s", chat.id)
         else:
-            log.info("WELCOME_NOT_CONFIGURED chat_id=%s member_id=%s", chat.id, member.id)
+            log.info("WELCOME_DISABLED chat_id=%s member_id=%s", chat.id, member.id)
 
         try:
             await notify_owners(
@@ -3859,6 +3885,7 @@ async def broadcast_draft_message(update, context):
             await msg.reply_text("أرسل نص ترحيب أو تعليقًا نصيًا.")
             return
         db.execute("INSERT OR REPLACE INTO welcome_messages(chat_id,message) VALUES(?,?)", (welcome_chat_id, body[:1000]))
+        db.execute("INSERT INTO welcome_settings(chat_id,enabled) VALUES(?,1) ON CONFLICT(chat_id) DO UPDATE SET enabled=1", (welcome_chat_id,))
         db.commit()
         log_action(welcome_chat_id, user.id, "welcome_set", "تم تحديث رسالة الترحيب")
         context.user_data.pop("awaiting_welcome_chat", None)
@@ -5849,9 +5876,11 @@ async def callback(update, context):
             await q.edit_message_text("لم يتم العثور على القروب.")
             return
         current = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
-        text = current[0] if current and current[0] else "غير مفعّل؛ لم تُحدّد رسالة ترحيب."
+        state = db.execute("SELECT enabled FROM welcome_settings WHERE chat_id=?", (chat_id,)).fetchone()
+        enabled = bool(state[0]) if state else True
+        text = (current[0] if current and current[0] else "رسالة الترحيب الافتراضية") if enabled else "متوقف حاليًا"
         await q.edit_message_text(
-            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {name} لاسم العضو.",
+            f"👋 الترحيب — {group[0] or chat_id}\nمعرّف القروب: {chat_id}\nالحالة: {'🟢 مفعّل' if enabled else '🔴 متوقف'}\n\nالرسالة الحالية:\n{text}\n\nاضغط تعيين رسالة جديدة، ثم أرسلها للبوت في الخاص. استخدم {{name}} لاسم العضو و {{group}} لاسم القروب.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✏️ تعيين رسالة جديدة", callback_data=f"welcome_set:{chat_id}")],
                 [InlineKeyboardButton("🗑️ إيقاف الترحيب", callback_data=f"welcome_off:{chat_id}")],
@@ -5872,7 +5901,7 @@ async def callback(update, context):
         chat_id = int(data.split(":", 1)[1])
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "ليس لديك صلاحية هذا القروب", show_alert=True); return
-        db.execute("DELETE FROM welcome_messages WHERE chat_id=?", (chat_id,))
+        db.execute("INSERT INTO welcome_settings(chat_id,enabled) VALUES(?,0) ON CONFLICT(chat_id) DO UPDATE SET enabled=0", (chat_id,))
         db.commit()
         log_action(chat_id, uid, "welcome_off", "تم إيقاف الترحيب")
         await q.edit_message_text("✅ تم إيقاف رسالة الترحيب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القروبات", callback_data="welcome")]]))
@@ -6497,7 +6526,11 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_filter), group=3)
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, edited_filter), group=4)
     async def error_handler(update, context):
-        # Keep the error visible in Render logs and notify owner/delegates, with 10-minute deduplication.
+        # Harmless Telegram no-op: message text and keyboard are already identical.
+        if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
+            log.debug("Ignored harmless no-op Telegram message edit")
+            return
+        # Keep real errors visible in Render logs and notify owner/delegates, with 10-minute deduplication.
         log.error("Update error: %s", context.error, exc_info=context.error)
         try:
             await executive_error_notifier(context, context.error)
