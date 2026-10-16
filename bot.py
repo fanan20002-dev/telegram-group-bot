@@ -1352,6 +1352,30 @@ async def process_private_workflows(update, context):
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
     raw = (msg.text or "").strip()
+    if context.user_data.get("awaiting_calendar_search"):
+        context.user_data.pop("awaiting_calendar_search", None)
+        if raw.lower() == "/cancel":
+            await msg.reply_text("تم إلغاء البحث.", reply_markup=assistant_menu_markup()); return
+        result = await calendar_date_text(raw)
+        if result:
+            await msg.reply_text(result, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 بحث عن تاريخ آخر", callback_data="calendar:search")], [InlineKeyboardButton("📅 فتح التقويم", callback_data="calendar:current")], [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="calendar:back")]])); return
+        # Event search across nearby calendar months; this searches the event labels supplied by the calendar service.
+        found = []
+        today = datetime.now(ZoneInfo("Asia/Riyadh"))
+        month_targets = []
+        for offset in range(0, 13):
+            total = today.year * 12 + (today.month - 1) + offset
+            month_targets.append((total // 12, total % 12 + 1))
+        month_results = await asyncio.gather(*(calendar_month_text(yy, mm) for yy, mm in month_targets), return_exceptions=True)
+        for (yy, mm), month_text in zip(month_targets, month_results):
+            if isinstance(month_text, str) and month_text:
+                for line in month_text.splitlines():
+                    if raw.casefold() in line.casefold() and ("—" in line or "هـ" in line):
+                        found.append(f"{yy}-{mm:02d}: {line.strip()}")
+            if len(found) >= 15: break
+        if found:
+            await msg.reply_text("🔎 نتائج البحث في المناسبات والتقويم:\n\n" + "\n".join(found[:15]), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 بحث جديد", callback_data="calendar:search")], [InlineKeyboardButton("📅 التقويم", callback_data="calendar:current")]])); return
+        await msg.reply_text("لم أجد تاريخًا أو مناسبة مطابقة. جرّب تاريخًا مثل 2026-10-16 أو 16/10/2026، أو كلمة مثل رمضان أو عرفة.\nأرسل /cancel للإلغاء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔎 إعادة البحث", callback_data="calendar:search")]])); return
     # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
     if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
         or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
@@ -1513,11 +1537,144 @@ def assistant_menu_markup():
         [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("⏰ تذكير جديد", callback_data="assistant_reminder_help")],
         [InlineKeyboardButton("📋 مهامي", callback_data="assistant_tasks_help"), InlineKeyboardButton("💰 مصاريفي", callback_data="assistant_expenses_help")],
         [InlineKeyboardButton("🎓 جدولي الدراسي", callback_data="student_schedule_help"), InlineKeyboardButton("🗓️ اختباراتي ومواعيدي", callback_data="student_events_help")],
+        [InlineKeyboardButton("📅 التقويم الهجري والميلادي", callback_data="calendar:home"), InlineKeyboardButton("🤲 الأذكار والأدعية", callback_data="adhkar:home")],
         [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تدريبي", callback_data="assistant_quiz_help")],
         [InlineKeyboardButton("📊 استخدامي وخصوصيتي", callback_data="assistant_privacy")],
         [InlineKeyboardButton("💬 الاستفسارات العامة (خاص)", callback_data="inquiry_start")],
         [InlineKeyboardButton("🛡️ لوحة حماية القروبات", callback_data="assistant_group_panel")]
     ])
+
+
+ADHKAR = {
+    "morning": ("🌅 أذكار الصباح", [
+        "أَعُوذُ بِاللَّهِ مِنَ الشَّيْطَانِ الرَّجِيمِ، اللَّهُ لَا إِلَٰهَ إِلَّا هُوَ الْحَيُّ الْقَيُّومُ... (آية الكرسي — البقرة: 255)",
+        "قُلْ هُوَ اللَّهُ أَحَدٌ، اللَّهُ الصَّمَدُ، لَمْ يَلِدْ وَلَمْ يُولَدْ، وَلَمْ يَكُن لَّهُ كُفُوًا أَحَدٌ. (الإخلاص)",
+        "اللَّهُمَّ بِكَ أَصْبَحْنَا، وَبِكَ أَمْسَيْنَا، وَبِكَ نَحْيَا، وَبِكَ نَمُوتُ، وَإِلَيْكَ النُّشُورُ.",
+        "رَضِيتُ بِاللَّهِ رَبًّا، وَبِالْإِسْلَامِ دِينًا، وَبِمُحَمَّدٍ ﷺ نَبِيًّا. (ثلاث مرات)",
+        "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ."
+    ]),
+    "evening": ("🌇 أذكار المساء", [
+        "قُلْ هُوَ اللَّهُ أَحَدٌ... (سورة الإخلاص، وتُقرأ مع المعوذتين)",
+        "أَمْسَيْنَا وَأَمْسَى الْمُلْكُ لِلَّهِ، وَالْحَمْدُ لِلَّهِ، لَا إِلَٰهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ.",
+        "رَضِيتُ بِاللَّهِ رَبًّا، وَبِالْإِسْلَامِ دِينًا، وَبِمُحَمَّدٍ ﷺ نَبِيًّا. (ثلاث مرات)",
+        "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ."
+    ]),
+    "sleep": ("🌙 أذكار النوم", [
+        "بِاسْمِكَ اللَّهُمَّ أَمُوتُ وَأَحْيَا.",
+        "اللَّهُمَّ قِنِي عَذَابَكَ يَوْمَ تَبْعَثُ عِبَادَكَ.",
+        "قراءة آية الكرسي قبل النوم.",
+        "جمع الكفين وقراءة الإخلاص والفلق والناس، ثم النفث فيهما ومسح ما استطاع من الجسد، ثلاث مرات."
+    ]),
+    "general": ("🤲 أدعية عامة", [
+        "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ. (البقرة: 201)",
+        "رَبِّ زِدْنِي عِلْمًا. (طه: 114)",
+        "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْهُدَى وَالتُّقَى وَالْعَفَافَ وَالْغِنَى.",
+        "اللَّهُمَّ أَعِنِّي عَلَى ذِكْرِكَ وَشُكْرِكَ وَحُسْنِ عِبَادَتِكَ."
+    ])
+}
+
+
+def adhkar_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌅 الصباح", callback_data="adhkar:morning"), InlineKeyboardButton("🌇 المساء", callback_data="adhkar:evening")],
+        [InlineKeyboardButton("🌙 النوم", callback_data="adhkar:sleep"), InlineKeyboardButton("🤲 أدعية عامة", callback_data="adhkar:general")],
+        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="adhkar:back")]
+    ])
+
+
+def calendar_markup(year, month):
+    prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ الشهر السابق", callback_data=f"calendar:month:{prev_year}:{prev_month}"), InlineKeyboardButton("الشهر التالي ▶️", callback_data=f"calendar:month:{next_year}:{next_month}")],
+        [InlineKeyboardButton("🔎 بحث/تحويل تاريخ", callback_data="calendar:search"), InlineKeyboardButton("📆 الشهر الحالي", callback_data="calendar:current")],
+        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="calendar:back")]
+    ])
+
+
+# Saudi school-year holidays (1448-1449 AH / 2026-2027), sourced from the published
+# general-education calendar. These are date ranges for the general school calendar;
+# some regions/institutions may have different schedules.
+SAUDI_SCHOOL_HOLIDAYS_1448 = [
+    ("إجازة اليوم الوطني", "2026-09-23", "2026-09-26"),
+    ("إجازة الخريف", "2026-11-20", "2026-11-28"),
+    ("إجازة منتصف العام الدراسي", "2027-01-08", "2027-01-16"),
+    ("إجازة يوم التأسيس", "2027-02-19", "2027-02-22"),
+    ("إجازة عيد الفطر المدرسية", "2027-02-06", "2027-03-13"),
+    ("إجازة عيد الأضحى المدرسية", "2027-05-07", "2027-05-22"),
+    ("إجازة نهاية العام الدراسي", "2027-06-24", "2027-06-24"),
+]
+
+
+def _school_holiday_lines_for_month(year, month):
+    from datetime import date
+    first = date(year, month, 1)
+    last = date(year + (month == 12), (month % 12) + 1, 1)
+    last = last.fromordinal(last.toordinal() - 1)
+    lines = []
+    for title, start_s, end_s in SAUDI_SCHOOL_HOLIDAYS_1448:
+        start = date.fromisoformat(start_s)
+        end = date.fromisoformat(end_s)
+        if start <= last and end >= first:
+            lines.append(f"🎓 {title} — {start.strftime('%d/%m/%Y')} إلى {end.strftime('%d/%m/%Y')}")
+    return lines
+
+
+async def calendar_month_text(year, month):
+    """Fetch Gregorian month with Hijri dates and holiday labels from AlAdhan API,
+    then add Saudi school-holiday ranges for academic year 1448-1449."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"https://api.aladhan.com/v1/gToHCalendar/{month}/{year}")
+            r.raise_for_status()
+            payload = r.json()
+        days = payload.get("data", [])
+        if not days:
+            return None
+        month_name = days[0]["gregorian"]["month"].get("en", str(month))
+        lines = [f"📅 التقويم الهجري والميلادي — {month_name} {year}", "📌 التاريخ الهجري المعروض حسب بيانات خدمة التقويم؛ قد تختلف بعض المناسبات بحسب ثبوت الهلال.", ""]
+        for day in days:
+            g = day.get("gregorian", {})
+            h = day.get("hijri", {})
+            holidays = h.get("holidays") or []
+            holiday = (" — " + "، ".join(holidays)) if holidays else ""
+            lines.append(f"{g.get('day','?')} {g.get('month',{}).get('en','')} | {h.get('day','?')} {h.get('month',{}).get('ar',h.get('month',{}).get('en',''))} {h.get('year','')}هـ{holiday}")
+        school_holidays = _school_holiday_lines_for_month(year, month)
+        if school_holidays:
+            lines.extend(["", "🎓 إجازات العام الدراسي السعودي 1448-1449هـ:", *school_holidays])
+        return "\n".join(lines)
+    except Exception as exc:
+        log.warning("calendar API unavailable: %s", exc)
+        return None
+
+
+async def calendar_date_text(query):
+    """Convert a Gregorian date (YYYY-MM-DD or DD/MM/YYYY) to Hijri using AlAdhan."""
+    q = (query or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", q)
+    if match:
+        year, month, day = map(int, match.groups())
+    else:
+        match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", q)
+        if not match:
+            return None
+        day, month, year = map(int, match.groups())
+    try:
+        date_obj = datetime(year, month, day)
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(f"https://api.aladhan.com/v1/gToH/{date_obj.strftime('%d-%m-%Y')}")
+            r.raise_for_status()
+            payload = r.json().get("data", {}).get("hijri", {})
+        if not payload:
+            return None
+        g_month = date_obj.strftime("%B")
+        h_month = payload.get("month", {}).get("ar", payload.get("month", {}).get("en", ""))
+        holidays = payload.get("holidays") or []
+        extra = "\n🎉 المناسبة: " + "، ".join(holidays) if holidays else ""
+        return f"📅 التاريخ الميلادي: {day:02d}/{month:02d}/{year} ({g_month})\n🌙 التاريخ الهجري: {payload.get('day','?')} {h_month} {payload.get('year','')}هـ{extra}\n\nملاحظة: قد تختلف بعض المناسبات حسب ثبوت الهلال في السعودية."
+    except Exception as exc:
+        log.warning("calendar date conversion failed: %s", exc)
+        return None
 
 
 def _offline_summary(source, limit=8):
@@ -2096,6 +2253,20 @@ async def start(update, context):
                 [InlineKeyboardButton("🕹️", callback_data="public:back")],
             ]),
         )
+
+
+async def calendar_cmd(update, context):
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("افتح البوت في الخاص لاستخدام التقويم التفاعلي."); return
+    dt = datetime.now(ZoneInfo("Asia/Riyadh"))
+    text_value = await calendar_month_text(dt.year, dt.month)
+    if not text_value:
+        await update.effective_message.reply_text("تعذر جلب التقويم الآن. حاول لاحقًا."); return
+    await update.effective_message.reply_text(text_value[:3900], reply_markup=calendar_markup(dt.year, dt.month))
+
+
+async def adhkar_cmd(update, context):
+    await update.effective_message.reply_text("🤲 الأذكار والأدعية\nاختر القسم لعرض النصوص وقراءتها. لا يوجد نشر تلقائي للقروبات.", reply_markup=adhkar_markup())
 
 
 async def staffdone_cmd(update, context):
@@ -4081,6 +4252,40 @@ async def callback(update, context):
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "calendar:back":
+        await q.edit_message_text("🤖 قائمة الخدمات الشخصية والطلابية:", reply_markup=assistant_menu_markup()); return
+    if data in ("calendar:home", "calendar:current"):
+        dt = datetime.now(ZoneInfo("Asia/Riyadh"))
+        text_value = await calendar_month_text(dt.year, dt.month)
+        if not text_value:
+            await q.edit_message_text("⚠️ تعذر جلب التقويم الآن. تأكد من اتصال الخدمة ثم حاول مجددًا.", reply_markup=calendar_markup(dt.year, dt.month)); return
+        await q.edit_message_text(text_value[:3900], reply_markup=calendar_markup(dt.year, dt.month)); return
+    if data.startswith("calendar:month:"):
+        try:
+            _, _, year_raw, month_raw = data.split(":", 3); year, month = int(year_raw), int(month_raw)
+            if not 1900 <= year <= 2100 or not 1 <= month <= 12: raise ValueError
+        except ValueError:
+            await safe_callback_answer(q, "التاريخ غير صحيح.", show_alert=True); return
+        text_value = await calendar_month_text(year, month)
+        if not text_value:
+            await q.edit_message_text("⚠️ تعذر جلب التقويم الآن. حاول لاحقًا.", reply_markup=calendar_markup(year, month)); return
+        await q.edit_message_text(text_value[:3900], reply_markup=calendar_markup(year, month)); return
+    if data == "calendar:search":
+        context.user_data["awaiting_calendar_search"] = True
+        await q.message.reply_text("🔎 أرسل تاريخًا ميلاديًا للتحويل مثل 2026-10-16 أو 16/10/2026، أو اكتب اسم مناسبة مثل رمضان أو عرفة للبحث في التقويم.\nللإلغاء أرسل /cancel.")
+        return
+    if data == "adhkar:back":
+        await q.edit_message_text("🤖 قائمة الخدمات الشخصية والطلابية:", reply_markup=assistant_menu_markup()); return
+    if data == "adhkar:home":
+        await q.edit_message_text("🤲 الأذكار والأدعية\nاختر القسم لعرض النصوص وقراءتها أو نسخها. لا يوجد نشر تلقائي للقروبات.", reply_markup=adhkar_markup()); return
+    if data.startswith("adhkar:"):
+        key = data.split(":", 1)[1]
+        if key not in ADHKAR:
+            await safe_callback_answer(q, "القسم غير موجود.", show_alert=True); return
+        title, items = ADHKAR[key]
+        body = title + "\n\n" + "\n\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
+        await q.edit_message_text(body[:3900], reply_markup=adhkar_markup()); return
 
     if data == "staff_permissions":
         if not (is_owner(uid) or is_delegated_owner(uid)):
@@ -6456,7 +6661,7 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id")
+    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_calendar_search")
     cancelled = any(context.user_data.pop(key, None) is not None for key in keys)
     await update.effective_message.reply_text("تم إلغاء العملية الحالية." if cancelled else "لا توجد عملية قيد التنفيذ.")
 
@@ -6698,7 +6903,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "calendar": calendar_cmd, "adhkar": adhkar_cmd, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
