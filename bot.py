@@ -27,37 +27,7 @@ from telegram.ext import (
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 BOOTSTRAP_CODE = os.environ.get("BOOTSTRAP_CODE", "").strip()
-# Prefer Render persistent storage when it is mounted. An explicit DB_PATH always wins.
-# If /var/data is available but empty, migrate the existing project-local SQLite DB
-# with SQLite's backup API (safe with WAL); never overwrite an existing persistent DB.
-def _choose_database_path():
-    explicit = os.environ.get("DB_PATH", "").strip()
-    if explicit:
-        target = os.path.abspath(explicit)
-    elif os.path.isdir("/var/data") and os.access("/var/data", os.W_OK):
-        target = "/var/data/bot.db"
-        legacy = os.path.abspath("bot.db")
-        if not os.path.exists(target) and os.path.isfile(legacy):
-            try:
-                source_db = sqlite3.connect(legacy, timeout=30)
-                target_db = sqlite3.connect(target, timeout=30)
-                try:
-                    source_db.backup(target_db)
-                finally:
-                    target_db.close()
-                    source_db.close()
-                logging.getLogger("groupbot").info("Migrated existing SQLite database to persistent storage.")
-            except Exception:
-                logging.getLogger("groupbot").exception("Database migration to persistent storage failed; keeping legacy DB path.")
-                target = legacy
-    else:
-        target = os.path.abspath("bot.db")
-    parent = os.path.dirname(target)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    return target
-
-DB_PATH = _choose_database_path()
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
 # Optional Render deploy integration. Configure both values in Render Environment.
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
@@ -68,48 +38,7 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("groupbot")
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-db.execute("PRAGMA busy_timeout=30000")
-try:
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=NORMAL")
-except sqlite3.DatabaseError:
-    log.exception("Could not enable SQLite WAL settings; continuing with the existing journal mode.")
-
-# Create a pre-migration snapshot on persistent storage before CREATE/ALTER statements.
-# Keep the latest five snapshots; snapshots are private and should not be shared publicly.
-def _make_startup_db_backup():
-    backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
-    if not os.path.isdir("/var/data") or not os.access("/var/data", os.W_OK):
-        log.warning("Persistent storage not detected. Database backups will not survive ephemeral deploys unless DB_PATH points to a persistent disk.")
-        return
-    os.makedirs(backup_dir, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(backup_dir, f"bot_preupdate_{stamp}.db")
-    try:
-        # This connection is opened before schema migrations, so this is a pre-update snapshot.
-        target = sqlite3.connect(backup_path, timeout=30)
-        try:
-            db.backup(target)
-        finally:
-            target.close()
-        backups = sorted(
-            (os.path.join(backup_dir, name) for name in os.listdir(backup_dir)
-             if name.startswith("bot_preupdate_") and name.endswith(".db")),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        for stale in backups[5:]:
-            try:
-                os.remove(stale)
-            except OSError:
-                log.warning("Could not remove old backup %s", stale)
-        log.info("Pre-update database backup created: %s", backup_path)
-    except Exception:
-        log.exception("Automatic pre-update database backup failed.")
-
-_make_startup_db_backup()
-
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 # Additive assistant tables. Existing group/panel/reentry tables are preserved.
 db.execute("""CREATE TABLE IF NOT EXISTS assistant_users(
     user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', display_name TEXT DEFAULT '',
@@ -1605,6 +1534,7 @@ async def channel_post_listener(update, context):
 
 def assistant_menu_markup():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎓 بوابتي الجامعية", callback_data="university_portal")],
         [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("⏰ تذكير جديد", callback_data="assistant_reminder_help")],
         [InlineKeyboardButton("📋 مهامي", callback_data="assistant_tasks_help"), InlineKeyboardButton("💰 مصاريفي", callback_data="assistant_expenses_help")],
         [InlineKeyboardButton("🎓 جدولي الدراسي", callback_data="student_schedule_help"), InlineKeyboardButton("🗓️ اختباراتي ومواعيدي", callback_data="student_events_help")],
@@ -4323,6 +4253,32 @@ async def callback(update, context):
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data == "university_portal":
+        portal_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 سجل المذاكرة الأسبوعي", callback_data="student_schedule_help")],
+            [InlineKeyboardButton("📋 الأعمال الفصلية", callback_data="coursework_portal_help")],
+            [InlineKeyboardButton("🔔 منبه المواعيد الجامعية", callback_data="student_events_help")],
+            [InlineKeyboardButton("🏆 إنجازاتي الدراسية", callback_data="student_achievements_help")],
+            [InlineKeyboardButton("🗓️ التقويم الهجري والميلادي", callback_data="calendar:home")],
+            [InlineKeyboardButton("⬅️ العودة إلى لوحة العضو", callback_data="university_portal_back")],
+        ])
+        await q.edit_message_text(
+            "🎓 بوابتي الجامعية\n\nخدماتك الدراسية في مكان واحد. اختر الخدمة المطلوبة من القائمة أدناه.",
+            reply_markup=portal_markup
+        ); return
+    if data == "university_portal_back":
+        await q.edit_message_text("🤖 لوحة خدماتك الشخصية والطلابية:", reply_markup=assistant_menu_markup()); return
+    if data == "coursework_portal_help":
+        await q.message.reply_text(
+            "📋 الأعمال الفصلية\n\nيمكنك استخدام هذه الخدمة لتنظيم أعمالك وملاحظاتك الدراسية.\n"
+            "تنبيه: حفظ صفحات الأعمال الفصلية وتحريرها من داخل البوت لم يُنفّذ بعد في هذه النسخة، لذلك لن أصفها بأنها خدمة مكتملة."
+        ); return
+    if data == "student_achievements_help":
+        await q.message.reply_text(
+            "🏆 إنجازاتي الدراسية\n\nتظهر هنا متابعة إنجازاتك الدراسية عند توفر سجل المهام والنقاط.\n"
+            "تنبيه: نظام النقاط والمكافآت الأسبوعية المتكامل لم يُنفّذ بعد في هذه النسخة."
+        ); return
 
     if data == "calendar:back":
         await q.edit_message_text("🤖 قائمة الخدمات الشخصية والطلابية:", reply_markup=assistant_menu_markup()); return
