@@ -1536,6 +1536,90 @@ def _offline_summary(source, limit=8):
     return "📄 ملخص استخراجي محلي (دون ذكاء اصطناعي):\n\n" + "\n".join(f"• {x[:500]}" for x in chosen)[:3500]
 
 
+async def openai_assistant_response(user_text, chat_title="المحادثة"):
+    """Generate a direct assistant answer through OpenAI API; returns Arabic error text on failure."""
+    if not OPENAI_API_KEY:
+        return None
+    prompt = (user_text or "").strip()
+    if not prompt:
+        return "اكتب سؤالك بعد الأمر /ai، مثال: /ai اشرح لي مبادئ الإدارة."
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "أنت المساعد التنفيذي لبوت تيليجرام. أجب بالعربية بوضوح واختصار. يمكنك اقتراح خطوات، لكن لا تدّعِ أنك نفذت إجراءً إداريًا داخل تيليجرام ما لم تنفذه وظيفة برمجية فعلية. لا تطلب مفاتيح أو كلمات مرور."},
+                        {"role": "user", "content": f"السياق: {chat_title}\nالطلب: {prompt[:6000]}"}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 800
+                }
+            )
+            if response.status_code == 401:
+                log.warning("OpenAI API returned 401 Unauthorized")
+                return "⚠️ مفتاح OpenAI مرفوض (401). تحقق من OPENAI_API_KEY في Render دون مشاركته."
+            if response.status_code == 429:
+                body = response.text[:500].lower()
+                log.warning("OpenAI API returned 429")
+                if "insufficient_quota" in body or "quota" in body or "billing" in body:
+                    return "⚠️ تعذر استخدام الذكاء الاصطناعي بسبب الرصيد أو حصة الفوترة. تحقق من صفحة Usage وBilling في OpenAI."
+                return "⚠️ وصلت طلبات الذكاء إلى حد السرعة مؤقتًا. انتظر قليلًا ثم أعد المحاولة."
+            response.raise_for_status()
+            data = response.json()
+            answer = str(data["choices"][0]["message"]["content"]).strip()
+            return answer[:3900] if answer else "لم يصل رد نصي من خدمة الذكاء الاصطناعي. حاول مرة أخرى."
+    except httpx.TimeoutException:
+        log.warning("OpenAI API request timed out")
+        return "⚠️ انتهت مهلة الاتصال بخدمة الذكاء الاصطناعي. حاول مرة أخرى بعد قليل."
+    except Exception as exc:
+        log.exception("OpenAI assistant request failed: %s", exc)
+        return "⚠️ تعذر الاتصال بخدمة الذكاء الاصطناعي. راجع Render Logs لمعرفة السبب، ولا تشارك المفاتيح السرية."
+
+
+async def ai_cmd(update, context):
+    """Explicit /ai command in private or registered groups with existing capability checks."""
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+    if not OPENAI_API_KEY:
+        await msg.reply_text("⚠️ لم يتم ضبط OPENAI_API_KEY في بيئة Render.")
+        return
+    if chat.type == ChatType.PRIVATE:
+        if not (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "ai")):
+            await msg.reply_text("⛔ لا تملك صلاحية استخدام الذكاء الاصطناعي. اطلب من المالك الأساسي منحك الصلاحية.")
+            return
+        prompt = " ".join(context.args).strip()
+        if not prompt:
+            await msg.reply_text("اكتب سؤالك بعد الأمر، مثال:\n/ai اشرح لي مبادئ الإدارة")
+            return
+        await msg.reply_text("⏳ جاري إعداد الإجابة...")
+        answer = await openai_assistant_response(prompt, "الخاص")
+        await msg.reply_text(answer or "⚠️ خدمة الذكاء الاصطناعي غير متاحة.")
+        return
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        registered = bool(db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat.id,)).fetchone())
+        if not registered:
+            await msg.reply_text("⛔ هذا القروب غير مسجل ضمن القروبات التي يديرها البوت.")
+            return
+        if not (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "ai", chat.id)):
+            await msg.reply_text("⛔ لا تملك صلاحية استخدام الذكاء الاصطناعي في هذا القروب.")
+            return
+        prompt = " ".join(context.args).strip()
+        if not prompt:
+            await msg.reply_text("اكتب سؤالك بعد الأمر، مثال: /ai اشرح لي مبادئ الإدارة")
+            return
+        await msg.reply_text("⏳ جاري إعداد الإجابة...")
+        answer = await openai_assistant_response(prompt, chat.title or "قروب تيليجرام")
+        await msg.reply_text(answer or "⚠️ خدمة الذكاء الاصطناعي غير متاحة.")
+        return
+    await msg.reply_text("استخدم /ai في الخاص أو داخل قروب مسجل ومصرح به.")
+
+
 async def offline_assistant_response(user_id, user_text):
     """Offline helper: no AI provider, network call, API key, or claim of generative AI."""
     text = (user_text or "").strip()
@@ -1978,6 +2062,11 @@ async def assistant_private_text(update, context):
     if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_channel_broadcast"):
         return
     remember_assistant_user(user)
+    if OPENAI_API_KEY and (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "ai")):
+        answer = await openai_assistant_response(msg.text, "الخاص")
+        if answer:
+            await msg.reply_text(answer)
+            return
     answer = await offline_assistant_response(user.id, msg.text)
     await msg.reply_text(answer)
 
@@ -6609,7 +6698,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     command_handlers = {
-        "start": start, "help": help_cmd, "panel": panel, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "staffdone": staffdone_cmd, "games": games_cmd, "reviewgames": games_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
