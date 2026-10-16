@@ -2633,7 +2633,7 @@ def assistant_menu_markup():
         [InlineKeyboardButton("📅 التقويم الهجري والميلادي", callback_data="calendar:home"), InlineKeyboardButton("🤲 الأذكار والأدعية", callback_data="adhkar:home")],
         [InlineKeyboardButton("📄 تلخيص نص/ملف", callback_data="assistant_summary_help"), InlineKeyboardButton("🎓 اختبار تدريبي", callback_data="assistant_quiz_help")],
         [InlineKeyboardButton("📊 استخدامي وخصوصيتي", callback_data="assistant_privacy")],
-        [InlineKeyboardButton("💬 الاستفسارات العامة (خاص)", callback_data="inquiry_start")],
+        [InlineKeyboardButton("💬 الاستفسارات العامة (تفاعلي)", web_app=WebAppInfo(url=WEBAPP_URL + "?tab=inquiries"))] if WEBAPP_URL.startswith("https://") else [InlineKeyboardButton("💬 الاستفسارات العامة (خاص)", callback_data="inquiry_start")],
         [InlineKeyboardButton("🛡️ لوحة حماية القروبات", callback_data="assistant_group_panel")]
     ])
 
