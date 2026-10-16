@@ -9,6 +9,7 @@ import uuid
 import time
 import random
 import json
+import calendar as pycalendar
 import html
 import httpx
 from collections import defaultdict, deque
@@ -1584,13 +1585,71 @@ def adhkar_markup():
 
 
 def calendar_markup(year, month):
+    """Compact fallback controls when the calendar API is unavailable."""
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
     next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ الشهر السابق", callback_data=f"calendar:month:{prev_year}:{prev_month}"), InlineKeyboardButton("الشهر التالي ▶️", callback_data=f"calendar:month:{next_year}:{next_month}")],
-        [InlineKeyboardButton("🔎 بحث/تحويل تاريخ", callback_data="calendar:search"), InlineKeyboardButton("📆 الشهر الحالي", callback_data="calendar:current")],
-        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="calendar:back")]
+        [InlineKeyboardButton("◀️ السابق", callback_data=f"calendar:month:{prev_year}:{prev_month}"), InlineKeyboardButton("التالي ▶️", callback_data=f"calendar:month:{next_year}:{next_month}")],
+        [InlineKeyboardButton("🔎 بحث عن تاريخ", callback_data="calendar:search"), InlineKeyboardButton("📆 اليوم", callback_data="calendar:current")],
+        [InlineKeyboardButton("⬅️ بوابتي الجامعية", callback_data="university_portal")]
     ])
+
+
+async def calendar_grid_view(year, month):
+    """Build an interactive month grid; each date button contains Gregorian and Hijri dates."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"https://api.aladhan.com/v1/gToHCalendar/{month}/{year}")
+            response.raise_for_status()
+            payload = response.json()
+        days = payload.get("data") or []
+        if not days:
+            return None, calendar_markup(year, month)
+        month_name = days[0].get("gregorian", {}).get("month", {}).get("en", str(month))
+        hijri_names = []
+        for item in days:
+            hm = item.get("hijri", {}).get("month", {}).get("ar", "")
+            if hm and hm not in hijri_names:
+                hijri_names.append(hm)
+        hijri_title = " – ".join(hijri_names[:2]) or "التاريخ الهجري"
+        header = (f"🎓 بوابتي الجامعية | التقويم الهجري والميلادي\n"
+                  f"📅 {month_name} {year}\n🌙 {hijri_title}\n"
+                  "اضغط على أي يوم لعرض تفاصيله؛ قد يختلف التاريخ الهجري يومًا بحسب ثبوت الهلال.")
+        # Telegram inline keyboards have a small callback payload; date cells use compact data.
+        weekday_names = ["أحد", "إثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت"]
+        rows = [[InlineKeyboardButton(name, callback_data="calendar:noop") for name in weekday_names]]
+        by_day = {}
+        for item in days:
+            g = item.get("gregorian", {})
+            h = item.get("hijri", {})
+            try:
+                n = int(g.get("day"))
+            except (TypeError, ValueError):
+                continue
+            by_day[n] = (str(h.get("day", "?")), str(h.get("month", {}).get("ar", "")), str(h.get("year", "")))
+        today = datetime.now(ZoneInfo("Asia/Riyadh"))
+        month_grid = pycalendar.Calendar(firstweekday=6).monthdayscalendar(year, month)  # Sunday first
+        for week in month_grid:
+            row = []
+            for n in week:
+                if not n:
+                    row.append(InlineKeyboardButton("·", callback_data="calendar:noop"))
+                    continue
+                hijri_day, hijri_month, hijri_year = by_day.get(n, ("?", "", ""))
+                label = f"🔹{n}\n{hijri_day}هـ" if (year, month, n) == (today.year, today.month, today.day) else f"{n}\n{hijri_day}هـ"
+                row.append(InlineKeyboardButton(label, callback_data=f"calendar:day:{year}:{month}:{n}"))
+            rows.append(row)
+        prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
+        next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+        rows.extend([
+            [InlineKeyboardButton("◀️ الشهر السابق", callback_data=f"calendar:month:{prev_year}:{prev_month}"), InlineKeyboardButton("الشهر التالي ▶️", callback_data=f"calendar:month:{next_year}:{next_month}")],
+            [InlineKeyboardButton("🔎 بحث عن تاريخ", callback_data="calendar:search"), InlineKeyboardButton("📆 اليوم", callback_data="calendar:current")],
+            [InlineKeyboardButton("⬅️ بوابتي الجامعية", callback_data="university_portal")]
+        ])
+        return header, InlineKeyboardMarkup(rows)
+    except Exception as exc:
+        log.warning("calendar grid unavailable: %s", exc)
+        return None, calendar_markup(year, month)
 
 
 # Saudi school-year holidays (1448-1449 AH / 2026-2027), sourced from the published
@@ -4256,15 +4315,14 @@ async def callback(update, context):
 
     if data == "university_portal":
         portal_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 سجل المذاكرة الأسبوعي", callback_data="student_schedule_help")],
-            [InlineKeyboardButton("📋 الأعمال الفصلية", callback_data="coursework_portal_help")],
-            [InlineKeyboardButton("🔔 منبه المواعيد الجامعية", callback_data="student_events_help")],
-            [InlineKeyboardButton("🏆 إنجازاتي الدراسية", callback_data="student_achievements_help")],
-            [InlineKeyboardButton("🗓️ التقويم الهجري والميلادي", callback_data="calendar:home")],
+            [InlineKeyboardButton("📚 سجل المذاكرة الأسبوعي", callback_data="student_schedule_help"), InlineKeyboardButton("📋 الأعمال الفصلية", callback_data="coursework_portal_help")],
+            [InlineKeyboardButton("🔔 منبه المواعيد الجامعية", callback_data="student_events_help"), InlineKeyboardButton("🏆 إنجازاتي الدراسية", callback_data="student_achievements_help")],
+            [InlineKeyboardButton("🗓️ التقويم الهجري والميلادي", callback_data="calendar:home"), InlineKeyboardButton("🤲 الأذكار والأدعية", callback_data="adhkar:home")],
+            [InlineKeyboardButton("📝 ملاحظاتي", callback_data="assistant_notes_help"), InlineKeyboardButton("🎯 أهدافي وخططي", callback_data="assistant_tasks_help")],
             [InlineKeyboardButton("⬅️ العودة إلى لوحة العضو", callback_data="university_portal_back")],
         ])
         await q.edit_message_text(
-            "🎓 بوابتي الجامعية\n\nخدماتك الدراسية في مكان واحد. اختر الخدمة المطلوبة من القائمة أدناه.",
+            "🎓 بوابتي الجامعية\n━━━━━━━━━━━━━━\nكل ما تحتاجه في مكان واحد 💙\n\nاختر إحدى الخدمات أدناه. صُممت القائمة لتكون واضحة وسهلة الاستخدام على الجوال.",
             reply_markup=portal_markup
         ); return
     if data == "university_portal_back":
@@ -4282,22 +4340,36 @@ async def callback(update, context):
 
     if data == "calendar:back":
         await q.edit_message_text("🤖 قائمة الخدمات الشخصية والطلابية:", reply_markup=assistant_menu_markup()); return
+    if data == "calendar:noop":
+        return
+    if data.startswith("calendar:day:"):
+        try:
+            _, _, year_raw, month_raw, day_raw = data.split(":", 4)
+            chosen = datetime(int(year_raw), int(month_raw), int(day_raw))
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "التاريخ غير صحيح.", show_alert=True); return
+        result = await calendar_date_text(chosen.strftime("%Y-%m-%d"))
+        if result:
+            await q.message.reply_text(result, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ العودة للتقويم", callback_data=f"calendar:month:{chosen.year}:{chosen.month}")], [InlineKeyboardButton("🎓 بوابتي الجامعية", callback_data="university_portal")]]))
+        else:
+            await safe_callback_answer(q, "تعذر جلب تفاصيل التاريخ الآن.", show_alert=True)
+        return
     if data in ("calendar:home", "calendar:current"):
         dt = datetime.now(ZoneInfo("Asia/Riyadh"))
-        text_value = await calendar_month_text(dt.year, dt.month)
-        if not text_value:
-            await q.edit_message_text("⚠️ تعذر جلب التقويم الآن. تأكد من اتصال الخدمة ثم حاول مجددًا.", reply_markup=calendar_markup(dt.year, dt.month)); return
-        await q.edit_message_text(text_value[:3900], reply_markup=calendar_markup(dt.year, dt.month)); return
+        grid_text, grid_markup = await calendar_grid_view(dt.year, dt.month)
+        if not grid_text:
+            await q.edit_message_text("⚠️ تعذر جلب التقويم الشبكي الآن. تحقق من اتصال الخدمة ثم حاول مجددًا.", reply_markup=grid_markup); return
+        await q.edit_message_text(grid_text[:3900], reply_markup=grid_markup); return
     if data.startswith("calendar:month:"):
         try:
             _, _, year_raw, month_raw = data.split(":", 3); year, month = int(year_raw), int(month_raw)
             if not 1900 <= year <= 2100 or not 1 <= month <= 12: raise ValueError
         except ValueError:
             await safe_callback_answer(q, "التاريخ غير صحيح.", show_alert=True); return
-        text_value = await calendar_month_text(year, month)
-        if not text_value:
-            await q.edit_message_text("⚠️ تعذر جلب التقويم الآن. حاول لاحقًا.", reply_markup=calendar_markup(year, month)); return
-        await q.edit_message_text(text_value[:3900], reply_markup=calendar_markup(year, month)); return
+        grid_text, grid_markup = await calendar_grid_view(year, month)
+        if not grid_text:
+            await q.edit_message_text("⚠️ تعذر جلب التقويم الشبكي الآن. حاول لاحقًا.", reply_markup=grid_markup); return
+        await q.edit_message_text(grid_text[:3900], reply_markup=grid_markup); return
     if data == "calendar:search":
         context.user_data["awaiting_calendar_search"] = True
         await q.message.reply_text("🔎 أرسل تاريخًا ميلاديًا للتحويل مثل 2026-10-16 أو 16/10/2026، أو اكتب اسم مناسبة مثل رمضان أو عرفة للبحث في التقويم.\nللإلغاء أرسل /cancel.")
