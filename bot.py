@@ -1398,6 +1398,11 @@ db.execute("""CREATE TABLE IF NOT EXISTS external_group_capabilities(
     granted_by INTEGER NOT NULL DEFAULT 0, granted_at TEXT NOT NULL,
     PRIMARY KEY(chat_id, capability)
 )""")
+# Owner-controlled AI enablement for every registered group (including internal groups).
+db.execute("""CREATE TABLE IF NOT EXISTS ai_group_settings(
+    chat_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+    updated_by INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT ''
+)""")
 db.execute("""CREATE TABLE IF NOT EXISTS external_support_tickets(
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, group_title TEXT DEFAULT '',
     requester_id INTEGER NOT NULL, requester_name TEXT DEFAULT '', requester_username TEXT DEFAULT '',
@@ -2858,11 +2863,21 @@ async def publish_channels_cmd(update, context):
     await update.effective_message.reply_text("📡 اختر القنوات المستهدفة للنشر:", reply_markup=InlineKeyboardMarkup(kb))
 
 
+def _is_aistatus_alias(text):
+    """Accept status command with or without slash, and tolerate a trailing slash."""
+    value = (text or "").strip().casefold()
+    value = value.lstrip("/").rstrip("/").strip()
+    return value == "aistatus"
+
+
 async def process_private_workflows(update, context):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
     raw = (msg.text or "").strip()
+    # A status request must never be consumed as the next value of another private workflow.
+    if _is_aistatus_alias(raw):
+        return
     if any(context.user_data.get(key) is not None for key in (
         "external_support_state", "mass_ban_state", "support_reply_ticket_id",
         "awaiting_coursework_page", "awaiting_calendar_search", "owner_autoreply_state",
@@ -3503,9 +3518,14 @@ async def ai_cmd(update, context):
             if not (is_owner(user.id) or await is_telegram_group_admin(context.bot, user.id, chat.id)):
                 await msg.reply_text("⛔ عند تفعيل الذكاء الاصطناعي لقروب خارجي، يقتصر استخدامه على مشرفي القروب الفعليين في تيليجرام.")
                 return
-        elif not (is_owner(user.id) or can_use_capability(user.id, "ai", chat.id)):
-            await msg.reply_text("⛔ لا تملك صلاحية استخدام الذكاء الاصطناعي في هذا القروب.")
-            return
+        else:
+            ai_setting = db.execute("SELECT enabled FROM ai_group_settings WHERE chat_id=?", (chat.id,)).fetchone()
+            if ai_setting and not ai_setting[0]:
+                await msg.reply_text("⛔ الذكاء الاصطناعي غير مفعّل لهذا القروب من المالك الأساسي.")
+                return
+            if not (is_owner(user.id) or can_use_capability(user.id, "ai", chat.id)):
+                await msg.reply_text("⛔ لا تملك صلاحية استخدام الذكاء الاصطناعي في هذا القروب.")
+                return
         prompt = " ".join(context.args).strip()
         if not prompt:
             await msg.reply_text("اكتب سؤالك بعد الأمر، مثال: /ai اشرح لي مبادئ الإدارة")
@@ -3515,6 +3535,100 @@ async def ai_cmd(update, context):
         await msg.reply_text(answer or "⚠️ خدمة الذكاء الاصطناعي غير متاحة.")
         return
     await msg.reply_text("استخدم /ai في الخاص أو داخل قروب مسجل ومصرح به.")
+
+
+async def aigroups_cmd(update, context):
+    """Owner-only control: /aigroups all on|off, /aigroups CHAT_ID on|off, /aigroups list."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not is_owner(user.id):
+        await msg.reply_text("⛔ هذه اللوحة للمالك الأساسي فقط.")
+        return
+    args = [str(x).strip() for x in (context.args or [])]
+    usage = (
+        "🤖 إدارة الذكاء الاصطناعي للقروبات\n\n"
+        "/aigroups list — عرض القروبات ومعرّفاتها وحالة الذكاء\n"
+        "/aigroups all on — تفعيل الذكاء لكل القروبات المسجلة\n"
+        "/aigroups all off — إيقافه عن جميع القروبات\n"
+        "/aigroups CHAT_ID on — تفعيل قروب محدد\n"
+        "/aigroups CHAT_ID off — إيقاف قروب محدد\n\n"
+        "عند التفعيل، يحاول البوت إرسال ترحيب مولّد بالذكاء الاصطناعي للقروب ويبلغك بالنتيجة."
+    )
+    if not args:
+        await msg.reply_text(usage)
+        return
+    mode = args[0].lower()
+    if mode == "list":
+        rows = db.execute("SELECT w.chat_id, COALESCE(w.title,''), COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0), COALESCE(e.is_external,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id ORDER BY w.title").fetchall()
+        if not rows:
+            await msg.reply_text("لا توجد قروبات مسجلة حاليًا.")
+            return
+        lines = ["📋 حالة الذكاء الاصطناعي للقروبات:"]
+        for cid, title, enabled, is_external in rows[:100]:
+            lines.append(f"{'🟢' if enabled else '⚪️'} {title or 'قروب بلا اسم'} | {cid} | {'خارجي' if is_external else 'داخلي'}")
+        if len(rows) > 100:
+            lines.append(f"… توجد {len(rows)-100} قروبات إضافية.")
+        await msg.reply_text("\n".join(lines)[:3900])
+        return
+    if len(args) != 2 or args[1].lower() not in ("on", "off"):
+        await msg.reply_text(usage)
+        return
+    enable = int(args[1].lower() == "on")
+    if mode == "all":
+        ids = [int(r[0]) for r in db.execute("SELECT chat_id FROM watched_groups").fetchall()]
+    else:
+        try:
+            ids = [int(args[0])]
+        except ValueError:
+            await msg.reply_text("❌ معرّف القروب غير صحيح. استخدم /aigroups list لمعرفة المعرفات.")
+            return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (ids[0],)).fetchone():
+            await msg.reply_text("❌ القروب غير مسجل لدى البوت. استخدم /aigroups list.")
+            return
+    if not ids:
+        await msg.reply_text("لا توجد قروبات مسجلة لتطبيق الأمر عليها.")
+        return
+    succeeded = 0
+    for cid in ids:
+        ext = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (cid,)).fetchone()
+        is_external = bool(ext and ext[0])
+        try:
+            if is_external:
+                db.execute("UPDATE external_group_control SET ai_enabled=?,updated_at=? WHERE chat_id=?", (enable, now(), cid))
+                db.execute("INSERT INTO external_group_capabilities(chat_id,capability,enabled,granted_by,granted_at) VALUES(?,'ai',?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,granted_by=excluded.granted_by,granted_at=excluded.granted_at", (cid, enable, user.id, now()))
+            else:
+                db.execute("INSERT INTO ai_group_settings(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at", (cid, enable, user.id, now()))
+            db.commit()
+            succeeded += 1
+            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (cid,)).fetchone()
+            title = (title_row[0] if title_row else None) or str(cid)
+            welcome_result = "لم يُرسل ترحيب (تم إيقاف الذكاء)."
+            if enable:
+                if not OPENAI_API_KEY:
+                    welcome_result = "تعذّر الترحيب: OPENAI_API_KEY غير مضبوط في Render."
+                else:
+                    welcome = await openai_assistant_response(
+                        f"اكتب رسالة ترحيب عربية قصيرة ولطيفة لأعضاء هذا القروب عند تفعيل المساعد الذكي. وضّح أن الذكاء الاصطناعي متاح للمساعدة والإجابة عن الأسئلة، ولا تدّعِ معرفة اسم مالك القروب. اجعلها مناسبة للنشر مباشرة، مع رموز تعبيرية قليلة.",
+                        f"رسالة ترحيب لقروب {title}"
+                    )
+                    if welcome and not welcome.startswith("⚠️"):
+                        try:
+                            await context.bot.send_message(chat_id=cid, text="🤖 تم تفعيل المساعد الذكي في هذا القروب!\n\n" + welcome[:3300])
+                            welcome_result = "تم إرسال ترحيب الذكاء الاصطناعي بنجاح."
+                        except Exception as exc:
+                            log.warning("AI welcome send failed for group %s: %s", cid, exc)
+                            welcome_result = "تعذّر إرسال الترحيب داخل القروب؛ تحقق من صلاحية البوت في إرسال الرسائل."
+                    else:
+                        welcome_result = "تعذّر إنشاء الترحيب عبر OpenAI؛ راجع إعدادات الخدمة وسجلات Render."
+            try:
+                await context.bot.send_message(chat_id=OWNER_ID, text=f"🤖 تحديث الذكاء الاصطناعي\nالقروب: {title}\nالمعرّف: {cid}\nالحالة: {'مفعّل' if enable else 'متوقف'}\nالنتيجة: {welcome_result}")
+            except Exception as exc:
+                log.warning("Could not notify owner about AI group change %s: %s", cid, exc)
+        except Exception as exc:
+            log.exception("Failed to change AI setting for group %s: %s", cid, exc)
+    await msg.reply_text(f"✅ تم {'تفعيل' if enable else 'إيقاف'} الذكاء الاصطناعي في {succeeded} من أصل {len(ids)} قروب.\nاستخدم /aigroups list لمراجعة الحالات. إشعار المالك والترحيب يعتمدان على صلاحية البوت والاتصال بالخدمة.")
 
 
 async def offline_assistant_response(user_id, user_text):
@@ -9366,8 +9480,13 @@ def owner_autoreply_group_markup(chat_id):
     return rows, buttons
 
 async def owner_autoreply_text_handler(update, context):
-    """Receives the primary/delegated owner's next private message during reply management."""
+    """Receives auto-reply setup text, while reserving AI status aliases."""
     if not update.effective_user or not update.effective_message or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    raw = (update.effective_message.text or "").strip()
+    # Let the owner check AI status even while an auto-reply wizard is waiting for input.
+    if _is_aistatus_alias(raw):
+        await aistatus_cmd(update, context)
         return
     state = context.user_data.get("owner_autoreply_state")
     if not state:
@@ -10025,7 +10144,7 @@ def main():
 
     command_handlers = {
         "portalstats": portal_stats_cmd,
-        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "calendar": calendar_cmd, "adhkar": adhkar_cmd, "staffdone": staffdone_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "aigroups": aigroups_cmd, "calendar": calendar_cmd, "adhkar": adhkar_cmd, "staffdone": staffdone_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
