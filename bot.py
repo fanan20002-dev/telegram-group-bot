@@ -15,7 +15,7 @@ import base64
 import io
 import httpx
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1415,6 +1415,13 @@ db.execute("""CREATE TABLE IF NOT EXISTS member_violations(
     last_reason TEXT DEFAULT '', reasons_json TEXT DEFAULT '[]', last_at TEXT NOT NULL,
     PRIMARY KEY(chat_id, user_id)
 )""")
+db.execute("""CREATE TABLE IF NOT EXISTS automatic_mutes(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, muted_until TEXT NOT NULL,
+    reason TEXT DEFAULT '', warning_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,user_id)
+)""")
+db.execute("CREATE INDEX IF NOT EXISTS idx_automatic_mutes_due ON automatic_mutes(status,muted_until)")
 _violation_cols = {r[1] for r in db.execute("PRAGMA table_info(member_violations)").fetchall()}
 if "abuse_count" not in _violation_cols:
     db.execute("ALTER TABLE member_violations ADD COLUMN abuse_count INTEGER NOT NULL DEFAULT 0")
@@ -2415,6 +2422,87 @@ def format_public_user(user):
     mention = f'<a href="tg://user?id={int(user.id)}">{name}</a>'
     username = getattr(user, "username", "") or ""
     return mention + (f" (@{html.escape(username)})" if username else "")
+
+
+def _mute_permissions():
+    return ChatPermissions(can_send_messages=False, can_send_audios=False, can_send_documents=False,
+        can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+        can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
+        can_add_web_page_previews=False)
+
+
+async def register_warning_and_enforce(context, chat, user, reason, abusive=False):
+    """Record a violation, publish an interactive warning card, and persist a 3-day mute at warning 3."""
+    warning_count, abuse_count = record_member_violation(chat.id, user, reason, abusive=abusive)
+    muted_until = None
+    already_active = db.execute("SELECT muted_until,status FROM automatic_mutes WHERE chat_id=? AND user_id=?", (chat.id, user.id)).fetchone()
+    if warning_count >= 3 and not (already_active and already_active[1] == 'active'):
+        until_dt = datetime.now(timezone.utc) + timedelta(days=3)
+        muted_until = until_dt.isoformat(timespec='seconds')
+        try:
+            await context.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id,
+                permissions=_mute_permissions(), until_date=until_dt)
+            db.execute("""INSERT INTO automatic_mutes(chat_id,user_id,muted_until,reason,warning_count,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,'active',?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                muted_until=excluded.muted_until,reason=excluded.reason,warning_count=excluded.warning_count,
+                status='active',updated_at=excluded.updated_at""",
+                (chat.id,user.id,muted_until,reason[:200],warning_count,now(),now()))
+            db.commit()
+            log_action(chat.id, user.id, 'automatic_mute_3_days', f'warning_count={warning_count}; until={muted_until}; reason={reason[:150]}')
+        except Exception as exc:
+            log.warning("Automatic 3-day mute failed chat=%s user=%s (%s)", chat.id, user.id, type(exc).__name__)
+            muted_until = None
+    buttons = [[InlineKeyboardButton("📋 سجل الإنذارات", callback_data=f"warnlog:{chat.id}:{user.id}"),
+                InlineKeyboardButton("🧹 إلغاء الإنذارات", callback_data=f"warnclear:{chat.id}:{user.id}")]]
+    if is_owner(getattr(user, 'id', 0)):
+        buttons = []
+    body = (f"⚠️ <b>كرت إنذار رسمي</b>\n\n👤 العضو: {format_public_user(user)}\n"
+            f"📝 السبب: {html.escape(reason[:250])}\n🔢 عدد الإنذارات المسجلة: <b>{warning_count}</b>\n")
+    if warning_count >= 3:
+        if muted_until:
+            body += "\n🔇 <b>تم كتم العضو لمدة 3 أيام</b> بعد الإنذار الثالث.\n⏳ سيتم فك الكتم تلقائيًا عند انتهاء المدة."
+        elif already_active and already_active[1] == 'active':
+            body += "\n🔇 العضو مكتوم حاليًا؛ لم تُمدد مدة الكتم تلقائيًا."
+        else:
+            body += "\n⚠️ تعذر تنفيذ الكتم تلقائيًا؛ تم تسجيل المخالفة ويجب مراجعة صلاحيات البوت."
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=body, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None, disable_web_page_preview=True)
+    except Exception as exc:
+        log.warning("Warning card send failed chat=%s user=%s (%s)", chat.id, user.id, type(exc).__name__)
+    return warning_count, abuse_count, bool(muted_until)
+
+
+async def automatic_unmute_worker(app):
+    """Unmute due members after restarts using persisted UTC deadlines."""
+    while True:
+        try:
+            due = db.execute("SELECT chat_id,user_id,muted_until FROM automatic_mutes WHERE status='active' AND muted_until<=? ORDER BY muted_until LIMIT 100",
+                             (datetime.now(timezone.utc).isoformat(timespec='seconds'),)).fetchall()
+            for chat_id, user_id, muted_until in due:
+                try:
+                    await app.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id,
+                        permissions=ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+                            can_add_web_page_previews=True))
+                    db.execute("UPDATE automatic_mutes SET status='completed',updated_at=? WHERE chat_id=? AND user_id=? AND status='active'",
+                               (now(),chat_id,user_id))
+                    db.commit()
+                    log_action(chat_id,user_id,'automatic_unmute_3_days',f'until={muted_until}')
+                    try:
+                        await app.bot.send_message(chat_id=chat_id,
+                            text=f"🔊 <b>إشعار إداري | فك الكتم تلقائيًا</b>\n\nتم فك الكتم عن العضو <a href=\"tg://user?id={user_id}\">{user_id}</a> بعد انتهاء مدة الكتم المحددة بثلاثة أيام.\n\nنأمل الالتزام بتعليمات المجموعة.", parse_mode='HTML')
+                    except Exception as exc:
+                        log.info("Unmute announcement failed chat=%s user=%s (%s)",chat_id,user_id,type(exc).__name__)
+                except Exception as exc:
+                    log.warning("Automatic unmute failed chat=%s user=%s (%s); will retry",chat_id,user_id,type(exc).__name__)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Automatic unmute worker failed")
+            await asyncio.sleep(30)
 
 
 def normalized_arabic_text(value):
@@ -5634,30 +5722,7 @@ async def message_filter(update, context):
                 await msg.delete()
             except Exception as exc:
                 log.info("Abusive message deletion failed chat=%s user=%s: %s", chat.id, uid, exc)
-            warning_count, abuse_count = record_member_violation(chat.id, msg.from_user, f"لفظ مسيء: {abusive_word}", abusive=True)
-            muted = False
-            if abuse_count >= 3:
-                try:
-                    await context.bot.restrict_chat_member(
-                        chat_id=chat.id, user_id=uid,
-                        permissions=ChatPermissions(
-                            can_send_messages=False, can_send_audios=False, can_send_documents=False,
-                            can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
-                            can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
-                            can_add_web_page_previews=False
-                        )
-                    )
-                    muted = True
-                    log_action(chat.id, uid, "abusive_language_auto_mute", f"abuse_warnings={abuse_count}")
-                except Exception as exc:
-                    log.warning("Auto-mute after abusive language failed chat=%s user=%s: %s", chat.id, uid, exc)
-            try:
-                text = f"⚠️ تم إنذار {format_public_user(msg.from_user)} بسبب استخدام لفظ مسيء.\nالسبب: {html.escape(abusive_word)}\nعدد الإنذارات: {warning_count} | إنذارات الإساءة: {abuse_count}/3"
-                if muted:
-                    text += "\n🔇 تم كتم العضو تلقائيًا بعد 3 إنذارات إساءة."
-                await context.bot.send_message(chat_id=chat.id, text=text, parse_mode="HTML")
-            except Exception as exc:
-                log.debug("Public abusive-language warning failed chat=%s: %s", chat.id, exc)
+            await register_warning_and_enforce(context, chat, msg.from_user, f"لفظ مسيء: {abusive_word}", abusive=True)
             return
 
     # مالك البوت والطاقم المخوّل ومشرفو Telegram الفعليون معفيون من فلاتر الحذف التلقائي.
@@ -5682,16 +5747,8 @@ async def message_filter(update, context):
             await msg.delete()
         except Exception as exc:
             log.info("Link deletion failed chat=%s user=%s: %s", chat.id, uid, exc)
-        warning_count, abuse_count = record_member_violation(chat.id, msg.from_user, "إرسال رابط أثناء قفل الروابط")
-        log_action(chat.id, uid, "link_warning", f"warning={warning_count}")
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"⚠️ تم إنذار {format_public_user(msg.from_user)} بسبب إرسال رابط أثناء قفل الروابط.\nعدد الإنذارات: {warning_count}",
-                parse_mode="HTML", disable_web_page_preview=True
-            )
-        except Exception as exc:
-            log.debug("Public link warning failed chat=%s: %s", chat.id, exc)
+        await register_warning_and_enforce(context, chat, msg.from_user, "إرسال رابط أثناء قفل الروابط")
+        log_action(chat.id, uid, "link_warning", "تم تسجيل إنذار للرابط المخالف")
         return
     if s.get("flood", 0) and msg.from_user and not msg.from_user.is_bot:
         key = (chat.id, uid)
@@ -5709,7 +5766,8 @@ async def message_filter(update, context):
             last_notice = flood_notice_last.get(key, 0)
             if now_mono - last_notice >= 60:
                 flood_notice_last[key] = now_mono
-                await notify_owners(context, f"🧯 رصد إغراق رسائل\nالقروب: {chat.title or chat.id}\nالعضو: {msg.from_user.full_name} (ID: {uid})\nالإجراء: حذف الرسالة بعد رصد 7 رسائل خلال 8 ثوانٍ.", "security")
+                await register_warning_and_enforce(context, chat, msg.from_user, "السبام وتكرار الرسائل (7 رسائل خلال 8 ثوانٍ)")
+                await notify_owners(context, f"🧯 رصد إغراق رسائل\nالقروب: {chat.title or chat.id}\nالعضو: {msg.from_user.full_name} (ID: {uid})\nالإجراء: حذف الرسالة وتسجيل إنذار بعد رصد 7 رسائل خلال 8 ثوانٍ.", "security")
             return
     delete = False
     reason = ""
@@ -6138,13 +6196,27 @@ async def broadcast_draft_message(update, context):
         return
     remember_delegated_user(user)
     if context.user_data.get("awaiting_staff_permissions_id"):
+        # Do not consume a mistyped command as a numeric user ID. Clear this
+        # pending state and tell the owner how to run the command correctly.
+        raw_probe = (msg.text or "").strip().casefold().lstrip("/").rstrip("/").strip()
+        if raw_probe == "aigroups" or raw_probe.startswith("aigroups ") or raw_probe == "ai groups":
+            context.user_data.pop("awaiting_staff_permissions_id", None)
+            await msg.reply_text("ℹ️ ألغيت انتظار رقم المستخدم حتى لا يتعارض مع الأمر. لإدارة الذكاء الاصطناعي أرسل الأمر كما هو مع الشرطة المائلة في البداية:\n/aigroups\nثم اختر أحد الأمثلة:\n/aigroups list\n/aigroups all on\n/aigroups all off")
+            return
         if not (is_owner(user.id) or is_delegated_owner(user.id)):
             context.user_data.pop("awaiting_staff_permissions_id", None)
             await msg.reply_text("⛔ إدارة صلاحيات الطاقم للمالك أو المالك المفوّض فقط.")
             return
         raw_id = (msg.text or "").strip()
+        # Avoid trapping the owner in a stale numeric-ID prompt: command-like input cancels the prompt.
+        normalized_command = raw_id.casefold().lstrip("/").rstrip("/").strip()
+        if raw_id.startswith("/") or normalized_command.startswith(("aigroups", "panel", "help", "start", "cancel", "ai ")):
+            context.user_data.pop("awaiting_staff_permissions_id", None)
+            await msg.reply_text("ℹ️ ألغيت انتظار رقم المستخدم. أعد إرسال الأمر المطلوب الآن، مثل /aigroups list أو /aigroups all off.")
+            return
         if not raw_id.isdigit() or int(raw_id) <= 0:
-            await msg.reply_text("أرسل رقم المستخدم الصحيح فقط، أو استخدم /cancel للإلغاء.")
+            context.user_data.pop("awaiting_staff_permissions_id", None)
+            await msg.reply_text("❌ أُلغيت عملية إدخال رقم المستخدم لأن المدخل غير رقمي. أعد الأمر المطلوب من جديد، أو استخدم /cancel لإلغاء العمليات.")
             return
         target_uid = int(raw_id)
         if target_uid == OWNER_ID or is_delegated_owner(target_uid):
@@ -6575,6 +6647,44 @@ async def callback(update, context):
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data.startswith("warnclear:"):
+        try:
+            _, raw_chat, raw_user = data.split(":", 2)
+            target_chat, target_user = int(raw_chat), int(raw_user)
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "بيانات الإنذار غير صحيحة.", show_alert=True); return
+        authorized = is_owner(uid) or is_delegated_owner(uid) or is_manager(uid) or is_protection_manager(uid) or can_use_capability(uid, "protection", target_chat)
+        if not authorized:
+            await safe_callback_answer(q, "إلغاء الإنذارات متاح للإدارة المخوّلة فقط.", show_alert=True); return
+        db.execute("UPDATE member_violations SET warning_count=0,abuse_count=0,last_reason='تمت تصفير الإنذارات إداريًا',reasons_json='[]',last_at=? WHERE chat_id=? AND user_id=?", (now(),target_chat,target_user))
+        db.commit()
+        log_action(target_chat, uid, "member_warnings_cleared", f"target={target_user}")
+        await safe_callback_answer(q, "تم تصفير سجل الإنذارات.", show_alert=True)
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        return
+
+    if data.startswith("warnlog:"):
+        try:
+            _, raw_chat, raw_user = data.split(":", 2)
+            target_chat, target_user = int(raw_chat), int(raw_user)
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "بيانات الإنذار غير صحيحة.", show_alert=True); return
+        authorized = is_owner(uid) or is_delegated_owner(uid) or is_manager(uid) or is_protection_manager(uid) or can_use_capability(uid, "protection", target_chat)
+        if not authorized:
+            await safe_callback_answer(q, "سجل الإنذارات متاح للإدارة المخوّلة فقط.", show_alert=True); return
+        row = db.execute("SELECT display_name,username,warning_count,abuse_count,last_reason,reasons_json,last_at FROM member_violations WHERE chat_id=? AND user_id=?", (target_chat,target_user)).fetchone()
+        if not row:
+            await safe_callback_answer(q, "لا يوجد سجل إنذارات لهذا العضو.", show_alert=True); return
+        name, username, count, abuse, reason, reasons_json, last_at = row
+        try: reasons = json.loads(reasons_json or "[]")
+        except Exception: reasons = []
+        lines = [f"📋 سجل الإنذارات — {name or target_user} (ID: {target_user})", f"إجمالي الإنذارات: {count} | الألفاظ المسيئة: {abuse}", f"آخر سبب: {reason or 'غير محدد'}", f"آخر تحديث: {last_at or 'غير محدد'}", "", "آخر المخالفات:"]
+        for item in reasons[-8:]: lines.append(f"• {item.get('at','')}: {item.get('reason','')}")
+        await safe_callback_answer(q, "تم فتح السجل.")
+        await context.bot.send_message(chat_id=q.message.chat_id, text="\n".join(lines)[:3900])
+        return
 
     if data.startswith("copy_user_id:"):
         try:
@@ -9587,7 +9697,7 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_calendar_search", "external_support_state", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups")
+    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_delegated_owner_id", "awaiting_calendar_search", "awaiting_coursework_page", "awaiting_admin_action", "awaiting_broadcast", "broadcast_draft", "broadcast_selected_groups", "awaiting_welcome_chat", "external_support_state", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups", "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_badge_state", "awaiting_channel_broadcast")
     cancelled = False
     for key in keys:
         if context.user_data.pop(key, None) is not None:
@@ -10069,6 +10179,7 @@ async def weekly_security_review_worker(app):
 async def post_init(app):
     """Start long-running assistant workers only after PTB has initialized its event loop."""
     app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
+    app.create_task(automatic_unmute_worker(app), name="automatic-unmute-worker")
     app.create_task(weekly_stats_worker(app), name="weekly-group-stats-worker")
     app.create_task(portal_weekly_stats_worker(app), name="weekly-university-portal-stats-worker")
     app.create_task(daily_member_activity_worker(app), name="daily-member-activity-worker")
