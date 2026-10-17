@@ -2316,7 +2316,7 @@ async def require_admin(update):
     if ext and ext[0] and not is_owner(uid):
         command_text = (update.effective_message.text or "").strip().lower()
         command_name = command_text.split()[0].split("@")[0] if command_text.startswith("/") else ""
-        member_commands = {"/ban","/unban","/kick","/mute","/unmute","/muted","/unmuteall","/del","/pin","/badges","/badge_remove","/givepoints","/setmembertitle"}
+        member_commands = {"/ban","/unban","/kick","/mute","/unmute","/warn","/muted","/unmuteall","/del","/pin","/badges","/badge_remove","/givepoints","/setmembertitle"}
         if command_name in member_commands and not external_group_cap_enabled(chat_id, "members"):
             await update.effective_message.reply_text("⛔ إدارة الأعضاء غير مفعّلة لهذا القروب."); return False
         protection_commands = {"/locks","/settings","/archive_on","/archive_off","/archive"}
@@ -2471,6 +2471,100 @@ async def register_warning_and_enforce(context, chat, user, reason, abusive=Fals
     except Exception as exc:
         log.warning("Warning card send failed chat=%s user=%s (%s)", chat.id, user.id, type(exc).__name__)
     return warning_count, abuse_count, bool(muted_until)
+
+
+async def warn_cmd(update, context):
+    """Manual warning by replying to a member or supplying their Telegram ID."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    actor = update.effective_user
+    if not msg or not chat or not actor:
+        return
+    if chat.type == ChatType.PRIVATE:
+        args = list(context.args or [])
+        if not (is_owner(actor.id) or is_delegated_owner(actor.id) or can_use_capability(actor.id, "protection", 0)):
+            await msg.reply_text("⛔ منح الإنذارات من الخاص متاح للمالك أو المفوّض أو من مُنح صلاحية الحماية العامة.")
+            return
+        if len(args) < 2:
+            await msg.reply_text("الصيغة من الخاص: /warn CHAT_ID USER_ID سبب_الإنذار")
+            return
+        try:
+            target_chat_id, target_id = int(args[0]), int(args[1])
+            if target_chat_id >= 0 or target_id <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            await msg.reply_text("تأكد من إدخال معرّف القروب ثم ID العضو. مثال: /warn -1001234567890 123456789 رابط مخالف")
+            return
+        if not (is_owner(actor.id) or is_delegated_owner(actor.id) or can_use_capability(actor.id, "protection", target_chat_id)):
+            await msg.reply_text("⛔ ليس لديك صلاحية منح الإنذارات في هذا القروب.")
+            return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (target_chat_id,)).fetchone():
+            await msg.reply_text("القروب غير مسجل لدى البوت.")
+            return
+        reason = " ".join(args[2:])[:200] if len(args) > 2 else "مخالفة تعليمات القروب"
+        try:
+            member = await context.bot.get_chat_member(target_chat_id, target_id)
+            target = member.user
+        except Exception:
+            from telegram import User
+            target = User(id=target_id, first_name=f"ID {target_id}", is_bot=False)
+        if target.is_bot or is_owner(target.id) or is_delegated_owner(target.id):
+            await msg.reply_text("لا يمكن منح إنذار لحساب بوت أو للمالك/المفوّض.")
+            return
+        fake_chat = await context.bot.get_chat(target_chat_id)
+        count, _, _ = await register_warning_and_enforce(context, fake_chat, target, reason, abusive=False)
+        log_action(target_chat_id, actor.id, "manual_warning_private", f"target={target.id}; count={count}; reason={reason[:150]}")
+        await msg.reply_text(f"✅ تم تسجيل الإنذار رقم {count} للعضو {target.id} في القروب {target_chat_id}.")
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text("استخدم /warn من الخاص مع CHAT_ID وID العضو، أو داخل القروب بالرد على رسالته.")
+        return
+    if not await require_admin(update):
+        return
+    if not (is_owner(actor.id) or is_delegated_owner(actor.id) or is_general_manager(actor.id)
+            or is_protection_manager(actor.id) or can_use_capability(actor.id, "protection", chat.id)
+            or group_role(chat.id, actor.id) in {"مشرف", "مشرف عام", "مدير", "مدير عام"}):
+        await msg.reply_text("⛔ منح الإنذارات متاح للمالك أو المفوّض أو الرتب المخوّلة بالإنذارات فقط.")
+        return
+    if external_group_info(chat.id) and external_group_info(chat.id)[0] and not is_owner(actor.id) and not external_group_cap_enabled(chat.id, "protection"):
+        await msg.reply_text("⛔ صلاحية الحماية غير مفعّلة لهذا القروب الخارجي.")
+        return
+    target = None
+    args = list(context.args or [])
+    reason = "مخالفة تعليمات القروب"
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target = msg.reply_to_message.from_user
+        if args:
+            reason = " ".join(args)[:200]
+    elif args:
+        try:
+            target_id = int(args[0])
+            if target_id <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            await msg.reply_text("الصيغة: رد على رسالة العضو واكتب /warn السبب، أو اكتب /warn ID السبب.")
+            return
+        if len(args) > 1:
+            reason = " ".join(args[1:])[:200]
+        try:
+            member = await context.bot.get_chat_member(chat.id, target_id)
+            target = member.user
+        except Exception:
+            # A valid numeric ID can be warned even if Telegram cannot return the member profile.
+            from telegram import User
+            target = User(id=target_id, first_name=f"ID {target_id}", is_bot=False)
+    else:
+        await msg.reply_text("⚠️ لمنح إنذار: رد على رسالة العضو واكتب /warn السبب، أو استخدم /warn ID السبب.")
+        return
+    if target.is_bot:
+        await msg.reply_text("لا يمكن منح إنذار لحساب بوت.")
+        return
+    if is_owner(target.id) or is_delegated_owner(target.id) or is_general_manager(target.id) or is_protection_manager(target.id):
+        await msg.reply_text("⛔ لا يمكن منح إنذار للمالك أو الإدارة العليا من خلال هذه الأداة.")
+        return
+    count, _, muted = await register_warning_and_enforce(context, chat, target, reason, abusive=False)
+    log_action(chat.id, actor.id, "manual_warning", f"target={target.id}; count={count}; reason={reason[:150]}")
+    await msg.reply_text(f"✅ تم تسجيل الإنذار رقم {count} للعضو ID {target.id}.")
 
 
 async def automatic_unmute_worker(app):
@@ -2701,6 +2795,7 @@ def panel_markup(uid):
             delegated_rows.append([InlineKeyboardButton("🚫 الحظر الجماعي", callback_data="massban_menu")])
         if can_use_capability(uid, "security_review"):
             delegated_rows.append([InlineKeyboardButton("🛡️ المراجعة الأمنية", callback_data="security_review_latest")])
+        delegated_rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         return InlineKeyboardMarkup(delegated_rows)
     if not is_owner(uid) and not is_delegated_owner(uid) and (is_general_manager(uid) or is_protection_manager(uid)):
         rows = [
@@ -2719,6 +2814,8 @@ def panel_markup(uid):
             rows.append([InlineKeyboardButton("📣 استدعاء التاق", callback_data="owner_tag_groups")])
         if can_use_capability(uid, "mass_ban"):
             rows.append([InlineKeyboardButton("🚫 الحظر الجماعي", callback_data="massban_menu")])
+        if is_general_manager(uid) or is_protection_manager(uid) or can_use_capability(uid, "protection"):
+            rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         rows.append([InlineKeyboardButton("❌ إغلاق اللوحة", callback_data="home")])
         return InlineKeyboardMarkup(rows)
     if not is_owner(uid) and not is_delegated_owner(uid) and not is_general_manager(uid) and not is_protection_manager(uid):
@@ -2733,6 +2830,8 @@ def panel_markup(uid):
             rows.append([InlineKeyboardButton("📊 إحصائيات القروبات المصرح بها", callback_data="statistics")])
         if can_use_capability(uid, "ai"):
             rows.append([InlineKeyboardButton("🧠 تحليل القروبات بالذكاء الاصطناعي", callback_data="owner_ai_report")])
+        if can_use_capability(uid, "protection"):
+            rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         rows.append([InlineKeyboardButton("❌ إغلاق اللوحة", callback_data="home")])
         return InlineKeyboardMarkup(rows)
     owner_rows = [
@@ -2742,6 +2841,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
+        [InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
         [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"), InlineKeyboardButton("🩺 صحة البوت", callback_data="health")],
@@ -6648,6 +6748,34 @@ async def callback(update, context):
     uid = q.from_user.id
     data = q.data or ""
 
+    if data == "warnings_center":
+        allowed = (is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid)
+                   or is_protection_manager(uid) or can_use_capability(uid, "protection"))
+        if not allowed:
+            await safe_callback_answer(q, "ليس لديك صلاحية إدارة الإنذارات.", show_alert=True)
+            return
+        text = (
+            "⚠️ <b>مركز الإنذارات التفاعلية</b>\n\n"
+            "اختر طريقة منح الإنذار:\n\n"
+            "<b>داخل القروب:</b> رد على رسالة العضو واكتب:\n"
+            "<code>/warn سبب المخالفة</code>\n\n"
+            "أو استخدم رقم العضو:\n"
+            "<code>/warn USER_ID سبب المخالفة</code>\n\n"
+            "<b>من الخاص مع البوت:</b> أرسل:\n"
+            "<code>/warn CHAT_ID USER_ID سبب المخالفة</code>\n\n"
+            "يسجل البوت الإنذار في سجل العضو، وينشر كرتًا تفاعليًا في القروب. "
+            "عند الإنذار الثالث يحاول كتم العضو 3 أيام، ثم يفك الكتم تلقائيًا عند انتهاء المدة.\n\n"
+            "تأكد من امتلاك البوت صلاحية تقييد الأعضاء، ومن امتلاكك صلاحية الإنذارات في القروب المستهدف."
+        )
+        buttons = [[InlineKeyboardButton("📋 سجل العمليات", callback_data="logs")],
+                   [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
+        await safe_callback_answer(q, "تم فتح مركز الإنذارات.")
+        try:
+            await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            await context.bot.send_message(chat_id=q.message.chat_id, text=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML", disable_web_page_preview=True)
+        return
+
     if data.startswith("warnclear:"):
         try:
             _, raw_chat, raw_user = data.split(":", 2)
@@ -10272,7 +10400,7 @@ def main():
         "id": id_cmd, "idgroup": idgroup, "monitor": monitor_cmd, "badges": badges_cmd, "badge_remove": badge_remove_cmd,
         "memberpoints": member_points_cmd, "membertop": member_top_cmd, "givepoints": give_member_points_cmd, "setmembertitle": set_member_title_cmd,
         "dailyactivity": daily_activity_settings_cmd,
-        "ban": ban, "unban": unban, "kick": kick, "mute": mute, "unmute": unmute,
+        "ban": ban, "unban": unban, "kick": kick, "mute": mute, "unmute": unmute, "warn": warn_cmd,
         "muted": muted_cmd, "unmuteall": unmuteall_cmd, "del": del_cmd, "pin": pin,
         "alerts": alerts, "logs": logs_cmd, "settings": settings_cmd, "locks": locks,
         "archive": archive_cmd, "archive_on": archive_on, "archive_off": archive_off,
