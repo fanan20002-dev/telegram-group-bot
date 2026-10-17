@@ -4604,7 +4604,11 @@ async def id_cmd(update, context):
     replied = msg.reply_to_message if msg else None
     if replied and replied.from_user:
         target = replied.from_user
-        await msg.reply_text(f"🆔 رقم العضو: {target.id}\n👤 الاسم: {target.full_name}")
+        username_line = f"\n🔗 اسم المستخدم: @{target.username}" if getattr(target, "username", None) else "\n🔗 اسم المستخدم: غير متوفر"
+        await msg.reply_text(
+            f"🆔 رقم العضو: {target.id}\n👤 الاسم: {target.full_name}{username_line}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 نسخ ID", callback_data=f"copy_user_id:{target.id}")]])
+        )
         return
     if context.args and context.args[0].lstrip("-").isdigit():
         await msg.reply_text(f"🆔 الرقم المدخل: {int(context.args[0])}")
@@ -5712,16 +5716,37 @@ async def my_chat_member_handler(update, context):
         enabled = external_group_active(chat.id)
         role_text = "قروب خارجي" if external else "قروب تابع للمالك الأساسي"
         bot_admin_text = "مشرف" if new_status == "administrator" else "عضو فقط؛ بعض وظائف الحماية تحتاج رفع البوت إلى مشرف"
+        # Include a verified public link when the group has a username. For private groups,
+        # do not create or disclose a fresh invite link automatically; report that it is unavailable.
+        group_link = "غير متاح (قد يكون القروب خاصًا أو لا يملك رابطًا عامًا)"
+        try:
+            chat_details = await context.bot.get_chat(chat.id)
+            public_username = getattr(chat_details, "username", None)
+            if public_username:
+                group_link = f"https://t.me/{public_username}"
+            else:
+                invite = getattr(chat_details, "invite_link", None)
+                if invite:
+                    group_link = invite
+        except Exception as link_exc:
+            log.debug("Could not resolve group link for %s: %s", chat.id, link_exc)
         notice = (
             f"📥 تمت إضافة البوت إلى {role_text}\n"
             f"القروب: {(chat.title or str(chat.id))[:150]}\nالمعرّف: {chat.id}\n"
+            f"رابط القروب: {group_link}\n"
             f"أضافه: {(getattr(actor, 'full_name', '') or 'غير معروف')[:100]} (ID: {actor_id or 'غير معروف'})"
             f"{' — @' + actor.username if getattr(actor, 'username', None) else ''}\n"
             f"صلاحية البوت في تيليجرام: {bot_admin_text}\n"
             f"حالة الخدمة: {'مفعّلة' if enabled else 'متوقفة بقرار سابق من المالك'}\n"
             "الذكاء الاصطناعي للقروبات الخارجية معطّل افتراضيًا."
         )
-        await notify_owners(context, notice, "groups")
+        # Group-registration details (especially links) are sent only to the primary owner.
+        # Delegated owners can receive these details only through a separately authorized workflow.
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(chat_id=OWNER_ID, text=notice)
+            except Exception as notify_exc:
+                log.info("Could not notify primary owner about external group %s: %s", chat.id, notify_exc)
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
         return
 
@@ -6436,6 +6461,15 @@ async def callback(update, context):
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    if data.startswith("copy_user_id:"):
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True)
+            return
+        await safe_callback_answer(q, f"ID: {target_id} — يمكنك نسخه يدويًا من الرسالة.", show_alert=True)
+        return
 
     if data == "security_review_latest":
         if not (is_owner(uid) or can_use_capability(uid, "security_review")):
