@@ -1514,9 +1514,20 @@ CREATE TABLE IF NOT EXISTS message_archive(
     display_name TEXT,
     message_id INTEGER,
     message_text TEXT,
-    created_at TEXT
+    created_at TEXT,
+    content_type TEXT DEFAULT '',
+    forward_origin TEXT DEFAULT '',
+    media_file_id TEXT DEFAULT '',
+    message_link TEXT DEFAULT ''
 )
 """)
+# Backward-compatible migration for databases created by earlier bot versions.
+_archive_columns = {row[1] for row in db.execute("PRAGMA table_info(message_archive)").fetchall()}
+for _column, _definition in (("content_type", "TEXT DEFAULT ''"), ("forward_origin", "TEXT DEFAULT ''"),
+                              ("media_file_id", "TEXT DEFAULT ''"), ("message_link", "TEXT DEFAULT ''")):
+    if _column not in _archive_columns:
+        db.execute(f"ALTER TABLE message_archive ADD COLUMN {_column} {_definition}")
+db.commit()
 db.execute("""
 CREATE TABLE IF NOT EXISTS archive_settings(
     chat_id INTEGER PRIMARY KEY,
@@ -4829,15 +4840,21 @@ async def archive_cmd(update, context):
         await update.effective_message.reply_text("استخدم /archive رقم_المجموعة لعرض أحدث الرسائل المسجلة. تحصل على رقم المجموعة عبر /idgroup داخلها.")
         return
     rows = db.execute(
-        "SELECT chat_title,display_name,username,message_text,created_at FROM message_archive WHERE chat_id=? ORDER BY id DESC LIMIT 20",
+        "SELECT chat_title,display_name,username,message_text,created_at,content_type,forward_origin,message_link FROM message_archive WHERE chat_id=? ORDER BY id DESC LIMIT 20",
         (chat_id,)
     ).fetchall()
     if not rows:
         await update.effective_message.reply_text("لا توجد رسائل مسجلة لهذه المجموعة.")
         return
     parts = ["📨 أحدث الرسائل المسجلة (للمالك الأساسي فقط):"]
-    for title, name, username, body, created in rows:
-        parts.append(f"\n📍 {title or chat_id}\n👤 {name or 'عضو'} {('@'+username) if username else ''}\n🕒 {created}\n💬 {(body or '[رسالة غير نصية]')[:500]}")
+    for title, name, username, body, created, content_type, forward_origin, message_link in rows:
+        parts.append(
+            f"\n📍 {title or chat_id}\n👤 {name or 'عضو'} {('@'+username) if username else ''}"
+            f"\n🕒 {created}\n📎 النوع: {content_type or 'غير محدد'}"
+            f"\n↪️ مصدر التحويل: {forward_origin or 'غير متاح/ليست رسالة محوّلة'}"
+            f"\n💬 {(body or '[رسالة غير نصية]')[:350]}"
+            f"\n🔗 الرسالة: {message_link or 'لا يتوفر رابط مباشر'}"
+        )
     output = "\n".join(parts)
     await update.effective_message.reply_text(output[:4000])
 
@@ -5808,9 +5825,42 @@ async def message_filter(update, context):
                 return
     if msg.from_user and not msg.from_user.is_bot and archive_is_enabled(chat.id):
         body = msg.text or msg.caption or "[رسالة غير نصية]"
+        media_file_id = ""
+        content_type = "text" if msg.text else ("captioned_media" if msg.caption else "other")
+        for _attr, _kind in (("photo", "photo"), ("video", "video"), ("document", "document"),
+                             ("audio", "audio"), ("voice", "voice"), ("animation", "animation"),
+                             ("video_note", "video_note"), ("sticker", "sticker")):
+            _obj = getattr(msg, _attr, None)
+            if _obj:
+                content_type = _kind
+                if _attr == "photo":
+                    media_file_id = getattr(_obj[-1], "file_id", "") if _obj else ""
+                else:
+                    media_file_id = getattr(_obj, "file_id", "")
+                break
+        _origin = getattr(msg, "forward_origin", None)
+        forward_origin = ""
+        if _origin is not None:
+            try:
+                _origin_user = getattr(_origin, "sender_user", None)
+                _origin_chat = getattr(_origin, "sender_chat", None)
+                if _origin_user:
+                    forward_origin = f"user:{_origin_user.id}"
+                elif _origin_chat:
+                    forward_origin = f"chat:{_origin_chat.id}:{getattr(_origin_chat, 'title', '')}"
+                else:
+                    forward_origin = str(getattr(_origin, "type", type(_origin).__name__))[:250]
+            except Exception:
+                forward_origin = type(_origin).__name__
+        message_link = ""
+        if getattr(chat, "username", None):
+            message_link = f"https://t.me/{chat.username}/{msg.message_id}"
+        elif str(chat.id).startswith("-100"):
+            message_link = f"https://t.me/c/{str(chat.id)[4:]}/{msg.message_id}"
         db.execute(
-            "INSERT INTO message_archive(chat_id,chat_title,user_id,username,display_name,message_id,message_text,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (chat.id, chat.title or "", uid, msg.from_user.username or "", msg.from_user.full_name or "", msg.message_id, body[:3000], now())
+            "INSERT INTO message_archive(chat_id,chat_title,user_id,username,display_name,message_id,message_text,created_at,content_type,forward_origin,media_file_id,message_link) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat.id, chat.title or "", uid, msg.from_user.username or "", msg.from_user.full_name or "",
+             msg.message_id, body[:3000], now(), content_type, forward_origin, media_file_id, message_link)
         )
         db.commit()
     # Apply abusive-language warnings to all human senders (including admins); owner can still recover permissions.
@@ -7184,8 +7234,8 @@ async def callback(update, context):
         return
 
     if data.startswith("staffrole:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not is_owner(uid):
+            await safe_callback_answer(q, "منح وسحب الرتب العامة يتطلب موافقة المالك الأساسي.", show_alert=True); return
         try: _, target_raw, role = data.split(":", 2); target_uid = int(target_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         if target_uid == OWNER_ID or is_delegated_owner(target_uid) or role not in ("manager", "protection"):
@@ -10191,8 +10241,12 @@ async def aistatus_cmd(update, context):
     uid = update.effective_user.id if update.effective_user else 0
     if not (is_owner(uid) or can_use_capability(uid, "ai")):
         await update.effective_message.reply_text("⛔ تحتاج إلى صلاحية الذكاء الاصطناعي من المالك."); return
-    status = "مفعّل عبر API" if OPENAI_API_KEY else "غير مفعّل؛ التقارير تعمل بالتحليل المحلي"
-    await update.effective_message.reply_text(f"🧠 حالة التحليل الذكي: {status}\nالنموذج المضبوط: {OPENAI_MODEL}\nلا تُرسل نصوص الرسائل الخاصة إلى مزود الذكاء؛ التحليل يستخدم مؤشرات مجمعة فقط.")
+    status = "مفتاح API مضبوط (لم يُختبر الاتصال بهذا الأمر)" if OPENAI_API_KEY else "غير مفعّل؛ التقارير تعمل بالتحليل المحلي"
+    await update.effective_message.reply_text(
+        f"🧠 حالة إعداد الذكاء الاصطناعي: {status}\nالنموذج المضبوط: {OPENAI_MODEL}\n\n"
+        "تنبيه الخصوصية: عند استخدام /ai يُرسل نص السؤال الذي تكتبه إلى مزود الذكاء الاصطناعي لمعالجته. "
+        "لا يعني ضبط المفتاح وحده أن الاتصال يعمل؛ راجع سجلات التشغيل عند حدوث خطأ."
+    )
 
 
 async def group_analysis_report_worker(app):
