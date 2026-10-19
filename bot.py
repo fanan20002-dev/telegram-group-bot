@@ -1719,6 +1719,31 @@ db.execute("""CREATE TABLE IF NOT EXISTS auto_replies(
     chat_id INTEGER NOT NULL, trigger_text TEXT NOT NULL, reply_text TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(chat_id, trigger_text)
 )""")
+# Additive tables for owner-approved daily motivational content. Existing tables are untouched.
+db.execute("""CREATE TABLE IF NOT EXISTS motivation_drafts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_date TEXT NOT NULL UNIQUE,
+    content_type TEXT NOT NULL DEFAULT 'تحفيز',
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    approved_at TEXT NOT NULL DEFAULT '',
+    approved_by INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS motivation_groups(
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ''
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS motivation_posts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    posted_at TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    UNIQUE(draft_id, chat_id)
+)""")
 db.commit()
 
 DEFAULT_AUTO_REPLIES = [
@@ -2910,6 +2935,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("⚡ أوامر الحماية الجماعية", callback_data="bulk_security")],
         [InlineKeyboardButton("👁️ مراقبة القروبات المسجلة", callback_data="monitor_groups")],
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
+        [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
@@ -3139,7 +3165,7 @@ async def process_private_workflows(update, context):
     if _is_aistatus_alias(raw):
         return
     # New owner UI workflows: unified permissions, warning operations and archive search.
-    pending = next((key for key in ("awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search") if context.user_data.get(key)), None)
+    pending = next((key for key in ("awaiting_motivation_edit", "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search") if context.user_data.get(key)), None)
     if pending:
         if raw.startswith("/") and raw.lower() != "/cancel":
             context.user_data.pop(pending, None)
@@ -3147,6 +3173,19 @@ async def process_private_workflows(update, context):
             return
         if raw.lower() == "/cancel":
             context.user_data.pop(pending, None); await msg.reply_text("تم إلغاء العملية."); return
+        if pending == "awaiting_motivation_edit":
+            if not is_owner(user.id):
+                context.user_data.pop(pending, None); await msg.reply_text("⛔ للمالك الأساسي فقط."); return
+            try: draft_id = int(context.user_data.pop(pending))
+            except (TypeError, ValueError):
+                await msg.reply_text("تعذر تحديد المسودة. افتح /motivation وحاول مجددًا."); return
+            if not raw or len(raw) > 3500 or raw.startswith("/"):
+                await msg.reply_text("أرسل نصًا صالحًا لا يتجاوز 3500 حرف، أو /cancel للإلغاء."); return
+            cur = db.execute("UPDATE motivation_drafts SET content=?,content_type='محتوى معدّل',created_at=? WHERE id=? AND status='pending'", (raw,now(),draft_id)); db.commit()
+            if not cur.rowcount:
+                await msg.reply_text("لم تعد المسودة بانتظار التعديل. افتح /motivation لمراجعة الحالة."); return
+            await show_motivation_draft(msg, draft_id)
+            return
         if pending == "awaiting_unified_target_id":
             if not is_owner(user.id): context.user_data.pop(pending,None); await msg.reply_text("⛔ للمالك الأساسي فقط."); return
             if not raw.isdigit() or int(raw) <= 0:
@@ -4569,7 +4608,8 @@ async def help_cmd(update, context):
             "/addmanager — إضافة مدير عام\n/delmanager — إزالة مدير عام\n"
             "/addprotect — إضافة مشرف حماية\n/delprotect — إزالة مشرف حماية\n"
             "/archive_on — تفعيل أرشفة الرسائل بعد إعلانها\n"
-            "/archive_off — إيقاف أرشفة الرسائل\n/archive — عرض سجل الرسائل الخاص\n"
+            "/archive_off — إيقاف أرشفة الرسائل\\n/archive — عرض سجل الرسائل الخاص\\n"
+            "/motivation — إدارة المحتوى التحفيزي اليومي وتحديد قروبات النشر (للمالك الأساسي)\\n"
             "/monitor — فتح مراقبة القروبات المسجلة (عدد الأعضاء وحالة البوت والإحصائيات)\n"
             "/grantpublish USER_ID CHAT_ID — منح صلاحية النشر في قروب\n"
             "/grantcap USER_ID tag CHAT_ID — منح التاق للمشرف/المدير في قروب\n"
@@ -6946,11 +6986,200 @@ def university_portal_caption(quote_index=0):
     )
 
 
+MOTIVATION_FALLBACKS = [
+    ("معلومة تحفيزية", "💡 معلومة تحفيزية\nالعادات الصغيرة التي تكررها باستمرار غالبًا تصنع فرقًا أكبر من الجهد الكبير المتقطع. اختر خطوة واحدة مفيدة اليوم وداوم عليها."),
+    ("حكمة", "✨ حكمة اليوم\nلا تقِس تقدمك بسرعة الآخرين؛ قِسْه بما تعلمته وما أنجزته مقارنة بالأمس."),
+    ("مثل", "🌿 مثل عربي: «من جدّ وجد»\nالمعنى: الاجتهاد والمثابرة من أسباب الوصول إلى الهدف، مع التخطيط والاستمرار."),
+    ("معلومة تحفيزية", "💡 تذكير اليوم\nتقسيم الهدف الكبير إلى خطوات صغيرة يجعل البدء أسهل، ويساعدك على متابعة تقدمك بوضوح.\n🎯 تحدي اليوم: خصص 15 دقيقة لمهمة كنت تؤجلها."),
+]
+
+
+def motivation_groups_markup():
+    groups = db.execute("SELECT chat_id, COALESCE(title, CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title, chat_id").fetchall()
+    selected = {int(r[0]) for r in db.execute("SELECT chat_id FROM motivation_groups WHERE enabled=1").fetchall()}
+    rows = []
+    for chat_id, title in groups[:45]:
+        mark = "✅" if int(chat_id) in selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {str(title or chat_id)[:42]}", callback_data=f"mot_group_toggle:{int(chat_id)}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("لا توجد قروبات مسجلة لدى البوت", callback_data="noop")])
+    rows.append([InlineKeyboardButton("✅ تحديد جميع القروبات", callback_data="mot_groups_all"), InlineKeyboardButton("🧹 إلغاء التحديد", callback_data="mot_groups_none")])
+    rows.append([InlineKeyboardButton(f"📌 القروبات المحددة: {len(selected)}", callback_data="mot_groups_refresh")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع للمحتوى التحفيزي", callback_data="motivation_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def motivation_draft_markup(draft_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ اعتماد ونشر", callback_data=f"mot_draft:{draft_id}:approve"), InlineKeyboardButton("✏️ تعديل النص", callback_data=f"mot_draft:{draft_id}:edit")],
+        [InlineKeyboardButton("🔄 محتوى بديل", callback_data=f"mot_draft:{draft_id}:alt"), InlineKeyboardButton("❌ رفض", callback_data=f"mot_draft:{draft_id}:reject")],
+        [InlineKeyboardButton("👥 تحديد القروبات", callback_data="mot_groups_refresh")],
+    ])
+
+
+def motivation_admin_markup():
+    selected = db.execute("SELECT COUNT(*) FROM motivation_groups WHERE enabled=1").fetchone()[0]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👥 تحديد قروبات النشر ({selected})", callback_data="mot_groups_refresh")],
+        [InlineKeyboardButton("📨 عرض مسودة اليوم", callback_data="motivation_show_draft")],
+        [InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")],
+    ])
+
+
+async def generate_motivation_content():
+    prompt = (
+        "أنشئ رسالة عربية قصيرة واحدة فقط لقروبات تيليجرام، اختر نوعًا واحدًا بالتناوب أو عشوائيًا من: "
+        "معلومة تحفيزية، حكمة، مثل عربي/شعبي. اجعلها نافعة ومحترمة ومناسبة للطلاب والعامة. "
+        "إن كان مثلًا فاذكر المثل ومعناه باختصار، ولا تنسب قولًا لشخص دون تحقق. تجنب الادعاءات العلمية غير المؤكدة، "
+        "ولا تضف مقدمة عن أنك ذكاء اصطناعي. اجعل الناتج بين 40 و100 كلمة، وبصيغة جاهزة للنشر."
+    )
+    result = await openai_assistant_response(prompt, "إعداد المحتوى التحفيزي اليومي")
+    if result and not result.startswith("⚠️"):
+        text = result.strip()[:3500]
+        kind = "حكمة" if "حكمة" in text[:80] else ("مثل" if "مثل" in text[:100] else "معلومة تحفيزية")
+        return kind, text
+    return random.choice(MOTIVATION_FALLBACKS)
+
+
+async def show_motivation_draft(target, draft_id=None):
+    if draft_id is None:
+        row = db.execute("SELECT id,content_date,content_type,content,status FROM motivation_drafts ORDER BY id DESC LIMIT 1").fetchone()
+    else:
+        row = db.execute("SELECT id,content_date,content_type,content,status FROM motivation_drafts WHERE id=?", (draft_id,)).fetchone()
+    if not row:
+        await target.reply_text("لا توجد مسودة محفوظة حاليًا. سيجهز البوت المحتوى اليومي الساعة 7:00 صباحًا بتوقيت السعودية.")
+        return
+    did, content_date, content_type, content, status = row
+    state = {"pending":"بانتظار موافقتك", "approved":"تم اعتماد المحتوى", "rejected":"مرفوض"}.get(status, status)
+    text = f"🌟 المحتوى التحفيزي اليومي\n📅 التاريخ: {content_date}\n🏷️ النوع: {content_type}\n📌 الحالة: {state}\n\n{content}"
+    await target.reply_text(text, reply_markup=motivation_draft_markup(did) if status == "pending" else motivation_admin_markup())
+
+
+async def motivation_cmd(update, context):
+    user = update.effective_user
+    if not user or not is_owner(user.id):
+        await update.effective_message.reply_text("⛔ ميزة المحتوى اليومي وإدارة القروبات للمالك الأساسي فقط.")
+        return
+    await update.effective_message.reply_text(
+        "🌟 إدارة المحتوى التحفيزي اليومي\n\nيعرض الذكاء الاصطناعي مسودة يومية الساعة 7:00 صباحًا بتوقيت السعودية. لن يتم النشر قبل موافقتك. اختر القروبات التي تريد نشر المحتوى فيها.",
+        reply_markup=motivation_admin_markup()
+    )
+    await show_motivation_draft(update.effective_message)
+
+
+async def motivation_daily_worker(app):
+    """Prepare and send one daily draft to the primary owner at 07:00 Asia/Riyadh."""
+    tz = ZoneInfo("Asia/Riyadh")
+    while True:
+        try:
+            current = datetime.now(tz)
+            next_run = current.replace(hour=7, minute=0, second=0, microsecond=0)
+            if next_run <= current:
+                next_run += timedelta(days=1)
+            await asyncio.sleep(max(1, (next_run - current).total_seconds()))
+            local_day = datetime.now(tz).date().isoformat()
+            exists = db.execute("SELECT id FROM motivation_drafts WHERE content_date=?", (local_day,)).fetchone()
+            if exists:
+                continue
+            kind, content = await generate_motivation_content()
+            db.execute("INSERT OR IGNORE INTO motivation_drafts(content_date,content_type,content,status,created_at) VALUES(?,?,?,?,?)",
+                       (local_day, kind, content, "pending", now()))
+            db.commit()
+            row = db.execute("SELECT id,content_type,content,status FROM motivation_drafts WHERE content_date=?", (local_day,)).fetchone()
+            if not row or not OWNER_ID:
+                continue
+            did, kind, content, status = row
+            if status == "pending":
+                text = f"🌅 محتوى اليوم للمراجعة — {local_day}\n🏷️ النوع: {kind}\n\n{content}\n\nهل تعتمد هذا المحتوى للنشر في القروبات المحددة؟"
+                try:
+                    await app.bot.send_message(chat_id=OWNER_ID, text=text, reply_markup=motivation_draft_markup(did))
+                except Exception as exc:
+                    log.warning("تعذر إرسال مسودة التحفيز للمالك؛ يمكن استعادتها عبر /motivation: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("تعذر إعداد المحتوى التحفيزي اليومي")
+            await asyncio.sleep(60)
+
+
 async def callback(update, context):
     q = update.callback_query
     await safe_callback_answer(q)
     uid = q.from_user.id
     data = q.data or ""
+
+    # Daily motivational content: primary owner only; publishing is always approval-gated.
+    if data.startswith("motivation_") or data.startswith("mot_groups_") or data.startswith("mot_group_toggle:") or data.startswith("mot_draft:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه الميزة للمالك الأساسي فقط.", show_alert=True); return
+        if data == "motivation_home":
+            await q.message.reply_text("🌟 إدارة المحتوى التحفيزي اليومي\nاختر القروبات المستهدفة، أو اعرض مسودة اليوم.", reply_markup=motivation_admin_markup())
+            await safe_callback_answer(q); return
+        if data in ("mot_groups_refresh",):
+            await q.message.reply_text("👥 اختر القروبات التي تريد نشر المحتوى المعتمد فيها. القروبات غير المحددة لن تستقبل المحتوى.", reply_markup=motivation_groups_markup())
+            await safe_callback_answer(q); return
+        if data == "mot_groups_all":
+            groups = db.execute("SELECT chat_id FROM watched_groups").fetchall()
+            for (gid,) in groups:
+                db.execute("INSERT INTO motivation_groups(chat_id,enabled,updated_at) VALUES(?,1,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=1,updated_at=excluded.updated_at", (gid, now()))
+            db.commit()
+            await q.edit_message_reply_markup(reply_markup=motivation_groups_markup())
+            await safe_callback_answer(q, f"تم تحديد {len(groups)} قروب."); return
+        if data == "mot_groups_none":
+            db.execute("UPDATE motivation_groups SET enabled=0,updated_at=?", (now(),)); db.commit()
+            await q.edit_message_reply_markup(reply_markup=motivation_groups_markup())
+            await safe_callback_answer(q, "تم إلغاء تحديد جميع القروبات."); return
+        if data.startswith("mot_group_toggle:"):
+            try: gid = int(data.split(":",1)[1])
+            except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+            if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (gid,)).fetchone():
+                await safe_callback_answer(q, "هذا القروب غير مسجل لدى البوت.", show_alert=True); return
+            db.execute("INSERT INTO motivation_groups(chat_id,enabled,updated_at) VALUES(?,1,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=1-enabled,updated_at=excluded.updated_at", (gid, now()))
+            db.commit(); await q.edit_message_reply_markup(reply_markup=motivation_groups_markup()); await safe_callback_answer(q); return
+        if data == "motivation_show_draft":
+            await show_motivation_draft(q.message); await safe_callback_answer(q); return
+        if data.startswith("mot_draft:"):
+            try: _, raw_id, action = data.split(":",2); did = int(raw_id)
+            except ValueError: await safe_callback_answer(q, "بيانات المسودة غير صحيحة.", show_alert=True); return
+            draft = db.execute("SELECT content_date,content_type,content,status FROM motivation_drafts WHERE id=?", (did,)).fetchone()
+            if not draft: await safe_callback_answer(q, "المسودة غير موجودة.", show_alert=True); return
+            content_date, kind, content, status = draft
+            if status != "pending": await safe_callback_answer(q, "هذه المسودة لم تعد بانتظار الموافقة.", show_alert=True); return
+            if action == "edit":
+                context.user_data["awaiting_motivation_edit"] = did
+                await q.message.reply_text("✏️ أرسل النص الجديد للمحتوى في رسالة واحدة. لن يُنشر حتى تعتمد النسخة المعدلة. للإلغاء أرسل /cancel.")
+                await safe_callback_answer(q); return
+            if action == "alt":
+                new_kind, new_content = await generate_motivation_content()
+                db.execute("UPDATE motivation_drafts SET content_type=?,content=?,created_at=? WHERE id=? AND status='pending'", (new_kind,new_content,now(),did)); db.commit()
+                await q.message.reply_text(f"🔄 محتوى بديل للمراجعة — {content_date}\n🏷️ النوع: {new_kind}\n\n{new_content}", reply_markup=motivation_draft_markup(did))
+                await safe_callback_answer(q, "تم إعداد محتوى بديل."); return
+            if action == "reject":
+                db.execute("UPDATE motivation_drafts SET status='rejected',approved_by=?,approved_at=? WHERE id=? AND status='pending'", (uid,now(),did)); db.commit()
+                await q.edit_message_text(f"❌ تم رفض محتوى {content_date}. لم يُنشر في أي قروب.")
+                await safe_callback_answer(q, "تم الرفض."); return
+            if action == "approve":
+                groups = [int(r[0]) for r in db.execute("SELECT chat_id FROM motivation_groups WHERE enabled=1 ORDER BY chat_id").fetchall()]
+                if not groups:
+                    await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل قبل النشر.", show_alert=True)
+                    await q.message.reply_text("👥 لا توجد قروبات محددة للنشر. اختر القروبات أولًا:", reply_markup=motivation_groups_markup()); return
+                db.execute("UPDATE motivation_drafts SET status='approved',approved_by=?,approved_at=? WHERE id=? AND status='pending'", (uid,now(),did)); db.commit()
+                sent, failed = [], []
+                for gid in groups:
+                    prior = db.execute("SELECT status FROM motivation_posts WHERE draft_id=? AND chat_id=?", (did,gid)).fetchone()
+                    if prior and prior[0] == "sent":
+                        sent.append(gid); continue
+                    try:
+                        await context.bot.send_message(chat_id=gid, text=f"🌟 {kind}\n\n{content}\n\n✨ بوت حماية ومساعدة القروبات")
+                        db.execute("INSERT INTO motivation_posts(draft_id,chat_id,status,posted_at,error) VALUES(?,?,?,?,?) ON CONFLICT(draft_id,chat_id) DO UPDATE SET status='sent',posted_at=excluded.posted_at,error=''", (did,gid,"sent",now(),"")); db.commit(); sent.append(gid)
+                    except Exception as exc:
+                        err = str(exc)[:400]
+                        db.execute("INSERT INTO motivation_posts(draft_id,chat_id,status,posted_at,error) VALUES(?,?,?,?,?) ON CONFLICT(draft_id,chat_id) DO UPDATE SET status='failed',posted_at=excluded.posted_at,error=excluded.error", (did,gid,"failed",now(),err)); db.commit(); failed.append((gid,err))
+                summary = f"✅ تم اعتماد المحتوى.\nنجح النشر في {len(sent)} قروب.\nتعذر النشر في {len(failed)} قروب."
+                if failed: summary += "\n\nالقروبات التي تعذر النشر فيها:\n" + "\n".join(f"• {gid}: {err[:100]}" for gid,err in failed[:10])
+                await q.edit_message_text(summary, reply_markup=motivation_admin_markup())
+                await safe_callback_answer(q, "تمت معالجة النشر."); return
+            await safe_callback_answer(q, "الإجراء غير معروف.", show_alert=True); return
 
     # Primary-owner-only unified permissions and group assignment workflow.
     if data == "unified_permissions":
@@ -10224,7 +10453,7 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    keys = ("owner_autoreply_state", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_delegated_owner_id", "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search", "awaiting_calendar_search", "awaiting_coursework_page", "awaiting_admin_action", "awaiting_broadcast", "broadcast_draft", "broadcast_selected_groups", "awaiting_welcome_chat", "external_support_state", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups", "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_badge_state", "awaiting_channel_broadcast")
+    keys = ("owner_autoreply_state", "awaiting_motivation_edit", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_delegated_owner_id", "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search", "awaiting_calendar_search", "awaiting_coursework_page", "awaiting_admin_action", "awaiting_broadcast", "broadcast_draft", "broadcast_selected_groups", "awaiting_welcome_chat", "external_support_state", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups", "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_badge_state", "awaiting_channel_broadcast")
     cancelled = False
     for key in keys:
         if context.user_data.pop(key, None) is not None:
@@ -10717,6 +10946,7 @@ async def post_init(app):
     app.create_task(owner_activity_audit_worker(app), name="owner-activity-audit-worker")
     app.create_task(group_analysis_report_worker(app), name="group-analysis-report-worker")
     app.create_task(weekly_security_review_worker(app), name="weekly-security-review-worker")
+    app.create_task(motivation_daily_worker(app), name="motivation-daily-worker")
 
 
 
@@ -10786,7 +11016,7 @@ def main():
 
     command_handlers = {
         "portalstats": portal_stats_cmd,
-        "start": start, "help": help_cmd, "panel": panel, "ai": ai_cmd, "aigroups": aigroups_cmd, "calendar": calendar_cmd, "adhkar": adhkar_cmd, "staffdone": staffdone_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
+        "start": start, "help": help_cmd, "panel": panel, "motivation": motivation_cmd, "ai": ai_cmd, "aigroups": aigroups_cmd, "calendar": calendar_cmd, "adhkar": adhkar_cmd, "staffdone": staffdone_cmd, "report": report_cmd, "groupstats": group_stats_cmd,
         "note": assistant_note_cmd, "notes": assistant_notes_cmd, "usage": assistant_usage_cmd, "clear_ai": assistant_clear_ai_cmd,
         "remind": assistant_remind_cmd, "reminders": assistant_reminders_cmd, "delreminder": assistant_delreminder_cmd, "assistantstats": assistant_stats_cmd,
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
