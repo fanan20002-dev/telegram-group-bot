@@ -1113,6 +1113,10 @@ PORTAL_HTML_B64 = (
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("groupbot")
+# httpx/httpcore can log full request URLs at INFO level; Telegram bot API URLs
+# may contain the bot token. Keep these libraries at WARNING to avoid leaking it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 def _resolve_database_path():
     """Prefer Render's persistent disk when available; migrate an existing local DB only if target is absent."""
@@ -2115,12 +2119,37 @@ async def send_quiz_stage(context, chat_id, category, stage):
 
 def ensure_settings(chat_id):
     cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
-    # SQLite cannot ALTER a missing table definition in one statement, so
-    # create a fresh table shape when possible and migrate old installations.
+    # Migrate old schemas without ever dropping the original settings table.
     existing = db.execute("PRAGMA table_info(settings)").fetchall()
     existing_names = {row[1] for row in existing}
-    if "chat_id" not in existing_names:
-        db.execute("DROP TABLE IF EXISTS settings")
+    if existing and "chat_id" not in existing_names:
+        legacy_table = "settings_legacy_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        legacy_names = set(existing_names)
+        db.execute(f'ALTER TABLE settings RENAME TO "{legacy_table}"')
+        db.execute(f"CREATE TABLE settings(chat_id INTEGER PRIMARY KEY, {cols})")
+        # A legacy table without chat_id can only represent global settings.
+        # Preserve it intact, and copy its first row as a baseline for known groups.
+        common_fields = [field for field in SETTING_FIELDS if field in legacy_names]
+        if common_fields:
+            select_fields = ", ".join(f'"{field}"' for field in common_fields)
+            legacy_row = db.execute(f'SELECT {select_fields} FROM "{legacy_table}" LIMIT 1').fetchone()
+            if legacy_row:
+                legacy_values = dict(zip(common_fields, legacy_row))
+                targets = {0}
+                try:
+                    targets.update(int(row[0]) for row in db.execute("SELECT chat_id FROM watched_groups").fetchall())
+                except sqlite3.DatabaseError:
+                    pass
+                field_sql = ", ".join(f'"{field}"' for field in SETTING_FIELDS)
+                placeholders = ", ".join("?" for _ in SETTING_FIELDS)
+                for target_chat_id in targets:
+                    values = [int(bool(legacy_values.get(field, DEFAULTS[field]))) for field in SETTING_FIELDS]
+                    db.execute(f"INSERT OR IGNORE INTO settings(chat_id, {field_sql}) VALUES(?, {placeholders})",
+                               [target_chat_id, *values])
+        db.commit()
+        log.warning("Migrated legacy settings schema without deleting original table; preserved as %s", legacy_table)
+        existing_names = {"chat_id", *SETTING_FIELDS}
+    elif not existing:
         db.execute(f"CREATE TABLE settings(chat_id INTEGER PRIMARY KEY, {cols})")
         db.commit()
         existing_names = {"chat_id", *SETTING_FIELDS}
