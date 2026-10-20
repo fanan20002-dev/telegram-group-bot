@@ -1222,7 +1222,6 @@ except sqlite3.OperationalError: pass
 try: db.execute("ALTER TABLE miniapp_events ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
 except sqlite3.OperationalError: pass
 db.commit()
-db.commit()
 # Usage analytics for the student portal. These tables are additive and do not replace existing data.
 db.execute("""CREATE TABLE IF NOT EXISTS portal_usage_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1767,12 +1766,32 @@ db.execute("""CREATE TABLE IF NOT EXISTS join_request_events(
     status TEXT NOT NULL DEFAULT 'pending', requested_at TEXT NOT NULL, decided_at TEXT DEFAULT '', decided_by INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(chat_id,user_id)
 )""")
+# Central switch for locking entry across every registered group. Additive migration only.
+db.execute("""CREATE TABLE IF NOT EXISTS global_join_approval_settings(
+    id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT '', updated_by INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updated_at,updated_by) VALUES(1,0,'',0)")
+# Track invite links created by this bot so it can revoke those it owns when needed.
+db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
+    chat_id INTEGER NOT NULL, invite_link TEXT NOT NULL, link_type TEXT NOT NULL DEFAULT 'join_request',
+    active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, revoked_at TEXT DEFAULT '',
+    PRIMARY KEY(chat_id,invite_link)
+)""")
 db.commit()
+
+def global_join_approval_enabled():
+    row = db.execute("SELECT enabled FROM global_join_approval_settings WHERE id=1").fetchone()
+    return bool(row and row[0])
+
 
 def group_feature_enabled(chat_id, feature):
     allowed = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
     if feature not in allowed:
         return False
+    # The global lock takes precedence so new and existing registered groups are covered.
+    if feature == "join_approval_enabled" and global_join_approval_enabled():
+        return True
     row = db.execute(f"SELECT {feature} FROM group_feature_settings WHERE chat_id=?", (chat_id,)).fetchone()
     if row:
         return bool(row[0])
@@ -1786,6 +1805,33 @@ def set_group_feature(chat_id, feature, enabled):
     db.execute("INSERT INTO group_feature_settings(chat_id,updated_at) VALUES(?,?) ON CONFLICT(chat_id) DO NOTHING", (chat_id, now()))
     db.execute(f"UPDATE group_feature_settings SET {feature}=?,updated_at=? WHERE chat_id=?", (int(bool(enabled)), now(), chat_id))
     db.commit()
+
+
+async def create_managed_join_request_link(bot, chat_id):
+    """Create a request-only invite, revoking known bot-managed links and attempting the primary link."""
+    bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+    if getattr(bot_member, "status", "") != "administrator":
+        raise RuntimeError("يجب رفع البوت إلى مشرف")
+    if not bool(getattr(bot_member, "can_invite_users", False)) or not bool(getattr(bot_member, "can_restrict_members", False)):
+        raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين وحظرهم")
+    old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
+    for (old_link,) in old_links:
+        try:
+            await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=old_link)
+            db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), chat_id, old_link))
+        except Exception as exc:
+            log.info("Could not revoke previous bot-managed invite link chat=%s: %s", chat_id, exc)
+    try:
+        details = await bot.get_chat(chat_id=chat_id)
+        primary_link = getattr(details, "invite_link", None)
+        if primary_link:
+            await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=primary_link)
+    except Exception as exc:
+        log.info("Primary invite link may require manual revocation chat=%s: %s", chat_id, exc)
+    invite = await bot.create_chat_invite_link(chat_id=chat_id, creates_join_request=True, name="موافقة المالك على الدخول")
+    db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (chat_id, invite.invite_link, now()))
+    db.commit()
+    return invite.invite_link
 
 DEFAULT_AUTO_REPLIES = [
     ("شكراً", "العفو، حياك الله 🌹"),
@@ -2963,6 +3009,8 @@ def panel_markup(uid):
         delegated_rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         if can_use_capability(uid, "message_lock") or capability_group_ids(uid, "message_lock"):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
+        if can_use_capability(uid, "join_approval", 0):
+            delegated_rows.append([InlineKeyboardButton(("🔐 إيقاف قفل الدخول لجميع القروبات" if global_join_approval_enabled() else "🔐 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")])
         if (can_use_capability(uid, "reentry") or capability_group_ids(uid, "reentry")
                 or can_use_capability(uid, "join_approval") or capability_group_ids(uid, "join_approval")):
             delegated_rows.append([InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات الانضمام", callback_data="restricted_members")])
@@ -3019,6 +3067,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("👁️ مراقبة القروبات المسجلة", callback_data="monitor_groups")],
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات والتحليل", callback_data="group_controls")],
+        [InlineKeyboardButton(("🔐 إيقاف قفل الدخول لجميع القروبات" if global_join_approval_enabled() else "🔐 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
@@ -4700,6 +4749,7 @@ async def help_cmd(update, context):
             "/grantpublish USER_ID CHAT_ID — منح صلاحية النشر في قروب\n"
             "/grantcap USER_ID tag CHAT_ID — منح التاق للمشرف/المدير في قروب\n"
             "/grantcap USER_ID tag all — منح التاق في جميع القروبات المسجلة\n"
+            "/grantcap USER_ID join_approval all — منح صلاحية قفل الدخول لجميع القروبات للمفوّض\n"
             "/revokepublish USER_ID CHAT_ID — سحب صلاحية النشر من قروب\n"
             "استخدم CHAT_ID=all لمنح/سحب صلاحية النشر في كل القروبات المسجلة."
         )
@@ -4892,8 +4942,9 @@ async def grantcap(update, context):
         await update.effective_message.reply_text(
             "الاستخدام:\n/grantcap USER_ID publish all|CHAT_ID\n"
             "/grantcap USER_ID tag all|CHAT_ID\n/grantcap USER_ID protection all|CHAT_ID\n"
-            "/grantcap USER_ID stats all|CHAT_ID\n/grantcap USER_ID ai all|CHAT_ID\n\n"
-            "الصلاحيات: publish للنشر، tag للتاق، protection للحماية، stats للإحصائيات، ai لتحليل القروبات."
+            "/grantcap USER_ID stats all|CHAT_ID\n/grantcap USER_ID ai all|CHAT_ID\n"
+            "/grantcap USER_ID join_approval all|CHAT_ID\n\n"
+            "الصلاحيات: publish للنشر، tag للتاق، protection للحماية، stats للإحصائيات، ai للتحليل، join_approval لإدارة موافقة الدخول. استخدم all لمنح إدارة قفل الدخول لجميع القروبات."
         )
         return
     try:
@@ -4901,8 +4952,8 @@ async def grantcap(update, context):
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai."); return
+    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval"}:
+        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval."); return
     raw_scope = context.args[2].lower()
     if raw_scope == "all":
         scope = 0
@@ -4923,23 +4974,23 @@ async def grantcap(update, context):
                 (target, capability, scope, uid, now()))
     db.commit()
     log_action(scope, uid, "staff_capability_granted", f"target={target}; capability={capability}; scope={scope}")
-    labels = {"publish":"النشر والإعلانات", "tag":"استدعاء التاق", "protection":"أوامر الحماية", "stats":"الإحصائيات", "ai":"تحليل الذكاء الاصطناعي"}
+    labels = {"publish":"النشر والإعلانات", "tag":"استدعاء التاق", "protection":"أوامر الحماية", "stats":"الإحصائيات", "ai":"تحليل الذكاء الاصطناعي", "join_approval":"إدارة الموافقة على الدخول"}
     await update.effective_message.reply_text(f"✅ مُنحت صلاحية {labels[capability]} للعضو {target}.\n📍 النطاق: {scope_label}\nيمكن سحبها بالأمر /revokecap.")
 
 
 async def revokecap(update, context):
-    """Owner-only revoke: /revokecap USER_ID publish|tag|protection CHAT_ID|all"""
+    """Owner-only revoke: /revokecap USER_ID capability CHAT_ID|all"""
     uid = update.effective_user.id if update.effective_user else 0
     if not is_owner(uid):
         await update.effective_message.reply_text("⛔ سحب الصلاحيات المركزية للمالك الأساسي فقط."); return
     if len(context.args) < 3:
-        await update.effective_message.reply_text("الاستخدام: /revokecap USER_ID publish|tag|protection CHAT_ID|all"); return
+        await update.effective_message.reply_text("الاستخدام: /revokecap USER_ID publish|tag|protection|stats|ai|join_approval CHAT_ID|all"); return
     try: target = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai."); return
+    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval"}:
+        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval."); return
     raw_scope = context.args[2].lower()
     if raw_scope == "all":
         db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability=?", (target, capability))
@@ -5736,12 +5787,31 @@ async def owner_group_feature_command(update, context):
         "leavealerts_off": ("leave_notices_enabled", 0, "🔕 تم إيقاف إشعارات خروج الأعضاء."),
         "analysis_on": ("analysis_enabled", 1, "🧠 تم تشغيل تحليل هذا القروب."),
         "analysis_off": ("analysis_enabled", 0, "⏸️ تم إيقاف تحليل هذا القروب وإرسال تقاريره الآلية."),
-        "joinapproval_on": ("join_approval_enabled", 1, "🔐 تم تفعيل اشتراط الموافقة على الانضمام. استخدم رابط طلب الانضمام المنشأ من لوحة التحكم؛ الروابط القديمة المباشرة قد لا تطلب موافقة، وسيمنعها البوت عند رصد الانضمام."),
+        "joinapproval_on": ("join_approval_enabled", 1, "🔐 تم تفعيل اشتراط الموافقة على الانضمام لهذا القروب. استخدم رابط طلب الانضمام المنشأ من لوحة التحكم؛ الروابط القديمة المباشرة قد تحتاج إلغاءً يدويًا إذا أنشأها مسؤول آخر."),
         "joinapproval_off": ("join_approval_enabled", 0, "🔓 تم إيقاف اشتراط الموافقة على الانضمام."),
     }
     field, enabled, response = mapping[cmd]
+    if field == "join_approval_enabled" and global_join_approval_enabled():
+        await msg.reply_text("🔐 قفل الدخول المركزي مفعّل لجميع القروبات. استخدم زر قفل الدخول لجميع القروبات في لوحة التحكم لإيقافه قبل تعديل هذا القروب منفردًا.")
+        return
     register_group(chat, user)
     set_group_feature(chat.id, field, enabled)
+    if field == "join_approval_enabled" and enabled:
+        try:
+            _request_link = await create_managed_join_request_link(context.bot, chat.id)
+            response += f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nالروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا."
+        except Exception as _create_link_exc:
+            log.warning("Could not create join request link for chat %s: %s", chat.id, _create_link_exc)
+            response += "\n\n⚠️ تعذر إنشاء رابط طلب الانضمام. تأكد من أن البوت مشرف ويملك صلاحية دعوة المستخدمين."
+    if field == "join_approval_enabled" and not enabled:
+        _managed_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat.id,)).fetchall()
+        for (_managed_link,) in _managed_links:
+            try:
+                await context.bot.revoke_chat_invite_link(chat_id=chat.id, invite_link=_managed_link)
+                db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), chat.id, _managed_link))
+            except Exception as _link_exc:
+                log.info("Could not revoke managed invite link chat=%s: %s", chat.id, _link_exc)
+        db.commit()
     log_action(chat.id, user.id, "group_feature_toggle", f"{field}={enabled}")
     await msg.reply_text(response)
 
@@ -6550,6 +6620,18 @@ async def my_chat_member_handler(update, context):
             except Exception as notify_exc:
                 log.info("Could not notify primary owner about external group %s: %s", chat.id, notify_exc)
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
+        if global_join_approval_enabled() and new_status == "administrator":
+            try:
+                invite_link = await create_managed_join_request_link(context.bot, chat.id)
+                if OWNER_ID:
+                    await context.bot.send_message(chat_id=OWNER_ID, text=f"🔐 قفل الدخول المركزي مفعّل. رابط طلب الانضمام للقروب الجديد {chat.title or chat.id}:\n{invite_link}\nوزّع هذا الرابط بدل روابط الدخول المباشر.")
+            except Exception as join_link_exc:
+                log.warning("Global join approval link creation failed for new group %s: %s", chat.id, join_link_exc)
+                if OWNER_ID:
+                    try:
+                        await context.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ قفل الدخول المركزي مفعّل، لكن تعذر تجهيز قفل كامل/رابط طلب انضمام للقروب الجديد {chat.title or chat.id} ({chat.id}). السبب: {join_link_exc}")
+                    except Exception:
+                        pass
         return
 
     if bot_left:
@@ -7439,6 +7521,96 @@ async def callback(update, context):
     uid = q.from_user.id
     data = q.data or ""
 
+    if data == "joinapproval_global_toggle":
+        if not (is_owner(uid) or can_use_capability(uid, "join_approval", 0)):
+            await safe_callback_answer(q, "تحتاج إلى صلاحية قفل الدخول لجميع القروبات.", show_alert=True); return
+        enabling = not global_join_approval_enabled()
+        groups = db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title,chat_id").fetchall()
+        db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(enabling), now(), uid))
+        # Keep per-group flags aligned with the master switch so turning it off really unlocks all groups.
+        for _cid, _title in groups:
+            db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=excluded.join_approval_enabled,updated_at=excluded.updated_at", (int(_cid), int(enabling), now()))
+        db.commit()
+        log_action(0, uid, "global_join_approval_toggle", f"enabled={int(enabling)}; groups={len(groups)}")
+        if not enabling:
+            revoked = 0
+            rows = db.execute("SELECT chat_id,invite_link FROM managed_join_invite_links WHERE active=1").fetchall()
+            for _cid, _link in rows:
+                try:
+                    await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_link)
+                    db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), int(_cid), _link))
+                    revoked += 1
+                except Exception as exc:
+                    log.info("Could not revoke bot-managed join link chat=%s: %s", _cid, exc)
+                await asyncio.sleep(0.1)
+            db.commit()
+            await q.edit_message_text(
+                f"🔓 تم إيقاف قفل الدخول المركزي لجميع القروبات المسجلة ({len(groups)}).\n"
+                f"تم إلغاء {revoked} رابط/روابط طلب انضمام أنشأها البوت. الروابط التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا من تيليجرام.",
+                reply_markup=panel_markup(uid))
+            return
+        link_lines = []
+        created = 0
+        failed = []
+        for _cid, _title in groups:
+            try:
+                _bot_member = await context.bot.get_chat_member(chat_id=int(_cid), user_id=context.bot.id)
+                if getattr(_bot_member, "status", "") != "administrator":
+                    failed.append(f"• {_title} ({_cid}): يجب رفع البوت إلى مشرف")
+                    await asyncio.sleep(0.1)
+                    continue
+                if not bool(getattr(_bot_member, "can_invite_users", False)) or not bool(getattr(_bot_member, "can_restrict_members", False)):
+                    failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين وحظرهم؛ القفل الكامل غير مضمون دون الصلاحيتين")
+                    await asyncio.sleep(0.1)
+                    continue
+                # Revoke only active links previously created and tracked by this bot.
+                _old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (int(_cid),)).fetchall()
+                for (_old_link,) in _old_links:
+                    try:
+                        await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_old_link)
+                        db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), int(_cid), _old_link))
+                    except Exception as _revoke_exc:
+                        log.info("Could not revoke old bot-managed link chat=%s: %s", _cid, _revoke_exc)
+                # Telegram may reject revoking a primary link created by another administrator.
+                try:
+                    _details = await context.bot.get_chat(chat_id=int(_cid))
+                    _primary_link = getattr(_details, "invite_link", None)
+                    if _primary_link:
+                        await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_primary_link)
+                except Exception as _primary_exc:
+                    log.info("Primary invite link could not be revoked chat=%s; enforcement remains active: %s", _cid, _primary_exc)
+                _invite = await context.bot.create_chat_invite_link(chat_id=int(_cid), creates_join_request=True, name="موافقة المالك على الدخول")
+                db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (int(_cid), _invite.invite_link, now()))
+                db.commit()
+                link_lines.append(f"• {_title}: {_invite.invite_link}")
+                created += 1
+            except Exception as exc:
+                failed.append(f"• {_title} ({_cid}): تعذر إنشاء رابط طلب الانضمام؛ تحقق من صلاحية دعوة المستخدمين")
+                log.warning("Global join lock link setup failed chat=%s: %s", _cid, exc)
+            await asyncio.sleep(0.1)
+        # Send links separately so the authorized operator can distribute them.
+        summary = f"🔐 تم تفعيل قفل الدخول لجميع القروبات المسجلة ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\n\n"
+        if link_lines:
+            chunks = []
+            current = summary
+            for line in link_lines:
+                if len(current) + len(line) + 1 > 3600:
+                    chunks.append(current)
+                    current = "🔗 بقية روابط طلب الانضمام:\n"
+                current += line + "\n"
+            if current.strip():
+                chunks.append(current)
+            for chunk in chunks:
+                await context.bot.send_message(chat_id=uid, text=chunk)
+        if failed:
+            await context.bot.send_message(chat_id=uid, text="⚠️ قروبات لم يتم تجهيز رابط لها:\n" + "\n".join(failed)[:3500])
+        await q.edit_message_text(
+            f"🔐 تم تفعيل قفل الدخول المركزي.\nالقروبات المسجلة: {len(groups)}\n"
+            f"روابط الطلب المنشأة: {created}\nالقروبات التي تعذر تجهيزها: {len(failed)}\n\n"
+            "مهم: الروابط التي أنشأها مسؤول آخر قد لا يمكن للبوت إلغاؤها؛ سيحاول البوت منع الدخول المباشر عند رصده، لكن إلغاء تلك الروابط يدويًا هو الخيار الأكثر أمانًا.",
+            reply_markup=panel_markup(uid))
+        return
+
     if data == "group_controls":
         if not is_owner(uid):
             await safe_callback_answer(q, "إعدادات التحليل والإشعارات العامة للمالك الأساسي فقط.", show_alert=True); return
@@ -7463,12 +7635,28 @@ async def callback(update, context):
         allowed_features = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
         if feature not in allowed_features or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await safe_callback_answer(q, "الإعداد غير صالح.", show_alert=True); return
+        if feature == "join_approval_enabled" and global_join_approval_enabled():
+            await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لجميع القروبات. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب منفرد.", show_alert=True); return
         new_state = not group_feature_enabled(chat_id, feature)
         set_group_feature(chat_id, feature, new_state)
+        if feature == "join_approval_enabled" and not new_state:
+            _managed_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
+            for (_managed_link,) in _managed_links:
+                try:
+                    await context.bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=_managed_link)
+                    db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), chat_id, _managed_link))
+                except Exception as _link_exc:
+                    log.info("Could not revoke managed invite link chat=%s: %s", chat_id, _link_exc)
+            db.commit()
         log_action(chat_id, uid, "group_feature_toggle", f"{feature}={int(new_state)}")
         note = ""
         if feature == "join_approval_enabled" and new_state:
-            note = "\n\nمهم: أنشئ رابط طلب انضمام من الزر أدناه وشاركه. الروابط القديمة المباشرة لا تتحول تلقائيًا إلى روابط موافقة؛ سيحاول البوت منع الدخول المباشر عند رصده."
+            try:
+                _request_link = await create_managed_join_request_link(context.bot, chat_id)
+                note = f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nالروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا."
+            except Exception as _create_link_exc:
+                log.warning("Could not create join request link for chat %s: %s", chat_id, _create_link_exc)
+                note = "\n\n⚠️ تعذر إنشاء رابط طلب الانضمام. تأكد من صلاحية البوت لدعوة المستخدمين."
         await q.edit_message_text(f"تم {'تشغيل' if new_state else 'إيقاف'} الإعداد بنجاح.{note}", reply_markup=group_controls_markup(chat_id)); return
 
     if data.startswith("gctrl_link:"):
@@ -7479,8 +7667,8 @@ async def callback(update, context):
         if not group_feature_enabled(chat_id, "join_approval_enabled"):
             await safe_callback_answer(q, "فعّل اشتراط الموافقة أولًا.", show_alert=True); return
         try:
-            invite = await context.bot.create_chat_invite_link(chat_id=chat_id, creates_join_request=True, name="طلب انضمام عبر البوت")
-            await q.message.reply_text(f"🔗 رابط طلب الانضمام الجديد:\n{invite.invite_link}\n\nاحتفظ بالرابط القديم إن أردت، لكن لا تشاركه إذا كان يسمح بالدخول المباشر. هذا الرابط الجديد يتطلب موافقة.")
+            _request_link = await create_managed_join_request_link(context.bot, chat_id)
+            await q.message.reply_text(f"🔗 رابط طلب الانضمام الجديد:\n{_request_link}\n\nاستخدم هذا الرابط للموافقة على الأعضاء. الروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا.")
             await safe_callback_answer(q, "تم إنشاء رابط طلب انضمام.")
         except Exception as exc:
             await safe_callback_answer(q, "تعذر إنشاء الرابط. تأكد أن البوت مشرف ويملك صلاحية دعوة المستخدمين.", show_alert=True)
