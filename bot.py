@@ -1826,29 +1826,42 @@ def set_group_feature(chat_id, feature, enabled):
 
 
 async def create_managed_join_request_link(bot, chat_id):
-    """Create a request-only invite, revoking known bot-managed links and attempting the primary link."""
+    """Create and persist a request-only invite before revoking any old bot-managed link.
+
+    This order is intentional: if Telegram rejects link creation, the previously working
+    link remains active and the caller must not report the group as locked.
+    """
     bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
     if getattr(bot_member, "status", "") != "administrator":
         raise RuntimeError("يجب رفع البوت إلى مشرف")
     if not bool(getattr(bot_member, "can_invite_users", False)):
         raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين/إدارة روابط الدعوة")
-    old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
+
+    # Create first. Never invalidate a known working link before replacement exists.
+    invite = await bot.create_chat_invite_link(
+        chat_id=chat_id, creates_join_request=True, name="موافقة المالك على الدخول"
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')",
+        (chat_id, invite.invite_link, now())
+    )
+    db.commit()
+
+    old_links = db.execute(
+        "SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1 AND invite_link<>?",
+        (chat_id, invite.invite_link)
+    ).fetchall()
     for (old_link,) in old_links:
         try:
             await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=old_link)
-            db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), chat_id, old_link))
+            db.execute(
+                "UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?",
+                (now(), chat_id, old_link)
+            )
+            db.commit()
         except Exception as exc:
-            log.info("Could not revoke previous bot-managed invite link chat=%s: %s", chat_id, exc)
-    try:
-        details = await bot.get_chat(chat_id=chat_id)
-        primary_link = getattr(details, "invite_link", None)
-        if primary_link:
-            await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=primary_link)
-    except Exception as exc:
-        log.info("Primary invite link may require manual revocation chat=%s: %s", chat_id, exc)
-    invite = await bot.create_chat_invite_link(chat_id=chat_id, creates_join_request=True, name="موافقة المالك على الدخول")
-    db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (chat_id, invite.invite_link, now()))
-    db.commit()
+            # Keep it recorded as active if revocation failed; the UI/log must not claim it was revoked.
+            log.warning("Could not revoke previous bot-managed invite link chat=%s: %s", chat_id, exc)
     return invite.invite_link
 
 DEFAULT_AUTO_REPLIES = [
@@ -7735,31 +7748,35 @@ async def callback(update, context):
                     failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين وإدارة روابط الدعوة")
                     await asyncio.sleep(0.1)
                     continue
-                # Revoke only active links previously created and tracked by this bot.
-                _old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (int(_cid),)).fetchall()
+                # Create and persist the replacement request-only link before revoking any old link.
+                # If Telegram rejects creation, preserve the previous links and report this group failed.
+                _invite = await context.bot.create_chat_invite_link(chat_id=int(_cid), creates_join_request=True, name="موافقة المالك على الدخول")
+                db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (int(_cid), _invite.invite_link, now()))
+                db.commit()
+                # Revoke only active links previously created and tracked by this bot, after replacement exists.
+                _old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1 AND invite_link<>?", (int(_cid), _invite.invite_link)).fetchall()
                 for (_old_link,) in _old_links:
                     try:
                         await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_old_link)
                         db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), int(_cid), _old_link))
+                        db.commit()
                     except Exception as _revoke_exc:
-                        log.info("Could not revoke old bot-managed link chat=%s: %s", _cid, _revoke_exc)
-                # Telegram may reject revoking a primary link created by another administrator.
+                        log.warning("Could not revoke old bot-managed link chat=%s: %s", _cid, _revoke_exc)
+                # Revoke the primary link only after a working request-only replacement exists.
                 try:
                     _details = await context.bot.get_chat(chat_id=int(_cid))
                     _primary_link = getattr(_details, "invite_link", None)
-                    if _primary_link:
+                    if _primary_link and _primary_link != _invite.invite_link:
                         await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_primary_link)
                 except Exception as _primary_exc:
-                    log.info("Primary invite link could not be revoked chat=%s; enforcement remains active: %s", _cid, _primary_exc)
-                _invite = await context.bot.create_chat_invite_link(chat_id=int(_cid), creates_join_request=True, name="موافقة المالك على الدخول")
-                db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (int(_cid), _invite.invite_link, now()))
+                    log.warning("Primary invite link could not be revoked chat=%s; request link exists but old link may still bypass approval: %s", _cid, _primary_exc)
                 db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at", (int(_cid), 1, now()))
                 db.commit()
                 link_lines.append(f"• {_title}: {_invite.invite_link}")
                 created += 1
             except Exception as exc:
-                db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=0,updated_at=excluded.updated_at", (int(_cid), 0, now()))
-                db.commit()
+                # Keep the previous per-group setting unchanged on failure; a failed attempt
+                # must not silently unlock a group that was already configured.
                 failed.append(f"• {_title} ({_cid}): {str(exc)[:220]}")
                 log.warning("Global join lock link setup failed chat=%s: %s", _cid, exc, exc_info=True)
             await asyncio.sleep(0.1)
@@ -7769,7 +7786,8 @@ async def callback(update, context):
         db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(_global_enabled), now(), uid))
         db.commit()
         # Send links separately so the authorized operator can distribute them.
-        summary = f"🔐 تم تفعيل قفل الدخول لجميع القروبات المسجلة ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\n\n"
+        summary_title = ("🔐 تم تجهيز قفل الدخول لجميع القروبات المسجلة" if _global_enabled else "⚠️ تم تجهيز قفل الدخول جزئيًا؛ القفل المركزي غير مفعّل")
+        summary = f"{summary_title} ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\nالقروبات التي تعذر تجهيزها: {len(failed)}.\n\n"
         if link_lines:
             chunks = []
             current = summary
@@ -7784,9 +7802,10 @@ async def callback(update, context):
                 await context.bot.send_message(chat_id=uid, text=chunk)
         if failed:
             await context.bot.send_message(chat_id=uid, text="⚠️ قروبات لم يتم تجهيز رابط لها:\n" + "\n".join(failed)[:3500])
+        _global_result_label = "تم تفعيل قفل الدخول المركزي لجميع القروبات" if _global_enabled else "اكتمل إعداد القروبات المتاحة جزئيًا؛ القفل المركزي غير مفعّل لأن بعض القروبات فشلت"
         await q.edit_message_text(
-            f"🔐 تم تفعيل قفل الدخول المركزي.\nالقروبات المسجلة: {len(groups)}\n"
-            f"روابط الطلب المنشأة: {created}\nالقروبات التي تعذر تجهيزها: {len(failed)}\n\n"
+            f"🔐 {_global_result_label}.\nالقروبات المسجلة: {len(groups)}\n"
+            f"روابط الطلب المنشأة بنجاح: {created}\nالقروبات التي تعذر تجهيزها: {len(failed)}\n\n"
             "مهم: الروابط التي أنشأها مسؤول آخر قد لا يمكن للبوت إلغاؤها؛ سيحاول البوت منع الدخول المباشر عند رصده، لكن إلغاء تلك الروابط يدويًا هو الخيار الأكثر أمانًا.",
             reply_markup=panel_markup(uid))
         return
@@ -7819,7 +7838,21 @@ async def callback(update, context):
         if feature == "join_approval_enabled" and global_join_approval_enabled():
             await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لجميع القروبات. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب منفرد.", show_alert=True); return
         new_state = not group_feature_enabled(chat_id, feature)
-        set_group_feature(chat_id, feature, new_state)
+        note = ""
+        # Enabling join approval is a two-phase operation: create a usable request link
+        # first, then persist the enabled state. Never leave the UI/database claiming the
+        # feature is enabled when Telegram rejected link creation.
+        if feature == "join_approval_enabled" and new_state:
+            try:
+                _request_link = await create_managed_join_request_link(context.bot, chat_id)
+            except Exception as _create_link_exc:
+                log.warning("Could not create join request link for chat %s: %s", chat_id, _create_link_exc, exc_info=True)
+                await safe_callback_answer(q, "تعذر تفعيل قفل الدخول. تحقق من عضوية البوت وصلاحية دعوة المستخدمين؛ لم تتغير حالة القروب.", show_alert=True)
+                return
+            set_group_feature(chat_id, feature, True)
+            note = f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nالروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا."
+        else:
+            set_group_feature(chat_id, feature, new_state)
         if feature == "join_approval_enabled" and not new_state:
             _managed_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
             for (_managed_link,) in _managed_links:
@@ -7827,17 +7860,10 @@ async def callback(update, context):
                     await context.bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=_managed_link)
                     db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), chat_id, _managed_link))
                 except Exception as _link_exc:
-                    log.info("Could not revoke managed invite link chat=%s: %s", chat_id, _link_exc)
+                    log.warning("Could not revoke managed invite link chat=%s: %s", chat_id, _link_exc)
             db.commit()
         log_action(chat_id, uid, "group_feature_toggle", f"{feature}={int(new_state)}")
-        note = ""
-        if feature == "join_approval_enabled" and new_state:
-            try:
-                _request_link = await create_managed_join_request_link(context.bot, chat_id)
-                note = f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nالروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا."
-            except Exception as _create_link_exc:
-                log.warning("Could not create join request link for chat %s: %s", chat_id, _create_link_exc)
-                note = "\n\n⚠️ تعذر إنشاء رابط طلب الانضمام. تأكد من صلاحية البوت لدعوة المستخدمين."
+        await safe_callback_answer(q, "تم تحديث الإعداد." if not (feature == "join_approval_enabled" and new_state) else "تم تفعيل قفل الدخول.")
         await q.edit_message_text(f"تم {'تشغيل' if new_state else 'إيقاف'} الإعداد بنجاح.{note}", reply_markup=group_controls_markup(chat_id)); return
 
     if data.startswith("gctrl_link:"):
