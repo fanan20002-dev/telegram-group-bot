@@ -1830,8 +1830,8 @@ async def create_managed_join_request_link(bot, chat_id):
     bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
     if getattr(bot_member, "status", "") != "administrator":
         raise RuntimeError("يجب رفع البوت إلى مشرف")
-    if not bool(getattr(bot_member, "can_invite_users", False)) or not bool(getattr(bot_member, "can_restrict_members", False)):
-        raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين وحظرهم")
+    if not bool(getattr(bot_member, "can_invite_users", False)):
+        raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين/إدارة روابط الدعوة")
     old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
     for (old_link,) in old_links:
         try:
@@ -2298,8 +2298,28 @@ def can_publish_to(uid, chat_id):
     return can_use_capability(uid, "publish", chat_id)
 
 async def can_publish_to_live(bot, uid, chat_id):
-    """تحقق من التفويض الداخلي؛ فشل الإرسال الفعلي يُسجل عند محاولة النشر."""
-    return can_publish_to(uid, chat_id)
+    """Check both internal permission and live bot membership before listing/sending."""
+    if not can_publish_to(uid, chat_id):
+        return False
+    try:
+        member = await bot.get_chat_member(chat_id=int(chat_id), user_id=bot.id)
+        status = str(getattr(member, "status", "")).casefold()
+        if status not in ("administrator", "creator", "owner", "member"):
+            return False
+        # A bot must be able to send to the group. Telegram does not expose a
+        # single send-right flag consistently for all group types; final send is rechecked.
+        return True
+    except (BadRequest, Forbidden) as exc:
+        detail = str(exc).casefold()
+        if any(term in detail for term in ("chat not found", "chat_id_invalid", "bot is not a member", "user not found", "kicked", "not enough rights", "participant_id_invalid")):
+            log.info("Excluding disconnected group from publishing chat=%s", chat_id)
+        else:
+            log.info("Cannot verify group for publishing chat=%s: %s", chat_id, str(exc)[:200])
+        return False
+    except Exception as exc:
+        # Fail closed: an unverified destination is not offered for publication.
+        log.info("Temporary group verification failure; exclude from current publishing list chat=%s (%s)", chat_id, type(exc).__name__)
+        return False
 
 def can_use_capability(uid, capability, chat_id=0):
     """Check owner-controlled grants, including scoped grants for delegated owners."""
@@ -3361,12 +3381,47 @@ async def delchannel_cmd(update, context):
     await update.effective_message.reply_text(f"✅ تم فك ربط القناة: {row[1]}")
 
 
+async def get_live_linked_channels(bot, purge_confirmed=True):
+    """Return only channels where the bot is still an admin with post rights.
+
+    Confirmed removals are pruned from linked_channels. Network/time-out errors are
+    treated as unknown and retained, so temporary Telegram failures do not erase data.
+    """
+    rows = db.execute("SELECT chat_id,title,username FROM linked_channels ORDER BY title").fetchall()
+    active, removed = [], []
+    for cid, title, username in rows:
+        try:
+            chat = await bot.get_chat(int(cid))
+            if getattr(chat, "type", None) != ChatType.CHANNEL:
+                removed.append((int(cid), "not_channel"))
+                continue
+            member = await bot.get_chat_member(chat_id=int(cid), user_id=bot.id)
+            if getattr(member, "status", "") != "administrator" or not bool(getattr(member, "can_post_messages", False)):
+                # Known channel but bot cannot publish there; keep link record so it can be fixed.
+                continue
+            active.append((int(cid), getattr(chat, "title", None) or title or str(cid), getattr(chat, "username", None) or username or ""))
+        except (BadRequest, Forbidden) as exc:
+            detail = str(exc).casefold()
+            if any(term in detail for term in ("chat not found", "chat_id_invalid", "bot is not a member", "user not found", "kicked", "not enough rights")):
+                removed.append((int(cid), str(exc)[:200]))
+            else:
+                log.info("Channel status is temporarily unknown; retaining linked record chat=%s: %s", cid, exc)
+        except Exception as exc:
+            log.info("Channel status check failed transiently; retaining linked record chat=%s (%s)", cid, type(exc).__name__)
+    if purge_confirmed and removed:
+        for cid, reason in removed:
+            db.execute("DELETE FROM linked_channels WHERE chat_id=?", (cid,))
+            log.info("Pruned inactive linked channel chat=%s reason=%s", cid, str(reason)[:200])
+        db.commit()
+    return active
+
+
 async def channels_cmd(update, context):
     if not update.effective_user or not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ قائمة القنوات للمالك الأساسي فقط.")
         return
-    rows = db.execute("SELECT chat_id,title,username FROM linked_channels ORDER BY title").fetchall()
-    text = "📡 القنوات المرتبطة:\n" + ("\n".join(f"• {title} — @{username or 'بدون معرف'} — {cid}" for cid,title,username in rows) if rows else "لا توجد قنوات مرتبطة بعد.")
+    rows = await get_live_linked_channels(context.bot)
+    text = "📡 القنوات المتصلة والجاهزة للنشر:\n" + ("\n".join(f"• {title} — @{username or 'بدون معرف'} — {cid}" for cid,title,username in rows) if rows else "لا توجد قنوات متصلة وجاهزة للنشر. تحقق من إضافة البوت مشرفًا مع صلاحية نشر الرسائل.")
     await update.effective_message.reply_text(text[:4000])
 
 
@@ -3374,13 +3429,13 @@ async def publish_channels_cmd(update, context):
     if not update.effective_user or not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ النشر للقنوات من المالك الأساسي فقط.")
         return
-    rows = db.execute("SELECT COUNT(*) FROM linked_channels").fetchone()[0]
-    if not rows:
-        await update.effective_message.reply_text("لا توجد قنوات مرتبطة. استخدم /addchannel @channelusername بعد منح البوت صلاحية النشر.")
+    live_rows = await get_live_linked_channels(context.bot)
+    if not live_rows:
+        await update.effective_message.reply_text("لا توجد قنوات متصلة وجاهزة للنشر. تحقق من صلاحية البوت في القناة.")
         return
     context.user_data["channel_broadcast_selected"] = []
     context.user_data["channel_broadcast_stage"] = "select"
-    kb = [[InlineKeyboardButton(f"⬜ {title}", callback_data=f"channel_pub_toggle:{cid}")] for cid,title in db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()[:50]]
+    kb = [[InlineKeyboardButton(f"⬜ {title}", callback_data=f"channel_pub_toggle:{cid}")] for cid,title,username in live_rows[:50]]
     kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات", callback_data="channel_pub_all")], [InlineKeyboardButton("➡️ متابعة", callback_data="channel_pub_prepare")], [InlineKeyboardButton("❌ إلغاء", callback_data="channel_pub_cancel")]]
     await update.effective_message.reply_text("📡 اختر القنوات المستهدفة للنشر:", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -5898,14 +5953,18 @@ async def owner_group_feature_command(update, context):
         await msg.reply_text("🔐 قفل الدخول المركزي مفعّل لجميع القروبات. استخدم زر قفل الدخول لجميع القروبات في لوحة التحكم لإيقافه قبل تعديل هذا القروب منفردًا.")
         return
     register_group(chat, user)
-    set_group_feature(chat.id, field, enabled)
     if field == "join_approval_enabled" and enabled:
+        # Do not persist an enabled state until Telegram confirms the request-only link exists.
         try:
             _request_link = await create_managed_join_request_link(context.bot, chat.id)
-            response += f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nالروابط القديمة التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا."
+            set_group_feature(chat.id, field, 1)
+            response += f"\n\n🔗 رابط طلب الانضمام الجديد:\n{_request_link}\nوزّع هذا الرابط بدل الروابط القديمة. قد تحتاج الروابط التي أنشأها مسؤول آخر إلى إلغاء يدوي."
         except Exception as _create_link_exc:
-            log.warning("Could not create join request link for chat %s: %s", chat.id, _create_link_exc)
-            response += "\n\n⚠️ تعذر إنشاء رابط طلب الانضمام. تأكد من أن البوت مشرف ويملك صلاحية دعوة المستخدمين."
+            set_group_feature(chat.id, field, 0)
+            log.warning("Could not enable join approval for chat %s: %s", chat.id, _create_link_exc, exc_info=True)
+            response = "⚠️ لم يتم تفعيل قفل الدخول؛ بقي القروب على حالته السابقة.\nالسبب: " + str(_create_link_exc)[:700]
+    else:
+        set_group_feature(chat.id, field, enabled)
     if field == "join_approval_enabled" and not enabled:
         _managed_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat.id,)).fetchall()
         for (_managed_link,) in _managed_links:
@@ -7637,10 +7696,12 @@ async def callback(update, context):
             await safe_callback_answer(q, "تحتاج إلى صلاحية قفل الدخول لجميع القروبات.", show_alert=True); return
         enabling = not global_join_approval_enabled()
         groups = db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title,chat_id").fetchall()
-        db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(enabling), now(), uid))
-        # Keep per-group flags aligned with the master switch so turning it off really unlocks all groups.
-        for _cid, _title in groups:
-            db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=excluded.join_approval_enabled,updated_at=excluded.updated_at", (int(_cid), int(enabling), now()))
+        # On enable, defer the global flag until links have been created successfully.
+        # Otherwise one permission failure would make every group appear locked in the UI.
+        if not enabling:
+            db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=? WHERE id=1", (now(), uid))
+            for _cid, _title in groups:
+                db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=0,updated_at=excluded.updated_at", (int(_cid), 0, now()))
         db.commit()
         log_action(0, uid, "global_join_approval_toggle", f"enabled={int(enabling)}; groups={len(groups)}")
         if not enabling:
@@ -7670,8 +7731,8 @@ async def callback(update, context):
                     failed.append(f"• {_title} ({_cid}): يجب رفع البوت إلى مشرف")
                     await asyncio.sleep(0.1)
                     continue
-                if not bool(getattr(_bot_member, "can_invite_users", False)) or not bool(getattr(_bot_member, "can_restrict_members", False)):
-                    failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين وحظرهم؛ القفل الكامل غير مضمون دون الصلاحيتين")
+                if not bool(getattr(_bot_member, "can_invite_users", False)):
+                    failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين وإدارة روابط الدعوة")
                     await asyncio.sleep(0.1)
                     continue
                 # Revoke only active links previously created and tracked by this bot.
@@ -7692,13 +7753,21 @@ async def callback(update, context):
                     log.info("Primary invite link could not be revoked chat=%s; enforcement remains active: %s", _cid, _primary_exc)
                 _invite = await context.bot.create_chat_invite_link(chat_id=int(_cid), creates_join_request=True, name="موافقة المالك على الدخول")
                 db.execute("INSERT OR REPLACE INTO managed_join_invite_links(chat_id,invite_link,link_type,active,created_at,revoked_at) VALUES(?,?,'join_request',1,?,'')", (int(_cid), _invite.invite_link, now()))
+                db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at", (int(_cid), 1, now()))
                 db.commit()
                 link_lines.append(f"• {_title}: {_invite.invite_link}")
                 created += 1
             except Exception as exc:
-                failed.append(f"• {_title} ({_cid}): تعذر إنشاء رابط طلب الانضمام؛ تحقق من صلاحية دعوة المستخدمين")
-                log.warning("Global join lock link setup failed chat=%s: %s", _cid, exc)
+                db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=0,updated_at=excluded.updated_at", (int(_cid), 0, now()))
+                db.commit()
+                failed.append(f"• {_title} ({_cid}): {str(exc)[:220]}")
+                log.warning("Global join lock link setup failed chat=%s: %s", _cid, exc, exc_info=True)
             await asyncio.sleep(0.1)
+        # Mark the global master switch on only when every listed group has a working request link.
+        # Partial success stays per-group, so failed groups are not falsely shown as locked.
+        _global_enabled = bool(groups) and not failed
+        db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(_global_enabled), now(), uid))
+        db.commit()
         # Send links separately so the authorized operator can distribute them.
         summary = f"🔐 تم تفعيل قفل الدخول لجميع القروبات المسجلة ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\n\n"
         if link_lines:
@@ -8893,15 +8962,15 @@ async def callback(update, context):
 
     if data == "channels_manage":
         if not is_owner(uid): await safe_callback_answer(q,"إدارة ربط القنوات والنشر للمالك الأساسي فقط.",show_alert=True); return
-        rows=db.execute("SELECT chat_id,title,username FROM linked_channels ORDER BY title").fetchall()
-        summary="\n".join(f"• {title} (@{username or 'بدون معرف'}) — {cid}" for cid,title,username in rows) or "لا توجد قنوات مرتبطة."
+        rows=await get_live_linked_channels(context.bot)
+        summary="\n".join(f"• {title} (@{username or 'بدون معرف'}) — {cid}" for cid,title,username in rows) or "لا توجد قنوات متصلة وجاهزة للنشر."
         await q.edit_message_text("📡 إدارة القنوات والنشر\n\n"+summary+"\n\nلربط قناة: أضف البوت مشرفًا مع صلاحية النشر، ثم أرسل /addchannel @username في الخاص.\nلفك الربط: /delchannel @username\nلعرض القائمة: /channels\n\nالنشر: اختر القنوات ثم أرسل الرسالة واعتمد المعاينة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إلى القنوات",callback_data="channel_pub_start")],[InlineKeyboardButton("🔄 تحديث القائمة",callback_data="channels_manage")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
     if data == "channel_pub_start":
         if not is_owner(uid): await safe_callback_answer(q,"النشر للقنوات للمالك الأساسي فقط.",show_alert=True); return
-        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
-        if not rows: await q.edit_message_text("لا توجد قنوات مرتبطة. استخدم /addchannel @username بعد منح البوت صلاحية النشر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إدارة القنوات",callback_data="channels_manage")]])); return
+        rows=await get_live_linked_channels(context.bot)
+        if not rows: await q.edit_message_text("لا توجد قنوات متصلة وجاهزة للنشر. تحقق من صلاحية البوت في القناة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إدارة القنوات",callback_data="channels_manage")]])); return
         context.user_data["channel_broadcast_selected"]=[]
-        kb=[[InlineKeyboardButton("⬜ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title in rows[:50]]
+        kb=[[InlineKeyboardButton("⬜ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title,username in rows[:50]]
         kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات",callback_data="channel_pub_all")],[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
         await q.edit_message_text("📡 حدد القنوات التي تريد النشر فيها:",reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("channel_pub_toggle:"):
@@ -8912,31 +8981,39 @@ async def callback(update, context):
         if cid in selected: selected.remove(cid)
         else: selected.add(cid)
         context.user_data["channel_broadcast_selected"]=sorted(selected)
-        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
-        kb=[[InlineKeyboardButton(("✅ " if x in selected else "⬜ ")+title,callback_data=f"channel_pub_toggle:{x}")] for x,title in rows[:50]]
+        rows=await get_live_linked_channels(context.bot)
+        live_ids={x for x,_,_ in rows}
+        selected.intersection_update(live_ids)
+        context.user_data["channel_broadcast_selected"]=sorted(selected)
+        kb=[[InlineKeyboardButton(("✅ " if x in selected else "⬜ ")+title,callback_data=f"channel_pub_toggle:{x}")] for x,title,username in rows[:50]]
         kb += [[InlineKeyboardButton("🌐 تحديد جميع القنوات",callback_data="channel_pub_all")],[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
         await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb)); return
     if data == "channel_pub_all":
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        context.user_data["channel_broadcast_selected"]=[r[0] for r in db.execute("SELECT chat_id FROM linked_channels ORDER BY title").fetchall()]
-        rows=db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall()
-        kb=[[InlineKeyboardButton("✅ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title in rows[:50]]
+        rows=await get_live_linked_channels(context.bot)
+        context.user_data["channel_broadcast_selected"]=[cid for cid,title,username in rows]
+        kb=[[InlineKeyboardButton("✅ "+title,callback_data=f"channel_pub_toggle:{cid}")] for cid,title,username in rows[:50]]
         kb += [[InlineKeyboardButton("➡️ متابعة",callback_data="channel_pub_prepare")],[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]]
         await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb)); return
     if data == "channel_pub_prepare":
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
-        selected=context.user_data.get("channel_broadcast_selected",[])
-        if not selected: await safe_callback_answer(q,"حدد قناة واحدة على الأقل.",show_alert=True); return
+        live_rows=await get_live_linked_channels(context.bot)
+        live_ids={cid for cid,title,username in live_rows}
+        selected=[cid for cid in context.user_data.get("channel_broadcast_selected",[]) if cid in live_ids]
+        context.user_data["channel_broadcast_selected"]=selected
+        if not selected: await safe_callback_answer(q,"لا توجد قناة متصلة وجاهزة للنشر ضمن اختيارك.",show_alert=True); return
         context.user_data["awaiting_channel_broadcast"]=True
-        await q.edit_message_text(f"أرسل الآن في الخاص الرسالة أو الصورة أو الفيديو الذي تريد نشره في {len(selected)} قناة. ستظهر معاينة قبل النشر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]])); return
+        await q.edit_message_text(f"أرسل الآن في الخاص الرسالة أو الصورة أو الفيديو الذي تريد نشره في {len(selected)} قناة متصلة. ستظهر معاينة قبل النشر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data="channel_pub_cancel")]])); return
     if data == "channel_pub_confirm":
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
         draft=context.user_data.get("channel_broadcast_draft")
         selected=context.user_data.get("channel_broadcast_selected",[])
         if not draft or not selected: await q.edit_message_text("انتهت صلاحية مسودة النشر. ابدأ من جديد."); return
         sent=failed=0
+        live_rows=await get_live_linked_channels(context.bot)
+        live_ids={cid for cid,title,username in live_rows}
+        selected=[cid for cid in selected if cid in live_ids]
         for cid in selected:
-            if not db.execute("SELECT 1 FROM linked_channels WHERE chat_id=?",(cid,)).fetchone(): continue
             try: await context.bot.copy_message(chat_id=cid,from_chat_id=draft["chat_id"],message_id=draft["message_id"]); sent+=1
             except Exception as exc: failed+=1; log.warning("Channel publish failed %s: %s",cid,exc)
         for key in ("channel_broadcast_draft","channel_broadcast_selected","awaiting_channel_broadcast"): context.user_data.pop(key,None)
