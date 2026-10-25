@@ -3132,7 +3132,7 @@ async def assistant_reminder_worker(app):
                 db.commit()
             # Deliver scheduled student exams/deadlines when their time arrives.
             now_local = datetime.now().astimezone().isoformat(timespec="seconds")
-            mini_due=db.execute("SELECT id,user_id,event_type,title,event_at,reminder_minutes FROM miniapp_events WHERE notified=0 AND datetime(event_at, '-' || reminder_minutes || ' minutes')<=datetime(?) ORDER BY event_at LIMIT 50",(now_riyadh,)).fetchall()
+            mini_due=db.execute("SELECT id,user_id,event_type,title,event_at,reminder_minutes FROM miniapp_events WHERE notified=0 AND datetime(event_at, '-' || reminder_minutes || ' minutes')<=datetime(?) ORDER BY event_at LIMIT 50",(now_local,)).fetchall()
             for mid,muid,mtype,mtitle,mat,mrem in mini_due:
                 try:
                     await app.bot.send_message(chat_id=muid,text=f"🔔 تذكير بموعدك الدراسي\n📌 {mtitle}\nالنوع: {mtype}\n📅 {mat.replace('T',' ')[:16]}\nالتنبيه قبل الموعد: {mrem} دقيقة")
