@@ -10576,6 +10576,7 @@ async def bot_connectivity_monitor_worker(app):
 
 async def post_init(app):
     """Start long-running assistant workers only after PTB has initialized its event loop."""
+    # Keep all existing background jobs and ensure scheduled reports actually start.
     app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
     app.create_task(bot_connectivity_monitor_worker(app), name="bot-connectivity-monitor-worker")
     app.create_task(automatic_unmute_worker(app), name="automatic-unmute-worker")
@@ -10584,6 +10585,9 @@ async def post_init(app):
     app.create_task(motivation_daily_worker(app), name="motivation-daily-worker")
     app.create_task(bot_promo_worker(app), name="bot-promo-worker")
     app.create_task(evening_adhkar_worker(app), name="evening-adhkar-worker")
+    app.create_task(weekly_stats_worker(app), name="weekly-stats-worker")
+    app.create_task(daily_member_activity_worker(app), name="daily-member-activity-worker")
+    app.create_task(group_analysis_report_worker(app), name="group-analysis-report-worker")
 
 
 
