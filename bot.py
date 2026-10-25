@@ -6675,15 +6675,22 @@ async def chat_member_handler(update, context):
             if group_feature_enabled(chat_id, "join_approval_enabled"):
                 request_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
                 if not request_row or request_row[0] != "approved":
-                    try:
-                        log_action(chat_id, member.id, "join_approval_required", "direct join blocked; join request required")
-                        await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
-                        await notify_owners(context, f"🔐 تم منع دخول غير معتمد\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name} (ID: {member.id})\nالسبب: الموافقة المسبقة مفعّلة؛ استخدم رابط طلب الانضمام.", "membership")
-                    except Exception as exc:
-                        log.warning("Join approval enforcement failed chat=%s user=%s: %s", chat_id, member.id, exc)
-                    return
-                db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
-                db.commit()
+                    # Do not remove a new, non-expelled member after they have entered.
+                    # Pre-entry approval must be enforced by sharing a join-request invite link
+                    # and revoking old direct invite links. Previously expelled users are still
+                    # blocked by the reentry_restrictions check above.
+                    log_action(chat_id, member.id, "join_approval_bypassed_by_direct_link", "member retained; use join-request link for future entries")
+                    await notify_owners(
+                        context,
+                        f"⚠️ انضم عضو عبر رابط دخول مباشر دون طلب موافقة\n"
+                        f"القروب: {cm.chat.title or chat_id}\n"
+                        f"العضو: {member.full_name} (ID: {member.id})\n"
+                        "لم يطرده البوت. لضمان الموافقة المسبقة مستقبلًا، وزّع رابط طلب الانضمام وألغِ روابط الدعوة المباشرة القديمة.",
+                        "membership"
+                    )
+                else:
+                    db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
+                    db.commit()
         if global_ban_applies(member.id, chat_id):
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
