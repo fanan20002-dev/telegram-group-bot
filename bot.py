@@ -1915,7 +1915,7 @@ def panel_markup(uid):
         if can_use_capability(uid, "security_review"):
             delegated_rows.append([InlineKeyboardButton("🛡️ المراجعة الأمنية", callback_data="security_review_latest")])
         if can_manage_delegates(uid):
-            delegated_rows.append([InlineKeyboardButton("👑 إدارة المفوضين ومنحهم/عزلهم", callback_data="delegated_owner")])
+            delegated_rows.append([InlineKeyboardButton("👑 نائب المالك وإدارة الصلاحيات", callback_data="delegated_owner")])
         delegated_rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         if can_use_capability(uid, "message_lock") or capability_group_ids(uid, "message_lock"):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
@@ -1993,7 +1993,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="staff_permissions")],
         [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
         [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
-        [InlineKeyboardButton("👑 إدارة المفوّضين", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
+        [InlineKeyboardButton("👑 نائب المالك وإدارة الصلاحيات", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center"), InlineKeyboardButton("📨 سجل التحويلات والملفات", callback_data="archive")],
         [InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
@@ -9219,11 +9219,11 @@ async def callback(update, context):
             await q.edit_message_text("⛔ إدارة المفوضين تتطلب تفويضًا صريحًا من المالك الأساسي.")
             return
         rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
-        text = "👑 المالكون المفوّضون وصلاحيات النشر\n\n"
+        text = "👑 نائب المالك — إدارة المفوّضين والصلاحيات\n\n"
         text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in rows) if rows else "لا يوجد مالكون مفوّضون."
         text += "\n\nاختر مالكًا مفوضًا لإدارة صلاحياته. الإضافة والعزل تتمان من هذه اللوحة في الخاص."
         buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — الصلاحيات", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
-        buttons.insert(0, [InlineKeyboardButton("➕ إضافة مالك مفوّض", callback_data="delegated_add_start")])
+        buttons.insert(0, [InlineKeyboardButton("➕ إضافة نائب مالك", callback_data="delegated_add_start")])
         buttons += [[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
         await q.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -9237,7 +9237,7 @@ async def callback(update, context):
             return
         context.user_data["awaiting_delegated_owner_id"] = True
         await q.edit_message_text(
-            "➕ إضافة مالك مفوّض\n\nأرسل رقم المستخدم (User ID) في هذه المحادثة الخاصة.\nلن تُمنح الصلاحية إلا بعد إدخال الرقم هنا، ولا ترسل رمز البوت أو التوكن.",
+            "➕ إضافة نائب مالك\n\nأرسل رقم المستخدم (User ID) في هذه المحادثة الخاصة.\nلن تُمنح الصلاحية إلا بعد إدخال الرقم هنا، ولا ترسل رمز البوت أو التوكن.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء والعودة", callback_data="delegated_owner")]])
         )
         return
