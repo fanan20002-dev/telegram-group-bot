@@ -349,6 +349,16 @@ CREATE TABLE IF NOT EXISTS delegated_owners(
     added_at TEXT
 )
 """)
+# نائب المالك رتبة مستقلة عن المالك المفوّض، مع بقاء صلاحياته قابلة للتحكم.
+db.execute("""
+CREATE TABLE IF NOT EXISTS deputy_owners(
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    added_at TEXT,
+    display_name TEXT DEFAULT '',
+    username TEXT DEFAULT ''
+)
+""")
 # Store a display name when Telegram has made it available.
 cols = {r[1] for r in db.execute("PRAGMA table_info(delegated_owners)").fetchall()}
 if "display_name" not in cols:
@@ -1259,15 +1269,32 @@ async def accessible_groups(bot, uid):
             allowed.append((chat_id, title))
     return allowed
 
+def is_deputy_owner(uid):
+    """رتبة نائب المالك المستقلة؛ لا تعني امتلاك البوت أو تغيير المالك الأساسي."""
+    return is_owner(uid) or bool(db.execute(
+        "SELECT 1 FROM deputy_owners WHERE user_id=?", (uid,)
+    ).fetchone())
+
+
 def is_delegated_owner(uid):
+    """المالك المفوّض فقط؛ نائب المالك رتبة مستقلة ولا يرث صلاحيات المفوّض تلقائيًا."""
     return is_owner(uid) or bool(db.execute(
         "SELECT 1 FROM delegated_owners WHERE user_id=?", (uid,)
     ).fetchone())
 
 
+def can_manage_external_groups(uid):
+    """المالك الأساسي دائمًا؛ النائب أو المفوّض يحتاجان منح external_groups صراحةً."""
+    if is_owner(uid):
+        return True
+    if not (is_delegated_owner(uid) or is_deputy_owner(uid)):
+        return False
+    return can_use_capability(uid, "external_groups", 0)
+
+
 def can_manage_delegates(uid):
-    """إدارة المفوضين للمالك الأساسي أو لنائب منحته هذه الصلاحية صراحةً.
-    لا تسمح هذه الصلاحية بتعديل المالك الأساسي أو منح صاحبها صلاحيات لنفسه.
+    """المالك الأساسي أو المالك المفوّض الذي مُنح صلاحية إدارة المفوّضين صراحةً.
+    لا تسمح هذه الصلاحية بإدارة نواب المالك أو تغيير المالك الأساسي.
     """
     if is_owner(uid):
         return True
@@ -1304,8 +1331,10 @@ def can_manage_security(uid):
 def role_name(uid):
     if is_owner(uid):
         return "👑 المالك الأساسي"
+    if is_deputy_owner(uid) and not is_owner(uid):
+        return "👑 نائب المالك"
     if is_delegated_owner(uid):
-        return "👑 مالك مفوّض"
+        return "🛡️ المالك المفوّض"
     if is_general_manager(uid):
         return "🔨 مدير عام"
     if is_protection_manager(uid):
@@ -1729,6 +1758,7 @@ STAFF_CAPABILITY_LABELS = {
     "message_lock": "🔒 صلاحية قفل وفتح الرسائل",
     "reentry": "🚫 مراجعة المطرودين وطلبات العودة",
     "join_approval": "✅ الموافقة على انضمام الأعضاء",
+    "external_groups": "🌐 إدارة القروبات الخارجية",
 }
 
 
@@ -1915,7 +1945,7 @@ def panel_markup(uid):
         if can_use_capability(uid, "security_review"):
             delegated_rows.append([InlineKeyboardButton("🛡️ المراجعة الأمنية", callback_data="security_review_latest")])
         if can_manage_delegates(uid):
-            delegated_rows.append([InlineKeyboardButton("👑 إدارة المفوضين ومنحهم/عزلهم", callback_data="delegated_owner")])
+            delegated_rows.append([InlineKeyboardButton("🛡️ إدارة المالك المفوّض", callback_data="delegated_owner")])
         delegated_rows.append([InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center")])
         if can_use_capability(uid, "message_lock") or capability_group_ids(uid, "message_lock"):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
@@ -1993,13 +2023,15 @@ def panel_markup(uid):
         [InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="staff_permissions")],
         [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
         [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
-        [InlineKeyboardButton("👑 نائب المالك وإدارة الصلاحيات", callback_data="delegated_owner"), InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
+        [InlineKeyboardButton("👑 إدارة نائب المالك", callback_data="deputy_owner_manage"), InlineKeyboardButton("🛡️ إدارة المالك المفوّض", callback_data="delegated_owner")],
+        [InlineKeyboardButton("💾 النسخ الاحتياطي", callback_data="owner_backup")],
         [InlineKeyboardButton("⚠️ الإنذارات التفاعلية", callback_data="warnings_center"), InlineKeyboardButton("📨 سجل التحويلات والملفات", callback_data="archive")],
         [InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
+    if is_owner(uid) or can_manage_external_groups(uid):
+        owner_rows.append([InlineKeyboardButton("🌐 إدارة القروبات الخارجية", callback_data="external_groups")])
     if is_owner(uid):
-        owner_rows.append([InlineKeyboardButton("🌐 إدارة القروبات الخارجية", callback_data="external_groups"),
-                           InlineKeyboardButton("🆘 صندوق الدعم الفني", callback_data="external_support_inbox")])
+        owner_rows.append([InlineKeyboardButton("🆘 صندوق الدعم الفني", callback_data="external_support_inbox")])
         owner_rows.append([InlineKeyboardButton("🚫 الحظر الجماعي", callback_data="massban_menu"),
                            InlineKeyboardButton("🛡️ المراجعة الأمنية الأسبوعية", callback_data="security_review_latest")])
         owner_rows.append([InlineKeyboardButton("🔄 إدارة تحديثات البوت", callback_data="update_manager")])
@@ -2206,6 +2238,45 @@ async def process_private_workflows(update, context):
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
     raw = (msg.text or "").strip()
+    # Button-driven deputy-owner workflow: only the primary owner can add a deputy.
+    if context.user_data.get("awaiting_deputy_owner_id"):
+        if not is_owner(user.id):
+            context.user_data.pop("awaiting_deputy_owner_id", None)
+            await msg.reply_text("⛔ إضافة نائب المالك للمالك الأساسي فقط.")
+            return
+        if raw.lower() == "/cancel":
+            context.user_data.pop("awaiting_deputy_owner_id", None)
+            await msg.reply_text("تم إلغاء إضافة نائب المالك.")
+            return
+        if not raw.isdigit() or int(raw) <= 0:
+            await msg.reply_text("أرسل رقم المستخدم فقط، أو استخدم زر العودة لإلغاء العملية.")
+            return
+        target_uid = int(raw)
+        if target_uid == OWNER_ID:
+            await msg.reply_text("هذا الحساب هو المالك الأساسي بالفعل.")
+            return
+        if db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await msg.reply_text("هذا المستخدم مسجل بالفعل بصفة المالك المفوّض. لا يمكن جمع الرتبتين في الحساب نفسه؛ أزل رتبته الحالية أولًا إن أردت تغييره.")
+            return
+        try:
+            target_chat = await context.bot.get_chat(target_uid)
+            if getattr(target_chat, "is_bot", False):
+                await msg.reply_text("لا يمكن تعيين حساب بوت كنائب للمالك.")
+                return
+            display_name = getattr(target_chat, "full_name", "") or getattr(target_chat, "first_name", "") or ""
+            username = getattr(target_chat, "username", "") or ""
+        except Exception:
+            display_name, username = "", ""
+        db.execute("""INSERT INTO deputy_owners(user_id,added_by,added_at,display_name,username) VALUES(?,?,?,?,?)
+                      ON CONFLICT(user_id) DO UPDATE SET added_by=excluded.added_by, added_at=excluded.added_at,
+                      display_name=CASE WHEN excluded.display_name!='' THEN excluded.display_name ELSE deputy_owners.display_name END,
+                      username=CASE WHEN excluded.username!='' THEN excluded.username ELSE deputy_owners.username END""",
+                   (target_uid, user.id, now(), display_name, username))
+        db.commit()
+        context.user_data.pop("awaiting_deputy_owner_id", None)
+        log_action(0, user.id, "deputy_owner_added", f"target={target_uid}")
+        await msg.reply_text(f"✅ تم تعيين {display_name or 'المستخدم'} نائبًا للمالك.\nID: {target_uid}\n👑 الرتبة: نائب المالك\nصلاحيات القروبات الخارجية غير ممنوحة تلقائيًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ إدارة الصلاحيات", callback_data=f"deputy_manage:{target_uid}")], [InlineKeyboardButton("👑 قائمة نواب المالك", callback_data="deputy_owner_manage")]]))
+        return
     # Status commands must remain commands even while another private workflow is waiting.
     if _is_aistatus_alias(raw):
         return
@@ -2314,7 +2385,7 @@ async def process_private_workflows(update, context):
         "external_support_state", "mass_ban_state", "support_reply_ticket_id",
         "awaiting_calendar_search", "owner_autoreply_state",
         "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast",
-        "awaiting_broadcast", "awaiting_delegated_owner_id", "awaiting_staff_permissions_id",
+        "awaiting_broadcast", "awaiting_delegated_owner_id", "awaiting_deputy_owner_id", "awaiting_staff_permissions_id",
         "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search",
         "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_appeal_state",
         "staff_inquiry_state", "staff_badge_state"
@@ -2468,7 +2539,7 @@ async def process_private_workflows(update, context):
     # Prevent other private-text handlers from also treating workflow messages as assistant prompts.
     if (context.user_data.get("staff_task_state") or context.user_data.get("staff_shift_state") or context.user_data.get("staff_appeal_state") or context.user_data.get("staff_inquiry_state") or context.user_data.get("staff_badge_state") or context.user_data.get("inquiry_reply_id") or context.user_data.get("awaiting_general_inquiry")
         or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("owner_autoreply_state")
-        or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id") or context.user_data.get("awaiting_staff_permissions_id")
+        or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_delegated_owner_id") or context.user_data.get("awaiting_deputy_owner_id") or context.user_data.get("awaiting_staff_permissions_id")
         or context.user_data.get("awaiting_admin_action")):
         context.user_data["_skip_assistant_private_message_id"] = msg.message_id
     # Allow the owner/delegated owner to award a badge directly with ID|badge|reason,
@@ -2483,6 +2554,7 @@ async def process_private_workflows(update, context):
             and not context.user_data.get("owner_autoreply_state")
             and not context.user_data.get("awaiting_broadcast")
             and not context.user_data.get("awaiting_delegated_owner_id")
+            and not context.user_data.get("awaiting_deputy_owner_id")
             and not context.user_data.get("awaiting_staff_permissions_id")
             and not context.user_data.get("awaiting_admin_action")
             and not context.user_data.get("staff_badge_state")
@@ -3501,6 +3573,7 @@ async def help_cmd(update, context):
         text += (
             "\n\n👑 أوامر المالك الأساسي فقط:\n"
             "/addowner — إضافة مالك مفوض\n/delowner — إزالة مالك مفوض\n"
+            "/adddeputy — إضافة نائب مالك مستقل\n/deldeputy — عزل نائب المالك\n"
         "رفع مشرف / رفع مشرف عام / رفع مدير / رفع مدير عام — بالرد على العضو\n"
         "تنزيل رتبة — بالرد على العضو\n"
             "/addmanager — إضافة مدير عام\n/delmanager — إزالة مدير عام\n"
@@ -3585,6 +3658,50 @@ async def panel(update, context):
     )
     await update.effective_message.reply_text(panel_intro, reply_markup=panel_markup(uid))
 
+async def adddeputy(update, context):
+    """إضافة نائب مالك مستقل: /adddeputy USER_ID أو بالرد على العضو. المالك الأساسي فقط."""
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ إضافة نائب المالك للمالك الأساسي فقط."); return
+    target = target_from_update(update, context)
+    if not target:
+        await update.effective_message.reply_text("الاستخدام: /adddeputy USER_ID أو بالرد على العضو."); return
+    uid = target.id if hasattr(target, "id") else int(target)
+    if uid == OWNER_ID:
+        await update.effective_message.reply_text("هذا الحساب هو المالك الأساسي بالفعل."); return
+    if db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (uid,)).fetchone():
+        await update.effective_message.reply_text("هذا المستخدم مسجل بالفعل كمالك مفوّض؛ أزل رتبته الحالية أولًا قبل تعيينه نائبًا للمالك."); return
+    name = target.full_name if hasattr(target, "full_name") else user_display_name(uid)
+    username = getattr(target, "username", "") or ""
+    db.execute("""INSERT INTO deputy_owners(user_id,added_by,added_at,display_name,username)
+                  VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET added_by=excluded.added_by,
+                  added_at=excluded.added_at,display_name=excluded.display_name,username=excluded.username""",
+               (uid, update.effective_user.id, now(), name, username))
+    db.commit()
+    await update.effective_message.reply_text(
+        f"✅ تم تعيين {name} نائبًا للمالك (ID: {uid}).\n"
+        "👑 الرتبة الظاهرة: نائب المالك.\n"
+        "🌐 إدارة القروبات الخارجية غير مفعلة له تلقائيًا؛ امنحها عند الحاجة عبر /grantcap USER_ID external_groups all.\n"
+        "🔒 لا يملك صلاحية تغيير المالك الأساسي أو نقل ملكية البوت."
+    )
+
+
+async def deldeputy(update, context):
+    """عزل نائب المالك وسحب صلاحياته المركزية الخاصة."""
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ عزل نائب المالك للمالك الأساسي فقط."); return
+    target = target_from_update(update, context)
+    if not target:
+        await update.effective_message.reply_text("الاستخدام: /deldeputy USER_ID أو بالرد على العضو."); return
+    uid = target.id if hasattr(target, "id") else int(target)
+    if uid == OWNER_ID:
+        await update.effective_message.reply_text("لا يمكن عزل المالك الأساسي."); return
+    db.execute("DELETE FROM deputy_owners WHERE user_id=?", (uid,))
+    db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability='external_groups'", (uid,))
+    db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability='external_groups'", (uid,))
+    db.commit()
+    await update.effective_message.reply_text(f"✅ تم عزل نائب المالك {user_display_name(uid)} وسحب صلاحية إدارة القروبات الخارجية.")
+
+
 async def addowner(update, context):
     if not can_manage_delegates(update.effective_user.id):
         await update.effective_message.reply_text("⛔ تحتاج صلاحية إدارة المفوضين من المالك الأساسي.")
@@ -3596,6 +3713,9 @@ async def addowner(update, context):
     uid = target.id if hasattr(target, "id") else target
     if uid == OWNER_ID:
         await update.effective_message.reply_text("هذا الحساب هو المالك الأساسي بالفعل.")
+        return
+    if db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (uid,)).fetchone():
+        await update.effective_message.reply_text("هذا المستخدم مسجل بالفعل كنائب للمالك؛ أزل رتبته الحالية أولًا قبل تعيينه مالكًا مفوّضًا.")
         return
     name = target.full_name if hasattr(target, "full_name") else ""
     username = target.username if hasattr(target, "username") and target.username else ""
@@ -3705,6 +3825,7 @@ async def grantcap(update, context):
     if len(context.args) < 3:
         await update.effective_message.reply_text(
             "الاستخدام:\n/grantcap USER_ID publish all|CHAT_ID\n"
+        "/grantcap USER_ID external_groups all — إدارة القروبات الخارجية\n"
             "/grantcap USER_ID tag all|CHAT_ID\n/grantcap USER_ID protection all|CHAT_ID\n"
             "/grantcap USER_ID stats all|CHAT_ID\n/grantcap USER_ID ai all|CHAT_ID\n"
             "/grantcap USER_ID join_approval all|CHAT_ID\n\n"
@@ -3716,8 +3837,10 @@ async def grantcap(update, context):
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval."); return
+    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval", "external_groups"}:
+        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval أو external_groups."); return
+    if capability == "external_groups" and context.args[2].lower() != "all":
+        await update.effective_message.reply_text("صلاحية القروبات الخارجية تُمنح على النطاق all فقط."); return
     raw_scope = context.args[2].lower()
     if raw_scope == "all":
         scope = 0
@@ -3738,7 +3861,7 @@ async def grantcap(update, context):
                 (target, capability, scope, uid, now()))
     db.commit()
     log_action(scope, uid, "staff_capability_granted", f"target={target}; capability={capability}; scope={scope}")
-    labels = {"publish":"النشر والإعلانات", "tag":"استدعاء التاق", "protection":"أوامر الحماية", "stats":"الإحصائيات", "ai":"تحليل الذكاء الاصطناعي", "join_approval":"إدارة الموافقة على الدخول"}
+    labels = {"publish":"النشر والإعلانات", "tag":"استدعاء التاق", "protection":"أوامر الحماية", "stats":"الإحصائيات", "ai":"تحليل الذكاء الاصطناعي", "join_approval":"إدارة الموافقة على الدخول", "external_groups":"إدارة القروبات الخارجية"}
     await update.effective_message.reply_text(f"✅ مُنحت صلاحية {labels[capability]} للعضو {target}.\n📍 النطاق: {scope_label}\nيمكن سحبها بالأمر /revokecap.")
 
 
@@ -3753,9 +3876,11 @@ async def revokecap(update, context):
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval."); return
+    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval", "external_groups"}:
+        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval أو external_groups."); return
     raw_scope = context.args[2].lower()
+    if capability == "external_groups" and raw_scope != "all":
+        await update.effective_message.reply_text("استخدم all لسحب صلاحية القروبات الخارجية."); return
     if raw_scope == "all":
         db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability=?", (target, capability))
         db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability=?", (target, capability))
@@ -5770,6 +5895,9 @@ async def broadcast_draft_message(update, context):
         if target_uid <= 0 or target_uid == OWNER_ID:
             await msg.reply_text("❌ رقم غير صالح أو هذا الحساب هو المالك الأساسي بالفعل.")
             return
+        if db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await msg.reply_text("هذا المستخدم مسجل بالفعل كنائب للمالك؛ أزل رتبته الحالية أولًا قبل تعيينه مالكًا مفوّضًا.")
+            return
         try:
             target_chat = await context.bot.get_chat(target_uid)
             if getattr(target_chat, "is_bot", False):
@@ -6492,6 +6620,8 @@ async def callback(update, context):
             if exists:
                 db.execute("DELETE FROM delegated_owners WHERE user_id=?", (target_uid,))
                 action = "تم سحب صفة المالك المفوّض"
+            elif db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
+                await safe_callback_answer(q, "المستخدم نائب للمالك بالفعل؛ أزل رتبته الحالية أولًا.", show_alert=True); return
             else:
                 db.execute("INSERT INTO delegated_owners(user_id,added_by,added_at,display_name,username) VALUES(?,?,?,?,?)", (target_uid,uid,now(),user_display_name(target_uid),""))
                 action = "تم منح صفة المالك المفوّض"
@@ -6741,14 +6871,91 @@ async def callback(update, context):
             await q.edit_message_text("لم تُجرَ مراجعة أمنية أسبوعية بعد. سيُرسل التقرير تلقائيًا في موعد المراجعة الأسبوعية.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
         await q.edit_message_text(f"🛡️ آخر مراجعة أمنية — {row[0]}\nوقت التقرير: {row[1]}\n\n{row[2][:3500]}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
-    # Owner-only external group control center: scoped features and remote kill switch.
-    if data == "external_groups":
+    if data == "deputy_owner_manage":
         if not is_owner(uid):
-            await safe_callback_answer(q, "إدارة القروبات الخارجية للمالك الأساسي فقط.", show_alert=True); return
+            await safe_callback_answer(q, "إدارة نواب المالك للمالك الأساسي فقط.", show_alert=True); return
+        deputies = db.execute("SELECT user_id,display_name,username FROM deputy_owners ORDER BY user_id").fetchall()
+        buttons = [[InlineKeyboardButton("➕ إضافة نائب المالك", callback_data="deputy_add_start")]]
+        for did, name, username in deputies[:40]:
+            label = (name or str(did))[:35]
+            buttons.append([InlineKeyboardButton(f"⚙️ {label} — الصلاحيات", callback_data=f"deputy_manage:{did}"), InlineKeyboardButton("🗑️ عزل", callback_data=f"deputy_remove:{did}")])
+        buttons.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        body = "👑 إدارة نائب المالك\n\n" + ("\n".join(f"• {html.escape(name or str(did))} (ID: {did})" + (f" — @{html.escape(un)}" if un else "") for did,name,un in deputies) if deputies else "لا يوجد نواب مضافون حاليًا.")
+        body += "\n\nالإضافة والعزل وتعديل الصلاحيات من الأزرار أدناه. صلاحية القروبات الخارجية غير مفعّلة تلقائيًا."
+        await q.edit_message_text(body[:3900], reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    if data == "deputy_add_start":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "إضافة نائب المالك للمالك الأساسي فقط.", show_alert=True); return
+        if q.message.chat.type != ChatType.PRIVATE:
+            await safe_callback_answer(q, "افتح لوحة الإدارة في الخاص مع البوت.", show_alert=True); return
+        context.user_data["awaiting_deputy_owner_id"] = True
+        await q.edit_message_text("➕ إضافة نائب المالك\n\nأرسل رقم المستخدم (User ID) في هذه المحادثة الخاصة.\nيمكنك إلغاء العملية من الزر أدناه.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء والعودة", callback_data="deputy_owner_manage")]])); return
+
+    if data.startswith("deputy_manage:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "تعديل صلاحيات نائب المالك للمالك الأساسي فقط.", show_alert=True); return
+        try: target_uid = int(data.split(":",1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q, "هذا المستخدم ليس نائبًا مسجلًا.", show_alert=True); return
+        ext = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='external_groups' AND chat_id=0", (target_uid,)).fetchone())
+        buttons = [[InlineKeyboardButton(("✅ سحب إدارة القروبات الخارجية" if ext else "⬜️ منح إدارة القروبات الخارجية"), callback_data=f"deputy_ext_toggle:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")]]
+        await q.edit_message_text(f"👑 صلاحيات نائب المالك\nالمستخدم: {user_display_name(target_uid)}\nID: {target_uid}\n\nإدارة القروبات الخارجية: {'ممنوحة' if ext else 'غير ممنوحة'}\n\nيمكن للمالك الأساسي منح هذه الصلاحية أو سحبها من الزر.", reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    if data.startswith("deputy_ext_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "المالك الأساسي فقط يستطيع تغيير الصلاحيات.", show_alert=True); return
+        try: target_uid = int(data.split(":",1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q, "هذا المستخدم ليس نائبًا مسجلًا.", show_alert=True); return
+        exists = db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='external_groups' AND chat_id=0", (target_uid,)).fetchone()
+        if exists:
+            db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability='external_groups'", (target_uid,))
+            db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability='external_groups'", (target_uid,))
+            action = "سحب صلاحية إدارة القروبات الخارجية"
+        else:
+            db.execute("INSERT OR REPLACE INTO staff_capabilities(user_id,capability,chat_id,granted_by,granted_at) VALUES(?, 'external_groups', 0, ?, ?)", (target_uid, uid, now()))
+            action = "منح صلاحية إدارة القروبات الخارجية"
+        db.commit()
+        log_action(0, uid, "deputy_external_groups_permission_changed", f"target={target_uid}; action={action}")
+        await safe_callback_answer(q, action)
+        ext = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='external_groups' AND chat_id=0", (target_uid,)).fetchone())
+        buttons = [[InlineKeyboardButton(("✅ سحب إدارة القروبات الخارجية" if ext else "⬜️ منح إدارة القروبات الخارجية"), callback_data=f"deputy_ext_toggle:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")]]
+        await q.edit_message_text(f"👑 صلاحيات نائب المالك\nالمستخدم: {user_display_name(target_uid)}\nID: {target_uid}\n\nإدارة القروبات الخارجية: {'ممنوحة' if ext else 'غير ممنوحة'}", reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    if data.startswith("deputy_remove:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "عزل نائب المالك للمالك الأساسي فقط.", show_alert=True); return
+        try: target_uid = int(data.split(":",1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
+        if target_uid == OWNER_ID:
+            await safe_callback_answer(q, "لا يمكن عزل المالك الأساسي.", show_alert=True); return
+        db.execute("DELETE FROM deputy_owners WHERE user_id=?", (target_uid,))
+        db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability='external_groups'", (target_uid,))
+        db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability='external_groups'", (target_uid,))
+        db.commit()
+        log_action(0, uid, "deputy_owner_removed", f"target={target_uid}")
+        await safe_callback_answer(q, "تم عزل نائب المالك وسحب صلاحياته.")
+        deputies = db.execute("SELECT user_id,display_name,username FROM deputy_owners ORDER BY user_id").fetchall()
+        buttons = [[InlineKeyboardButton("➕ إضافة نائب المالك", callback_data="deputy_add_start")]]
+        for did, name, username in deputies[:40]:
+            buttons.append([InlineKeyboardButton(f"⚙️ {(name or str(did))[:35]} — الصلاحيات", callback_data=f"deputy_manage:{did}"), InlineKeyboardButton("🗑️ عزل", callback_data=f"deputy_remove:{did}")])
+        buttons.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+        await q.edit_message_text("👑 إدارة نائب المالك\n\nتم تحديث القائمة.", reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    # External group control center: owner or users explicitly granted external_groups.
+    if data == "external_groups":
+        if not can_manage_external_groups(uid):
+            await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
         await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا لعرض معلوماته، وصلاحياته المتاحة، وحالة تفعيله. الذكاء الاصطناعي معطل افتراضيًا للقروبات الخارجية.", reply_markup=external_groups_markup()); return
     if data.startswith("external_group:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
+        if not can_manage_external_groups(uid):
+            await safe_callback_answer(q, "غير مصرح لك بإدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         row = db.execute("""SELECT e.title,e.enabled,e.ai_enabled,e.added_by,e.added_by_name,e.added_by_username,e.created_at
@@ -6773,7 +6980,7 @@ async def callback(update, context):
                 f"حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي: {'مفعّل يدويًا' if ai_enabled else 'معطّل افتراضيًا'}\n\nالصلاحيات المتاحة:\n{cap_text}")
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data.startswith("external_toggle:"):
-        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True); return
         row = db.execute("SELECT enabled FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
@@ -6791,7 +6998,7 @@ async def callback(update, context):
         await safe_callback_answer(q, "تم إيقاف خدمات البوت عن القروب." if not new_enabled else "تم تفعيل البوت للقروب.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data.startswith("external_ai:"):
-        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف غير صحيح.", show_alert=True); return
         row = db.execute("SELECT ai_enabled FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
@@ -6804,7 +7011,7 @@ async def callback(update, context):
         db.commit(); log_action(ext_chat_id, uid, "external_ai_permission", f"enabled={enabled}")
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data.startswith("external_cap:"):
-        if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
+        if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: _, cid_raw, cap = data.split(":",2); ext_chat_id = int(cid_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         if cap not in EXTERNAL_CAPABILITY_LABELS or cap == "ai":
@@ -9219,7 +9426,7 @@ async def callback(update, context):
             await q.edit_message_text("⛔ إدارة المفوضين تتطلب تفويضًا صريحًا من المالك الأساسي.")
             return
         rows = db.execute("SELECT user_id,display_name,username FROM delegated_owners ORDER BY user_id").fetchall()
-        text = "👑 المالكون المفوّضون وصلاحيات النشر\n\n"
+        text = "🛡️ المالك المفوّض — إدارة الصلاحيات\n\n"
         text += "\n".join(f"• {name or 'اسم غير معروف'}" + (f" (@{username})" if username else "") + f" — ID: {user_id}" for user_id,name,username in rows) if rows else "لا يوجد مالكون مفوّضون."
         text += "\n\nاختر مالكًا مفوضًا لإدارة صلاحياته. الإضافة والعزل تتمان من هذه اللوحة في الخاص."
         buttons = [[InlineKeyboardButton(f"⚙️ {name or user_id} — الصلاحيات", callback_data=f"delegated_manage:{user_id}")] for user_id,name,_ in rows[:30]]
@@ -9266,7 +9473,7 @@ async def callback(update, context):
         # Keep the legacy publish-permission editor available for older deployments/data.
         buttons.append([InlineKeyboardButton("📢 إدارة نطاق النشر بالتفصيل", callback_data=f"delegated_publish_legacy:{target_uid}")])
         buttons += [[InlineKeyboardButton("🛑 عزل هذا المالك المفوض", callback_data=f"delegated_remove_confirm:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة المالكين", callback_data="delegated_owner")]]
-        await q.edit_message_text(f"👑 إدارة صلاحيات المالك المفوض\nالاسم: {user_display_name(target_uid)}\n\nاختر كل صلاحية على حدة لمنحها أو سحبها. الصلاحية العامة تشمل القروبات الحالية والمستقبلية، ويمكن تخصيص قروبات من زر النطاق.\n✅ ممنوحة  |  ⬜️ غير ممنوحة", reply_markup=InlineKeyboardMarkup(buttons))
+        await q.edit_message_text(f"🛡️ إدارة صلاحيات المالك المفوّض\nالاسم: {user_display_name(target_uid)}\n\nاختر كل صلاحية على حدة لمنحها أو سحبها. الصلاحية العامة تشمل القروبات الحالية والمستقبلية، ويمكن تخصيص قروبات من زر النطاق.\n✅ ممنوحة  |  ⬜️ غير ممنوحة", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if data.startswith("delegate_admin_toggle:"):
@@ -10108,6 +10315,7 @@ def main():
         "task": assistant_task_cmd, "tasks": assistant_tasks_cmd, "donetask": assistant_done_task_cmd, "deltask": assistant_delete_task_cmd,
         "expense": assistant_expense_cmd, "expenses": assistant_expenses_cmd, "summarize": assistant_summarize_cmd, "quiz": assistant_quiz_cmd,
         "addowner": addowner, "delowner": delowner, "owners": owners_cmd,
+        "adddeputy": adddeputy, "deldeputy": deldeputy,
         "grantpublish": grantpublish, "revokepublish": revokepublish,
         "grantcap": grantcap, "revokecap": revokecap, "groupreport": groupreport_cmd, "aistatus": aistatus_cmd,
         "addchannel": addchannel_cmd, "delchannel": delchannel_cmd, "channels": channels_cmd,
