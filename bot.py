@@ -6900,9 +6900,79 @@ async def callback(update, context):
             await safe_callback_answer(q, "رقم المستخدم غير صحيح.", show_alert=True); return
         if not db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
             await safe_callback_answer(q, "هذا المستخدم ليس نائبًا مسجلًا.", show_alert=True); return
-        ext = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='external_groups' AND chat_id=0", (target_uid,)).fetchone())
-        buttons = [[InlineKeyboardButton(("✅ سحب إدارة القروبات الخارجية" if ext else "⬜️ منح إدارة القروبات الخارجية"), callback_data=f"deputy_ext_toggle:{target_uid}")], [InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")]]
-        await q.edit_message_text(f"👑 صلاحيات نائب المالك\nالمستخدم: {user_display_name(target_uid)}\nID: {target_uid}\n\nإدارة القروبات الخارجية: {'ممنوحة' if ext else 'غير ممنوحة'}\n\nيمكن للمالك الأساسي منح هذه الصلاحية أو سحبها من الزر.", reply_markup=InlineKeyboardMarkup(buttons)); return
+        buttons = []
+        granted_caps = set(row[0] for row in db.execute(
+            "SELECT capability FROM staff_capabilities WHERE user_id=? AND chat_id=0", (target_uid,)
+        ).fetchall())
+        for cap, label in STAFF_CAPABILITY_LABELS.items():
+            granted = cap in granted_caps
+            buttons.append([InlineKeyboardButton(
+                ("✅ " if granted else "⬜️ ") + label,
+                callback_data=f"deputy_cap_toggle:{target_uid}:{cap}"
+            )])
+        buttons.append([InlineKeyboardButton("📍 إدارة صلاحيات قروب محدد", callback_data=f"staffgroups:{target_uid}")])
+        buttons.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"deputy_manage:{target_uid}"),
+                        InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")])
+        status = "\\n".join(
+            f"• {label}: {'ممنوحة' if cap in granted_caps else 'غير ممنوحة'}"
+            for cap, label in STAFF_CAPABILITY_LABELS.items()
+        )
+        await q.edit_message_text(
+            f"🛡️ صلاحيات نائب المالك\\nالمستخدم: {user_display_name(target_uid)}\\nID: {target_uid}\\n\\n{status}\\n\\n"
+            "اضغط على أي صلاحية لمنحها أو سحبها. تُحفظ التغييرات مباشرةً.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        ); return
+
+    if data.startswith("deputy_cap_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "المالك الأساسي فقط يستطيع تغيير صلاحيات نائب المالك.", show_alert=True); return
+        try:
+            _, target_text, cap = data.split(":", 2)
+            target_uid = int(target_text)
+        except (ValueError, TypeError):
+            await safe_callback_answer(q, "بيانات الصلاحية غير صحيحة.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM deputy_owners WHERE user_id=?", (target_uid,)).fetchone():
+            await safe_callback_answer(q, "هذا المستخدم ليس نائبًا مسجلًا.", show_alert=True); return
+        if cap not in STAFF_CAPABILITY_LABELS:
+            await safe_callback_answer(q, "هذه الصلاحية غير معروفة.", show_alert=True); return
+        exists = db.execute(
+            "SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability=? AND chat_id=0",
+            (target_uid, cap)
+        ).fetchone()
+        if exists:
+            db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability=?", (target_uid, cap))
+            db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability=?", (target_uid, cap))
+            action = "تم سحب"
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO staff_capabilities(user_id,capability,chat_id,granted_by,granted_at) VALUES(?,?,?,?,?)",
+                (target_uid, cap, 0, uid, now())
+            )
+            action = "تم منح"
+        db.commit()
+        log_action(0, uid, "deputy_capability_changed", f"target={target_uid}; capability={cap}; action={action}")
+        await safe_callback_answer(q, f"{action} الصلاحية.")
+        buttons = []
+        granted_caps = set(row[0] for row in db.execute(
+            "SELECT capability FROM staff_capabilities WHERE user_id=? AND chat_id=0", (target_uid,)
+        ).fetchall())
+        for item_cap, label in STAFF_CAPABILITY_LABELS.items():
+            buttons.append([InlineKeyboardButton(
+                ("✅ " if item_cap in granted_caps else "⬜️ ") + label,
+                callback_data=f"deputy_cap_toggle:{target_uid}:{item_cap}"
+            )])
+        buttons.append([InlineKeyboardButton("📍 إدارة صلاحيات قروب محدد", callback_data=f"staffgroups:{target_uid}")])
+        buttons.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"deputy_manage:{target_uid}"),
+                        InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")])
+        status = "\\n".join(
+            f"• {label}: {'ممنوحة' if item_cap in granted_caps else 'غير ممنوحة'}"
+            for item_cap, label in STAFF_CAPABILITY_LABELS.items()
+        )
+        await q.edit_message_text(
+            f"🛡️ صلاحيات نائب المالك\\nالمستخدم: {user_display_name(target_uid)}\\nID: {target_uid}\\n\\n{status}\\n\\n"
+            "اضغط على أي صلاحية لمنحها أو سحبها. تُحفظ التغييرات مباشرةً.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        ); return
 
     if data.startswith("deputy_ext_toggle:"):
         if not is_owner(uid):
