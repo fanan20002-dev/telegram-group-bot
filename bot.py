@@ -9,6 +9,7 @@ import uuid
 import time
 import random
 import json
+from difflib import SequenceMatcher
 import calendar as pycalendar
 import html
 import io
@@ -488,6 +489,24 @@ CREATE TABLE IF NOT EXISTS welcome_messages(
 )
 """)
 db.execute("""
+CREATE TABLE IF NOT EXISTS welcome_sent_events(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,user_id)
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS group_member_numbers(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    member_number INTEGER NOT NULL,
+    PRIMARY KEY(chat_id,user_id),
+    UNIQUE(chat_id,member_number)
+)
+""")
+db.execute("""
 CREATE TABLE IF NOT EXISTS notification_preferences(
     user_id INTEGER NOT NULL,
     event TEXT NOT NULL,
@@ -650,6 +669,13 @@ db.execute("""CREATE TABLE IF NOT EXISTS motivation_posts(
     posted_at TEXT NOT NULL,
     error TEXT NOT NULL DEFAULT '',
     UNIQUE(draft_id, chat_id)
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS motivation_content_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_normalized TEXT NOT NULL UNIQUE,
+    content TEXT NOT NULL,
+    content_date TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
 )""")
 db.execute("""CREATE TABLE IF NOT EXISTS group_feature_settings(
     chat_id INTEGER PRIMARY KEY,
@@ -1249,7 +1275,8 @@ async def can_access_group(bot, uid, chat_id):
         return False
     if is_owner(uid):
         return True
-    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+    if (is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
+            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
         return True
     if group_role(chat_id, uid):
         try:
@@ -1261,7 +1288,8 @@ async def can_access_group(bot, uid, chat_id):
 
 async def accessible_groups(bot, uid):
     groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-    if is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+    if (is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
+            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
         return groups
     allowed = []
     for chat_id, title in groups:
@@ -1794,6 +1822,7 @@ def unified_permissions_markup(target_uid):
         rows.append([InlineKeyboardButton(("✅ " if granted else "⬜ ") + label + " — جميع القروبات", callback_data=f"unifiedcap:{target_uid}:{cap}")])
     archive_granted = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='archive' AND chat_id=0", (target_uid,)).fetchone())
     rows.append([InlineKeyboardButton(("✅ " if archive_granted else "⬜ ") + "📨 سجل التحويلات والملفات — جميع القروبات", callback_data=f"unifiedcap:{target_uid}:archive")])
+    rows.append([InlineKeyboardButton("✅ منح جميع الصلاحيات التشغيلية", callback_data=f"unifiedall:{target_uid}")])
     rows.append([InlineKeyboardButton("📍 تحديد الصلاحيات حسب القروب", callback_data=f"unifiedgroups:{target_uid}")])
     rows.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"unifiedmanage:{target_uid}"), InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -3003,6 +3032,50 @@ async def ai_cmd(update, context):
     await msg.reply_text("استخدم /ai في الخاص أو داخل قروب مسجل ومصرح به.")
 
 
+async def get_verified_active_watched_groups(bot, limit=None):
+    """Return only groups where Telegram confirms this bot is still a member.
+    Definitive left/kicked status removes the group from active selection. Transient
+    API/network failures are not treated as removal and never erase historical settings.
+    """
+    rows = db.execute(
+        "SELECT chat_id, COALESCE(NULLIF(title,''), CAST(chat_id AS TEXT)) "
+        "FROM watched_groups ORDER BY title COLLATE NOCASE"
+    ).fetchall()
+    try:
+        me = await bot.get_me()
+        bot_id = int(me.id)
+    except Exception as exc:
+        log.warning("Could not verify bot identity for active-group list: %s", exc)
+        return []
+    active = []
+    for cid, title in rows:
+        try:
+            member = await bot.get_chat_member(chat_id=int(cid), user_id=bot_id)
+            status = getattr(member, "status", "")
+            if status in ("left", "kicked"):
+                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
+                db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
+                db.commit()
+                continue
+            is_member = getattr(member, "is_member", True)
+            if status in ("member", "administrator", "creator") or (status == "restricted" and is_member):
+                active.append((int(cid), title))
+            else:
+                # Any confirmed non-membership state must not remain in active lists.
+                db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
+                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
+                db.commit()
+                log.info("Removed non-member group from active list: %s (%s), status=%s", title, cid, status)
+        except Exception as exc:
+            # Unknown/transient API errors must not delete configuration, but unverified
+            # groups are omitted from this particular selection list.
+            log.debug("Could not verify membership in group %s; omitted from active list: %s", cid, exc)
+            continue
+        if limit and len(active) >= limit:
+            break
+    return active
+
+
 async def aigroups_cmd(update, context):
     """Owner-only control: /aigroups all on|off, /aigroups CHAT_ID on|off, /aigroups list."""
     user = update.effective_user
@@ -3023,11 +3096,31 @@ async def aigroups_cmd(update, context):
         "عند التفعيل، يحاول البوت إرسال ترحيب مولّد بالذكاء الاصطناعي للقروب ويبلغك بالنتيجة."
     )
     if not args:
-        await msg.reply_text(usage)
+        active_groups = await get_verified_active_watched_groups(context.bot, limit=80)
+        rows = []
+        for cid, title in active_groups:
+            state = db.execute("SELECT COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0), COALESCE(e.is_external,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE w.chat_id=?", (cid,)).fetchone()
+            if state:
+                rows.append((cid, title, state[0], state[1]))
+        if not rows:
+            await msg.reply_text("لا توجد قروبات مسجلة حاليًا.")
+            return
+        buttons = []
+        for cid, title, enabled, is_external in rows[:80]:
+            state = "🟢 الذكاء يعمل" if enabled else "⚪️ الذكاء متوقف"
+            label = f"{state} | {title[:32]}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"ai_group_toggle:{int(cid)}")])
+        buttons.append([InlineKeyboardButton("🔄 تحديث القائمة", callback_data="ai_group_refresh"), InlineKeyboardButton("إغلاق", callback_data="home")])
+        await msg.reply_text("🤖 تشغيل وإيقاف الذكاء الاصطناعي للقروبات\nاضغط على اسم القروب لتبديل الحالة. التغيير خاص بالقروب المحدد.", reply_markup=InlineKeyboardMarkup(buttons))
         return
     mode = args[0].lower()
     if mode == "list":
-        rows = db.execute("SELECT w.chat_id, COALESCE(w.title,''), COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0), COALESCE(e.is_external,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id ORDER BY w.title").fetchall()
+        active_groups = await get_verified_active_watched_groups(context.bot, limit=100)
+        rows = []
+        for cid, title in active_groups:
+            state = db.execute("SELECT COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0), COALESCE(e.is_external,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE w.chat_id=?", (cid,)).fetchone()
+            if state:
+                rows.append((cid, title, state[0], state[1]))
         if not rows:
             await msg.reply_text("لا توجد قروبات مسجلة حاليًا.")
             return
@@ -3836,9 +3929,11 @@ async def grantcap(update, context):
         target = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
+    if target <= 0 or target == OWNER_ID:
+        await update.effective_message.reply_text("لا يمكن تعديل صلاحيات حساب المالك الأساسي بهذه الأوامر."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval", "external_groups"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval أو external_groups."); return
+    if capability not in STAFF_CAPABILITY_LABELS:
+        await update.effective_message.reply_text("الصلاحية غير معروفة. استخدم أحد مفاتيح الصلاحيات المعروضة في لوحة توزيع الصلاحيات."); return
     if capability == "external_groups" and context.args[2].lower() != "all":
         await update.effective_message.reply_text("صلاحية القروبات الخارجية تُمنح على النطاق all فقط."); return
     raw_scope = context.args[2].lower()
@@ -3875,9 +3970,11 @@ async def revokecap(update, context):
     try: target = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text("رقم المستخدم غير صحيح."); return
+    if target <= 0 or target == OWNER_ID:
+        await update.effective_message.reply_text("لا يمكن تعديل صلاحيات حساب المالك الأساسي بهذه الأوامر."); return
     capability = context.args[1].lower()
-    if capability not in {"publish", "tag", "protection", "stats", "ai", "join_approval", "external_groups"}:
-        await update.effective_message.reply_text("الصلاحية: publish أو tag أو protection أو stats أو ai أو join_approval أو external_groups."); return
+    if capability not in STAFF_CAPABILITY_LABELS:
+        await update.effective_message.reply_text("الصلاحية غير معروفة. استخدم أحد مفاتيح الصلاحيات المعروضة في لوحة توزيع الصلاحيات."); return
     raw_scope = context.args[2].lower()
     if capability == "external_groups" and raw_scope != "all":
         await update.effective_message.reply_text("استخدم all لسحب صلاحية القروبات الخارجية."); return
@@ -4535,6 +4632,12 @@ async def ArabicTextCommand(update, context):
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     text = (update.effective_message.text or "").strip().lower()
+    # Reply with the sender's actual registered role when they ask in a group.
+    # This is deliberately checked before other Arabic text commands.
+    normalized_role_query = re.sub(r"[؟?!،,.]+$", "", text).strip()
+    if normalized_role_query in {"رتبتي", "ما رتبتي", "وش رتبتي", "ماهي رتبتي", "ما هي رتبتي", "منصبي", "ما منصبي"}:
+        await update.effective_message.reply_text(f"🪪 رتبتك: {role_name(update.effective_user.id)}")
+        return
     if text in {"اعدادات", "إعدادات", "اعدادات البوت", "إعدادات البوت", "مساعدة", "اوامر البوت", "أوامر البوت"}:
         await public_settings(update, context)
         return
@@ -5524,8 +5627,10 @@ async def my_chat_member_handler(update, context):
         return
 
     if bot_left:
-        # Retain the group record for the owner's dashboard, but stop service until reviewed.
+        # Remove the group from active group lists immediately. Keep its historical
+        # configuration/audit rows intact so this cleanup does not damage other modules.
         db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (chat.id,))
         db.commit()
         actor_id = int(getattr(actor, "id", 0) or 0)
         log_action(chat.id, actor_id, "bot_removed_from_group", f"old={old_status}; new={new_status}")
@@ -5533,7 +5638,7 @@ async def my_chat_member_handler(update, context):
             "⚠️ تمت إزالة البوت من قروب؛ تم إيقاف خدماته لهذا القروب في السجل.\n"
             f"القروب: {(chat.title or str(chat.id))[:150]}\nالمعرّف: {chat.id}\n"
             f"الإجراء بواسطة: {(getattr(actor, 'full_name', '') or 'غير معروف')[:100]} (ID: {actor_id or 'غير معروف'})\n"
-            "يمكن للمالك الأساسي مراجعة القروب من أيقونة إدارة القروبات الخارجية."
+            "تم حذف القروب من قائمة القروبات النشطة والنشر تلقائيًا. ستبقى سجلاته التاريخية محفوظة."
         )
         await notify_owners(context, notice, "groups")
 
@@ -5543,7 +5648,11 @@ async def chat_member_handler(update, context):
     if not cm or not cm.chat:
         return
     chat_id = cm.chat.id
-    register_group(cm.chat, update.effective_user)
+    # Registration is driven by MY_CHAT_MEMBER when the bot itself is added.
+    # Ordinary member updates must not resurrect stale/unregistered groups in admin panels.
+    if db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+        db.execute("UPDATE watched_groups SET title=? WHERE chat_id=?", (cm.chat.title or "", chat_id))
+        db.commit()
     # Define transition values before using them in membership statistics.
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
@@ -5601,6 +5710,8 @@ async def chat_member_handler(update, context):
                     log.info("Join notice failed chat=%s user=%s: %s", chat_id, member.id, exc)
         elif old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
+            # Allow a fresh welcome if this same Telegram user genuinely joins again later.
+            db.execute("DELETE FROM welcome_sent_events WHERE chat_id=? AND user_id=?", (chat_id, member.id))
             db.commit()
             if group_feature_enabled(chat_id, "leave_notices_enabled"):
                 try:
@@ -5644,6 +5755,18 @@ async def chat_member_handler(update, context):
         )
         db.commit()
         log_action(chat_id, member.id, "member_join", member.full_name)
+        # Do not depend solely on Telegram's optional NEW_CHAT_MEMBERS service message.
+        # The chat_member update is sufficient to welcome the member; the database key
+        # prevents a duplicate if the service-message handler also fires.
+        try:
+            if external_group_cap_enabled(chat_id, "welcome"):
+                approval_row = db.execute(
+                    "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)
+                ).fetchone()
+                approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
+                await _send_member_welcome_with_bot_photo(context, cm.chat, member, approved=approved)
+        except Exception:
+            log.exception("WELCOME_CHAT_MEMBER_HANDLER_FAILED chat_id=%s member_id=%s", chat_id, member.id)
         await notify_owners(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
     if member and member.is_bot and member.id == context.bot.id and old in ("left", "kicked") and new in ("member", "administrator"):
         await notify_owners(context, f"📡 تمت إضافة البوت إلى مجموعة\nالمجموعة: {cm.chat.title or chat_id}\nالمعرّف: {chat_id}\nالحالة: {new}", "groups")
@@ -5676,6 +5799,79 @@ async def verification_timeout(bot, chat_id, user_id):
         log.warning("تعذر إزالة عضو لم يكمل التحقق %s في %s: %s", user_id, chat_id, exc)
 
 
+async def _send_member_welcome_with_bot_photo(context, chat, member, approved=False):
+    """Send a distinct welcome for approved requests vs direct joins, using the bot's current profile photo."""
+    # Reserve the event first so overlapping chat_member and new_chat_members updates cannot double-welcome.
+    cur = db.execute(
+        "INSERT OR IGNORE INTO welcome_sent_events(chat_id,user_id,event_type,sent_at) VALUES(?,?,?,?)",
+        (chat.id, member.id, "approved" if approved else "direct", now())
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        log.info("WELCOME_DUPLICATE_SKIPPED chat_id=%s member_id=%s", chat.id, member.id)
+        return False
+
+    # Assign a stable sequential member number per group, distinct from Telegram's user ID.
+    number_row = db.execute(
+        "SELECT member_number FROM group_member_numbers WHERE chat_id=? AND user_id=?", (chat.id, member.id)
+    ).fetchone()
+    if number_row:
+        member_number = number_row[0]
+    else:
+        max_row = db.execute("SELECT COALESCE(MAX(member_number),0) FROM group_member_numbers WHERE chat_id=?", (chat.id,)).fetchone()
+        member_number = int(max_row[0] or 0) + 1
+        db.execute(
+            "INSERT OR IGNORE INTO group_member_numbers(chat_id,user_id,member_number) VALUES(?,?,?)",
+            (chat.id, member.id, member_number)
+        )
+        db.commit()
+        number_row = db.execute(
+            "SELECT member_number FROM group_member_numbers WHERE chat_id=? AND user_id=?", (chat.id, member.id)
+        ).fetchone()
+        member_number = number_row[0] if number_row else member_number
+
+    moment = _riyadh_now()
+    display_name = html.escape(member.full_name or "عضو")
+    username = "@" + html.escape(member.username) if member.username else "لا يوجد"
+    title = "♛ تـم قـبـول طـلـب انـضـمـامـك ♛" if approved else "♛ عـضـو جـديـد ♛"
+    intro = (f"🌷 نـورت مـلـتـقـانـا بـ 『{display_name}』 ✨" if approved
+             else f"🎉 يـا مـرحـبـا بـ 『{display_name}』 نـوّرت الـقـروب 🌟")
+    time_label = "وقت القبول" if approved else "وقت الدخول"
+    text = (
+        f"ᯓ˹ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ {title} ˼\n"
+        "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\n"
+        f"{intro}\n"
+        f"°︙ اسم العضو ⇚ 『{display_name}』\n"
+        f"°︙ رقم العضوية ⇚ 『{member_number}』\n"
+        f"°︙ حساب ID ⇚ 『{member.id}』\n"
+        f"°︙ اليوزر ⇚ 『{username}』\n"
+        f"°︙ التاريخ ⇚ 『{moment.strftime('%d-%m-%Y')}』\n"
+        f"°︙ {time_label} ⇚ 『{moment.strftime('%I:%M %p').lstrip('0')}』\n"
+        "💫 حـيـاك الله بـيـنـنـا، ونـتـمـنـى لـك أجـمـل الأوقـات 🤍\n"
+        "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°"
+    )
+    try:
+        photos = await context.bot.get_user_profile_photos(user_id=context.bot.id, limit=1)
+        if photos and photos.total_count and photos.photos:
+            photo_id = photos.photos[0][-1].file_id
+            await context.bot.send_photo(chat_id=chat.id, photo=photo_id, caption=text[:1024], parse_mode="HTML")
+        else:
+            await context.bot.send_message(chat_id=chat.id, text=text[:4000], parse_mode="HTML")
+        log.info("WELCOME_SENT chat_id=%s member_id=%s approved=%s photo_attempted=1", chat.id, member.id, approved)
+        return True
+    except Exception as exc:
+        # If the photo endpoint or sendPhoto fails, fall back to text so the welcome is not lost.
+        log.warning("WELCOME_PHOTO_SEND_FAILED chat_id=%s member_id=%s error=%r", chat.id, member.id, exc)
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=text[:4000], parse_mode="HTML")
+            return True
+        except Exception as fallback_exc:
+            db.execute("DELETE FROM welcome_sent_events WHERE chat_id=? AND user_id=?", (chat.id, member.id))
+            db.commit()
+            log.warning("WELCOME_TEXT_FALLBACK_FAILED chat_id=%s member_id=%s error=%r", chat.id, member.id, fallback_exc)
+            return False
+
+
 async def new_members(update, context):
     """Record new members and send welcome independently of owner notifications.
 
@@ -5690,7 +5886,12 @@ async def new_members(update, context):
 
     try:
         register_group(chat)
-        if not external_group_active(chat.id):
+        # Only suppress welcomes when this chat is explicitly tracked as an external
+        # group and has been disabled. Ordinary registered groups may not have an
+        # external_group_control row, so a missing row must not silently disable welcomes.
+        _welcome_group_control = external_group_info(chat.id)
+        if _welcome_group_control and _welcome_group_control[0] and not _welcome_group_control[1]:
+            log.info("WELCOME_SKIPPED_EXTERNAL_GROUP_DISABLED chat_id=%s", chat.id)
             return
         settings = get_settings(chat.id)
     except Exception:
@@ -5737,37 +5938,13 @@ async def new_members(update, context):
         except Exception:
             log.exception("MEMBER_ACTIVITY_SAVE_FAILED chat_id=%s member_id=%s", chat.id, member.id)
 
-        # Send the welcome first: unrelated owner-DM issues must not block it.
-        if configured_welcome:
-            welcome_text = configured_welcome.replace("{name}", display_name).replace("{group}", group_title)
-            try:
-                await context.bot.send_message(chat_id=chat.id, text=welcome_text[:4000])
-                log.info("WELCOME_SENT chat_id=%s member_id=%s custom=1", chat.id, member.id)
-            except Exception as exc:
-                log.warning(
-                    "WELCOME_SEND_FAILED chat_id=%s member_id=%s bot_must_be_able_to_send_messages error=%r",
-                    chat.id, member.id, exc
-                )
-                try:
-                    await notify_owners(
-                        context,
-                        f"⚠️ تعذر إرسال الترحيب\nالقروب: {group_title} ({chat.id})\n"
-                        f"العضو: {display_name} (ID: {member.id})\n"
-                        "تحقق من أن البوت لم يُحظر وأن لديه صلاحية إرسال الرسائل.",
-                        "security"
-                    )
-                except Exception:
-                    log.exception("WELCOME_FAILURE_OWNER_ALERT_FAILED chat_id=%s", chat.id)
-        elif external_group_cap_enabled(chat.id, "welcome"):
-            default_welcome = (
-                f"👋 أهلًا وسهلًا {html.escape(display_name)} في {html.escape(group_title)}!\n"
-                "نتمنى لك تجربة موفقة. يرجى الالتزام بقوانين القروب واحترام الجميع. 💙"
-            )
-            try:
-                await context.bot.send_message(chat_id=chat.id, text=default_welcome, parse_mode="HTML")
-                log.info("DEFAULT_WELCOME_SENT chat_id=%s member_id=%s", chat.id, member.id)
-            except Exception as exc:
-                log.warning("DEFAULT_WELCOME_SEND_FAILED chat_id=%s member_id=%s: %s", chat.id, member.id, exc)
+        # Keep the existing per-group welcome toggle; use the bot profile photo and separate templates.
+        if external_group_cap_enabled(chat.id, "welcome"):
+            approval_row = db.execute(
+                "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)
+            ).fetchone()
+            approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
+            await _send_member_welcome_with_bot_photo(context, chat, member, approved=approved)
         else:
             log.info("WELCOME_DISABLED chat_id=%s member_id=%s", chat.id, member.id)
 
@@ -6165,19 +6342,74 @@ def motivation_admin_markup():
     ])
 
 
-async def generate_motivation_content():
+def normalize_motivation_content(content):
+    """Normalize Arabic text for duplicate detection without changing published text."""
+    text = (content or "").strip().lower()
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    text = text.replace("ـ", "")
+    text = re.sub(r"[إأآٱ]", "ا", text).replace("ى", "ي")
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+def motivation_content_is_duplicate(content, exclude_draft_id=None, threshold=0.88):
+    """Compare against all saved drafts and published history; exact or near duplicates are rejected."""
+    normalized = normalize_motivation_content(content)
+    if len(normalized) < 25:
+        return True
+    rows = db.execute("SELECT content_normalized FROM motivation_content_history").fetchall()
+    query = "SELECT id,content FROM motivation_drafts WHERE content IS NOT NULL AND content<>''"
+    params = ()
+    if exclude_draft_id is not None:
+        query += " AND id<>?"
+        params = (int(exclude_draft_id),)
+    rows += [(normalize_motivation_content(r[1]),) for r in db.execute(query, params).fetchall()]
+    for (old,) in rows:
+        if not old:
+            continue
+        if normalized == old:
+            return True
+        # Fast containment check catches copied paragraphs with a small prefix/suffix change.
+        shorter = min(len(normalized), len(old))
+        longer = max(len(normalized), len(old))
+        if shorter >= 35 and shorter / max(1, longer) >= 0.78 and (normalized in old or old in normalized):
+            return True
+        if shorter >= 55 and SequenceMatcher(None, normalized, old).ratio() >= threshold:
+            return True
+    return False
+
+def record_motivation_content(content, content_date):
+    normalized = normalize_motivation_content(content)
+    if not normalized:
+        return False
+    try:
+        db.execute("INSERT INTO motivation_content_history(content_normalized,content,content_date,created_at) VALUES(?,?,?,?)",
+                   (normalized, (content or "")[:3500], content_date or "", now()))
+        db.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+async def generate_motivation_content(exclude_draft_id=None):
+    """Generate genuinely new daily content; reject duplicate/near-duplicate output."""
     prompt = (
-        "أنشئ رسالة عربية قصيرة واحدة فقط لقروبات تيليجرام، اختر نوعًا واحدًا بالتناوب أو عشوائيًا من: "
-        "معلومة تحفيزية، حكمة، مثل عربي/شعبي. اجعلها نافعة ومحترمة ومناسبة للطلاب والعامة. "
-        "إن كان مثلًا فاذكر المثل ومعناه باختصار، ولا تنسب قولًا لشخص دون تحقق. تجنب الادعاءات العلمية غير المؤكدة، "
-        "ولا تضف مقدمة عن أنك ذكاء اصطناعي. اجعل الناتج بين 40 و100 كلمة، وبصيغة جاهزة للنشر."
+        "أنشئ رسالة عربية قصيرة واحدة فقط لقروبات تيليجرام، اختر نوعًا من: معلومة تحفيزية، حكمة، أو مثل عربي/شعبي. "
+        "اجعلها نافعة ومحترمة ومناسبة للطلاب والعامة. إن كان مثلًا فاذكر معناه باختصار، ولا تنسب قولًا لشخص دون تحقق. "
+        "تجنب الادعاءات العلمية غير المؤكدة. اجعل النص جديدًا ومختلفًا عن الصيغ الشائعة، بين 40 و100 كلمة، جاهزًا للنشر."
     )
-    result = await openai_assistant_response(prompt, "إعداد المحتوى التحفيزي اليومي")
-    if result and not result.startswith("⚠️"):
-        text = result.strip()[:3500]
-        kind = "حكمة" if "حكمة" in text[:80] else ("مثل" if "مثل" in text[:100] else "معلومة تحفيزية")
-        return kind, text
-    return random.choice(MOTIVATION_FALLBACKS)
+    for attempt in range(4):
+        result = await openai_assistant_response(prompt + f"\nأنشئ صياغة مختلفة تمامًا. رقم المحاولة: {attempt + 1}.", "إعداد المحتوى التحفيزي اليومي")
+        if result and not result.startswith("⚠️"):
+            content = result.strip()[:3500]
+            if not motivation_content_is_duplicate(content, exclude_draft_id=exclude_draft_id):
+                kind = "حكمة" if "حكمة" in content[:100] else ("مثل" if "مثل" in content[:100] else "معلومة تحفيزية")
+                return kind, content
+    # Use a fallback only when it is demonstrably new. Never recycle an old fallback.
+    candidates = list(MOTIVATION_FALLBACKS)
+    random.shuffle(candidates)
+    for content in candidates:
+        if not motivation_content_is_duplicate(content, exclude_draft_id=exclude_draft_id):
+            return "محتوى تحفيزي", content
+    raise RuntimeError("تعذر توليد محتوى جديد غير مكرر؛ تم إيقاف إنشاء المسودة بدل إعادة نشر محتوى قديم.")
 
 
 async def show_motivation_draft(target, draft_id=None):
@@ -6220,7 +6452,21 @@ async def motivation_daily_worker(app):
             exists = db.execute("SELECT id FROM motivation_drafts WHERE content_date=?", (local_day,)).fetchone()
             if exists:
                 continue
-            kind, content = await generate_motivation_content()
+            generated = None
+            for generation_attempt in range(12):
+                try:
+                    generated = await generate_motivation_content()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("تعذر إعداد محتوى جديد غير مكرر (المحاولة %s/12): %s", generation_attempt + 1, exc)
+                    if generation_attempt < 11:
+                        await asyncio.sleep(300)
+            if not generated:
+                log.error("لم تُنشأ مسودة اليوم بعد 12 محاولة؛ لن يُعاد استخدام محتوى قديم.")
+                continue
+            kind, content = generated
             db.execute("INSERT OR IGNORE INTO motivation_drafts(content_date,content_type,content,status,created_at) VALUES(?,?,?,?,?)",
                        (local_day, kind, content, "pending", now()))
             db.commit()
@@ -6451,12 +6697,30 @@ async def callback(update, context):
             restriction = db.execute("SELECT status FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
             if restriction and restriction[0] in ("pending", "blocked"):
                 await safe_callback_answer(q, "هذا عضو مطرود سابقًا. وافق أولًا على عودته من زر مراجعة المطرودين.", show_alert=True); return
+            # Mark approved before calling Telegram: the chat_member update can arrive
+            # immediately after approveChatJoinRequest, before this handler resumes.
+            # That race previously made the welcome handler classify approved joins as direct joins.
+            previous_row = db.execute(
+                "SELECT status,decided_at,decided_by FROM join_request_events WHERE chat_id=? AND user_id=?",
+                (chat_id, target_id)
+            ).fetchone()
+            db.execute(
+                "UPDATE join_request_events SET status='approved',decided_at=?,decided_by=? WHERE chat_id=? AND user_id=?",
+                (now(), uid, chat_id, target_id)
+            )
+            db.commit()
             try:
                 await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=target_id)
-                db.execute("UPDATE join_request_events SET status='approved',decided_at=?,decided_by=? WHERE chat_id=? AND user_id=?", (now(), uid, chat_id, target_id))
-                db.commit(); log_action(chat_id, uid, "join_request_approved", f"target={target_id}")
+                log_action(chat_id, uid, "join_request_approved", f"target={target_id}")
                 await q.edit_message_text((q.message.text or "طلب انضمام") + f"\n\n✅ تمت الموافقة بواسطة {uid}.")
             except Exception as exc:
+                # Restore the prior state if Telegram rejected the approval.
+                if previous_row:
+                    db.execute(
+                        "UPDATE join_request_events SET status=?,decided_at=?,decided_by=? WHERE chat_id=? AND user_id=?",
+                        (previous_row[0], previous_row[1], previous_row[2], chat_id, target_id)
+                    )
+                    db.commit()
                 log.warning("Join request approval failed chat=%s user=%s: %s", chat_id, target_id, exc)
                 await safe_callback_answer(q, "تعذرت الموافقة. تحقق من صلاحيات البوت وحالة الطلب.", show_alert=True)
         else:
@@ -6565,7 +6829,7 @@ async def callback(update, context):
                 await q.message.reply_text("✏️ أرسل النص الجديد للمحتوى في رسالة واحدة. لن يُنشر حتى تعتمد النسخة المعدلة. للإلغاء أرسل /cancel.")
                 await safe_callback_answer(q); return
             if action == "alt":
-                new_kind, new_content = await generate_motivation_content()
+                new_kind, new_content = await generate_motivation_content(exclude_draft_id=did)
                 db.execute("UPDATE motivation_drafts SET content_type=?,content=?,created_at=? WHERE id=? AND status='pending'", (new_kind,new_content,now(),did)); db.commit()
                 await q.message.reply_text(f"🔄 محتوى بديل للمراجعة — {content_date}\n🏷️ النوع: {new_kind}\n\n{new_content}", reply_markup=motivation_draft_markup(did))
                 await safe_callback_answer(q, "تم إعداد محتوى بديل."); return
@@ -6574,7 +6838,10 @@ async def callback(update, context):
                 await q.edit_message_text(f"❌ تم رفض محتوى {content_date}. لم يُنشر في أي قروب.")
                 await safe_callback_answer(q, "تم الرفض."); return
             if action == "approve":
-                groups = [int(r[0]) for r in db.execute("SELECT chat_id FROM motivation_groups WHERE enabled=1 ORDER BY chat_id").fetchall()]
+                if motivation_content_is_duplicate(content, exclude_draft_id=did):
+                    await safe_callback_answer(q, "تم منع النشر لأن المحتوى مكرر أو شديد التشابه. أنشئ محتوى بديلًا.", show_alert=True)
+                    await q.message.reply_text("⚠️ لم يُنشر المحتوى: اكتشف النظام تكرارًا. اضغط «محتوى بديل» ثم راجع النص الجديد.", reply_markup=motivation_draft_markup(did)); return
+                groups = [int(r[0]) for r in db.execute("SELECT mg.chat_id FROM motivation_groups mg JOIN watched_groups w ON w.chat_id=mg.chat_id WHERE mg.enabled=1 ORDER BY mg.chat_id").fetchall()]
                 if not groups:
                     await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل قبل النشر.", show_alert=True)
                     await q.message.reply_text("👥 لا توجد قروبات محددة للنشر. اختر القروبات أولًا:", reply_markup=motivation_groups_markup()); return
@@ -6586,7 +6853,9 @@ async def callback(update, context):
                         sent.append(gid); continue
                     try:
                         await context.bot.send_message(chat_id=gid, text=f"🌟 {kind}\n\n{content}\n\n✨ بوت حماية ومساعدة القروبات")
-                        db.execute("INSERT INTO motivation_posts(draft_id,chat_id,status,posted_at,error) VALUES(?,?,?,?,?) ON CONFLICT(draft_id,chat_id) DO UPDATE SET status='sent',posted_at=excluded.posted_at,error=''", (did,gid,"sent",now(),"")); db.commit(); sent.append(gid)
+                        db.execute("INSERT INTO motivation_posts(draft_id,chat_id,status,posted_at,error) VALUES(?,?,?,?,?) ON CONFLICT(draft_id,chat_id) DO UPDATE SET status='sent',posted_at=excluded.posted_at,error=''", (did,gid,"sent",now(),"")); db.commit()
+                        record_motivation_content(content, content_date)
+                        sent.append(gid)
                     except Exception as exc:
                         err = str(exc)[:400]
                         db.execute("INSERT INTO motivation_posts(draft_id,chat_id,status,posted_at,error) VALUES(?,?,?,?,?) ON CONFLICT(draft_id,chat_id) DO UPDATE SET status='failed',posted_at=excluded.posted_at,error=excluded.error", (did,gid,"failed",now(),err)); db.commit(); failed.append((gid,err))
@@ -6635,6 +6904,25 @@ async def callback(update, context):
         db.commit(); log_action(0,uid,"unified_role_changed",f"target={target_uid}; role={role}; action={action}")
         await safe_callback_answer(q, action, show_alert=True)
         await q.edit_message_text(f"{action} للمستخدم {target_uid}.", reply_markup=unified_permissions_markup(target_uid)); return
+    if data.startswith("unifiedall:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "منح جميع الصلاحيات للمالك الأساسي فقط.", show_alert=True); return
+        try:
+            target_uid = int(data.split(":", 1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف المستخدم غير صحيح.", show_alert=True); return
+        if target_uid <= 0 or target_uid == OWNER_ID:
+            await safe_callback_answer(q, "لا يمكن تغيير صلاحيات المالك الأساسي.", show_alert=True); return
+        # Grant every operational capability in the same registry used by the UI.
+        # This does not grant primary-owner status or access to primary-owner-only controls.
+        for cap in STAFF_CAPABILITY_LABELS:
+            db.execute("DELETE FROM staff_capability_denials WHERE user_id=? AND capability=?", (target_uid, cap))
+            db.execute("INSERT OR REPLACE INTO staff_capabilities(user_id,capability,chat_id,granted_by,granted_at) VALUES(?,?,?,?,?)",
+                       (target_uid, cap, 0, uid, now()))
+        db.commit()
+        log_action(0, uid, "unified_all_capabilities_granted", f"target={target_uid}; count={len(STAFF_CAPABILITY_LABELS)}")
+        await safe_callback_answer(q, "تم منح جميع الصلاحيات التشغيلية.", show_alert=True)
+        await q.edit_message_text(f"✅ تم منح جميع الصلاحيات التشغيلية للمستخدم {target_uid}.\nتبقى لوحة المالك الأساسي وإدارة ملكية البوت محصورتين بالمالك الأساسي.", reply_markup=unified_permissions_markup(target_uid)); return
     if data.startswith("unifiedcap:"):
         if not is_owner(uid): await safe_callback_answer(q, "منح الصلاحيات العامة للمالك الأساسي فقط.", show_alert=True); return
         try: _, raw_target, cap = data.split(":",2); target_uid=int(raw_target)
@@ -6656,6 +6944,7 @@ async def callback(update, context):
         try: target_uid=int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q,"معرّف المستخدم غير صحيح.",show_alert=True); return
         if target_uid <= 0 or target_uid == OWNER_ID: await safe_callback_answer(q,"لا يمكن تعديل حساب المالك الأساسي.",show_alert=True); return
+        await get_verified_active_watched_groups(context.bot, limit=500)
         await q.edit_message_text(f"📍 اختر قروبًا لتحديد صلاحيات المستخدم {target_uid}.",reply_markup=unified_group_list_markup(target_uid)); return
     if data.startswith("unifiedgroup:"):
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
@@ -7391,6 +7680,52 @@ async def callback(update, context):
         db.commit(); log_action(chat_id, uid, "staff_group_capability_changed", f"target={target_uid}; capability={cap}")
         await safe_callback_answer(q, "تم تحديث صلاحية القروب.")
         await q.edit_message_text(f"🔐 صلاحيات المستخدم {target_uid} في القروب {chat_id}:", reply_markup=staff_group_capabilities_markup(target_uid, chat_id)); return
+
+    if data == "ai_group_refresh":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه الخاصية للمالك الأساسي فقط.", show_alert=True); return
+        active_groups = await get_verified_active_watched_groups(context.bot, limit=80)
+        rows = []
+        for cid, title in active_groups:
+            state = db.execute("SELECT COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE w.chat_id=?", (cid,)).fetchone()
+            if state:
+                rows.append((cid, title, state[0]))
+        buttons = [[InlineKeyboardButton(f"{'🟢 الذكاء يعمل' if enabled else '⚪️ الذكاء متوقف'} | {title[:32]}", callback_data=f"ai_group_toggle:{int(cid)}")] for cid, title, enabled in rows[:80]]
+        buttons.append([InlineKeyboardButton("🔄 تحديث القائمة", callback_data="ai_group_refresh"), InlineKeyboardButton("إغلاق", callback_data="home")])
+        await safe_callback_answer(q, "تم تحديث القائمة.")
+        await q.edit_message_text("🤖 تشغيل وإيقاف الذكاء الاصطناعي للقروبات\nاضغط على اسم القروب لتبديل الحالة.", reply_markup=InlineKeyboardMarkup(buttons)); return
+
+    if data.startswith("ai_group_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه الخاصية للمالك الأساسي فقط.", show_alert=True); return
+        try: cid = int(data.split(":", 1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone():
+            await safe_callback_answer(q, "القروب لم يعد ضمن القروبات المسجلة.", show_alert=True); return
+        ext = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (cid,)).fetchone()
+        is_external = bool(ext and ext[0])
+        if is_external:
+            current = db.execute("SELECT ai_enabled FROM external_group_control WHERE chat_id=?", (cid,)).fetchone()
+            enabled = 0 if (current and current[0]) else 1
+            db.execute("UPDATE external_group_control SET ai_enabled=?,updated_at=? WHERE chat_id=?", (enabled, now(), cid))
+            db.execute("INSERT INTO external_group_capabilities(chat_id,capability,enabled,granted_by,granted_at) VALUES(?,'ai',?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,granted_by=excluded.granted_by,granted_at=excluded.granted_at", (cid, enabled, uid, now()))
+        else:
+            current = db.execute("SELECT enabled FROM ai_group_settings WHERE chat_id=?", (cid,)).fetchone()
+            enabled = 0 if (current and current[0]) else 1
+            db.execute("INSERT INTO ai_group_settings(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at", (cid, enabled, uid, now()))
+        db.commit()
+        log_action(cid, uid, "ai_group_toggled_from_panel", f"enabled={enabled}; external={int(is_external)}")
+        await safe_callback_answer(q, "تم تشغيل الذكاء الاصطناعي." if enabled else "تم إيقاف الذكاء الاصطناعي.")
+        active_groups = await get_verified_active_watched_groups(context.bot, limit=80)
+        rows = []
+        for cid, title in active_groups:
+            state = db.execute("SELECT COALESCE(a.enabled, CASE WHEN e.is_external=1 THEN e.ai_enabled ELSE 0 END,0) FROM watched_groups w LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE w.chat_id=?", (cid,)).fetchone()
+            if state:
+                rows.append((cid, title, state[0]))
+        buttons = [[InlineKeyboardButton(f"{'🟢 الذكاء يعمل' if state else '⚪️ الذكاء متوقف'} | {title[:32]}", callback_data=f"ai_group_toggle:{int(group_id)}")] for group_id, title, state in rows[:80]]
+        buttons.append([InlineKeyboardButton("🔄 تحديث القائمة", callback_data="ai_group_refresh"), InlineKeyboardButton("إغلاق", callback_data="home")])
+        await q.edit_message_text("🤖 تشغيل وإيقاف الذكاء الاصطناعي للقروبات\nاضغط على اسم القروب لتبديل الحالة.", reply_markup=InlineKeyboardMarkup(buttons)); return
 
     if data == "owner_ai_report":
         if not (is_owner(uid) or can_use_capability(uid, "ai") or capability_group_ids(uid, "ai")):
@@ -10300,8 +10635,50 @@ async def weekly_security_review_worker(app):
             await asyncio.sleep(300)
 
 
+async def active_group_refresh_worker(app):
+    """Periodically reconcile saved groups with Telegram membership; never delete on transient API errors."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            bot_user = await app.bot.get_me()
+            rows = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY chat_id").fetchall()
+            for chat_id, title in rows:
+                try:
+                    member = await app.bot.get_chat_member(chat_id=int(chat_id), user_id=bot_user.id)
+                    status = getattr(member, "status", "unknown")
+                    if status in ("left", "kicked"):
+                        db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
+                        db.commit()
+                        log.info("Removed inactive group from active lists: %s (%s)", title, chat_id)
+                except (Forbidden, BadRequest) as exc:
+                    message = str(exc).lower()
+                    # Only treat definitive membership/chat errors as removal. Other BadRequest
+                    # messages can be transient or caused by Telegram API limitations.
+                    if any(token in message for token in (
+                        "chat not found", "bot is not a member", "user not found", "kicked",
+                        "bot was kicked", "not a member of the supergroup", "group chat was upgraded"
+                    )):
+                        db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
+                        db.commit()
+                        log.info("Pruned unreachable group from active lists: %s (%s): %s", title, chat_id, exc)
+                    else:
+                        log.warning("Could not verify group membership; keeping record %s (%s): %s", title, chat_id, exc)
+                except Exception as exc:
+                    log.warning("Temporary group membership check failed; keeping record %s (%s): %s", title, chat_id, exc)
+                await asyncio.sleep(0.15)
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Active group refresh worker failed")
+            await asyncio.sleep(120)
+
+
 async def post_init(app):
     """Start long-running assistant workers only after PTB has initialized its event loop."""
+    app.create_task(active_group_refresh_worker(app), name="active-group-refresh-worker")
     app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
     app.create_task(automatic_unmute_worker(app), name="automatic-unmute-worker")
     app.create_task(weekly_stats_worker(app), name="weekly-group-stats-worker")
