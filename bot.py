@@ -10906,20 +10906,25 @@ async def post_init(app):
         (motivation_daily_worker, "motivation-daily-worker"),
         (group_greeting_worker, "group-greeting-worker"),
     ]
-    app._background_worker_tasks = [
-        asyncio.create_task(worker(app), name=name) for worker, name in worker_specs
-    ]
+    # Application is a library object: do not assign undocumented private attributes.
+    # post_init runs on the application's active event loop, so asyncio.create_task
+    # is appropriate here and avoids PTB's warning for Application.create_task
+    # calls made before the application enters its running state.
+    tasks = []
+    for worker, name in worker_specs:
+        tasks.append(asyncio.create_task(worker(app), name=name))
+    app.bot_data["_background_worker_tasks"] = tasks
 
 
 async def post_stop(app):
-    """Cancel and await long-running workers to avoid pending-task warnings on shutdown."""
-    tasks = list(getattr(app, "_background_worker_tasks", []))
+    """Cancel and await long-running workers to shut down without orphaned tasks."""
+    tasks = list(app.bot_data.get("_background_worker_tasks", []))
     for task in tasks:
         if not task.done():
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    app._background_worker_tasks = []
+    app.bot_data["_background_worker_tasks"] = []
 
 
 
