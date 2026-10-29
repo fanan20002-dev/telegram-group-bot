@@ -742,7 +742,9 @@ db.execute("""CREATE TABLE IF NOT EXISTS global_join_approval_settings(
     id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT '', updated_by INTEGER NOT NULL DEFAULT 0
 )""")
-db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updated_at,updated_by) VALUES(1,0,'',0)")
+db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updated_at,updated_by) VALUES(1,1,'',0)")
+# One-time migration: if the old default row was never explicitly changed, enable approval by default.
+db.execute("UPDATE global_join_approval_settings SET enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=1 AND COALESCE(updated_at,'')=''")
 # Track invite links created by this bot so it can revoke those it owns when needed.
 db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
     chat_id INTEGER NOT NULL, invite_link TEXT NOT NULL, link_type TEXT NOT NULL DEFAULT 'join_request',
@@ -2074,7 +2076,7 @@ def panel_markup(uid):
         if can_use_capability(uid, "message_lock") or capability_group_ids(uid, "message_lock"):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
         if can_use_capability(uid, "join_approval", 0):
-            delegated_rows.append([InlineKeyboardButton(("🔐 إيقاف قفل الدخول لجميع القروبات" if global_join_approval_enabled() else "🔐 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")])
+            delegated_rows.append([InlineKeyboardButton(("🔓 فتح الدخول لجميع القروبات" if global_join_approval_enabled() else "🔒 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")])
         if (can_use_capability(uid, "reentry") or capability_group_ids(uid, "reentry")
                 or can_use_capability(uid, "join_approval") or capability_group_ids(uid, "join_approval")):
             delegated_rows.append([InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات الانضمام", callback_data="restricted_members")])
@@ -2131,7 +2133,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("👁️ مراقبة القروبات المسجلة", callback_data="monitor_groups")],
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات والتحليل", callback_data="group_controls")],
-        [InlineKeyboardButton(("🔐 إيقاف قفل الدخول لجميع القروبات" if global_join_approval_enabled() else "🔐 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")],
+        [InlineKeyboardButton(("🔓 فتح الدخول لجميع القروبات" if global_join_approval_enabled() else "🔒 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
@@ -4200,6 +4202,17 @@ async def notify_owners(context, text, event="general"):
         except Exception as exc:
             log.info("تعذر إرسال إشعار إلى %s: %s", recipient, exc)
 
+
+async def notify_owner_and_deputies(context, text, reply_markup=None):
+    """Send membership/join-approval notices to the primary owner and every deputy."""
+    recipients = {int(OWNER_ID)} if OWNER_ID else set()
+    recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
+    for recipient in recipients:
+        try:
+            await context.bot.send_message(chat_id=recipient, text=text, reply_markup=reply_markup)
+        except Exception as exc:
+            log.info("تعذر إرسال إشعار الدخول إلى المالك/نائب المالك %s: %s", recipient, exc)
+
 def archive_is_enabled(chat_id):
     row = db.execute("SELECT enabled FROM archive_settings WHERE chat_id=?", (chat_id,)).fetchone()
     return bool(row and row[0])
@@ -5719,16 +5732,8 @@ async def chat_join_request_handler(update, context):
             f"اسم المستخدم: @{user.username or 'غير متوفر'}\nالمعرّف: {user.id}\n"
             + (f"⚠️ تنبيه: لهذا العضو سجل سابق: {prior[1] or prior[0]}. فك الحظر وحده لا يُعد موافقة على العودة.\n" if restricted else "")
             + "اختر الموافقة أو الرفض. لا يُقبل الطلب إلا من مسؤول مخوّل.")
-    recipients = {OWNER_ID} if OWNER_ID else set()
-    _join_candidates = {r[0] for r in db.execute("SELECT DISTINCT user_id FROM staff_capabilities WHERE capability='join_approval'").fetchall()}
-    _reentry_candidates = {r[0] for r in db.execute("SELECT DISTINCT user_id FROM staff_capabilities WHERE capability='reentry'").fetchall()}
-    recipients.update(candidate for candidate in _join_candidates if can_use_capability(candidate, "join_approval", chat.id))
-    recipients.update(candidate for candidate in _reentry_candidates if can_use_capability(candidate, "reentry", chat.id))
-    for recipient in recipients:
-        try:
-            await context.bot.send_message(chat_id=recipient, text=text, reply_markup=keyboard)
-        except Exception as exc:
-            log.info("Join request notification failed recipient=%s chat=%s: %s", recipient, chat.id, exc)
+    # Join requests are intentionally routed only to the primary owner and deputy owners.
+    await notify_owner_and_deputies(context, text, reply_markup=keyboard)
 
 
 async def my_chat_member_handler(update, context):
@@ -5857,37 +5862,55 @@ async def chat_member_handler(update, context):
     new = cm.new_chat_member.status
     member = cm.new_chat_member.user
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
-        # A previous kick is remembered by stable Telegram ID. Removing a Telegram ban
-        # alone does not approve re-entry; the owner-authorized decision is stored separately.
-        if new != "administrator":
-            restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
-            if restriction and restriction[0] in ("pending", "blocked"):
+        # Telegram identifies the actor who added the user in chat_member.from_user.
+        # The primary owner and registered deputy owners are explicitly allowed to add
+        # members directly, including members with older re-entry/global-ban records.
+        actor = getattr(cm, "from_user", None)
+        actor_id = int(getattr(actor, "id", 0) or 0)
+        owner_or_deputy_added = bool(actor_id and (is_owner(actor_id) or is_deputy_owner(actor_id)))
+        restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
+        if restriction and restriction[0] in ("pending", "blocked") and not owner_or_deputy_added:
+            try:
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+                log_action(chat_id, member.id, "reentry_reblocked", restriction[1] or restriction[0])
+                await notify_reentry_restriction(context, cm.chat, member, restriction[1] or "عضو مطرود سابقًا؛ يحتاج موافقة المسؤول")
+            except Exception as exc:
+                log.warning("Reentry enforcement failed chat=%s user=%s: %s", chat_id, member.id, exc)
+            return
+        if group_feature_enabled(chat_id, "join_approval_enabled"):
+            request_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
+            approved_request = bool(request_row and request_row[0] in ("approved", "joined"))
+            if approved_request:
+                db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
+                db.commit()
+            elif not owner_or_deputy_added:
+                # With approval enabled, block direct joins/additions unless the member
+                # was approved or was explicitly added by the primary owner/deputy.
+                log_action(chat_id, member.id, "join_approval_required", f"direct_entry_blocked; actor={actor_id}")
                 try:
                     await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
-                    log_action(chat_id, member.id, "reentry_reblocked", restriction[1] or restriction[0])
-                    await notify_reentry_restriction(context, cm.chat, member, restriction[1] or "عضو مطرود سابقًا؛ يحتاج موافقة المسؤول")
+                    await context.bot.unban_chat_member(chat_id=chat_id, user_id=member.id, only_if_banned=True)
                 except Exception as exc:
-                    log.warning("Reentry enforcement failed chat=%s user=%s: %s", chat_id, member.id, exc)
+                    log.warning("Could not block direct entry chat=%s user=%s actor=%s: %s", chat_id, member.id, actor_id, exc)
+                await notify_owner_and_deputies(
+                    context,
+                    f"🔐 تم منع دخول مباشر دون موافقة مسبقة\nالقروب: {cm.chat.title or chat_id}\n"
+                    f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\n"
+                    f"الإجراء بواسطة/مصدر الدخول: {actor_id or 'غير محدد'}\n"
+                    "على العضو استخدام رابط طلب الانضمام، ثم يوافق المالك الأساسي أو نائب المالك."
+                )
                 return
-            if group_feature_enabled(chat_id, "join_approval_enabled"):
-                request_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
-                if not request_row or request_row[0] != "approved":
-                    # Do not remove a new, non-expelled member after they have entered.
-                    # Pre-entry approval must be enforced by sharing a join-request invite link
-                    # and revoking old direct invite links. Previously expelled users are still
-                    # blocked by the reentry_restrictions check above.
-                    log_action(chat_id, member.id, "join_approval_bypassed_by_direct_link", "member retained; use join-request link for future entries")
-                    await notify_owners(
-                        context,
-                        f"⚠️ انضم عضو عبر رابط دخول مباشر دون طلب موافقة\n"
-                        f"القروب: {cm.chat.title or chat_id}\n"
-                        f"العضو: {member.full_name} (ID: {member.id})\n"
-                        "لم يطرده البوت. لضمان الموافقة المسبقة مستقبلًا، وزّع رابط طلب الانضمام وألغِ روابط الدعوة المباشرة القديمة.",
-                        "membership"
-                    )
-                else:
-                    db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
-                    db.commit()
+            # Direct additions are permitted only when Telegram identifies the primary
+            # owner or a registered deputy as the actor. Notify both roles after success.
+            elif owner_or_deputy_added:
+                log_action(chat_id, member.id, "owner_deputy_direct_add_allowed", f"actor={actor_id}")
+                await notify_owner_and_deputies(
+                    context,
+                    f"📥 دخول عضو بإضافة مباشرة مصرح بها\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\n"
+                    f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\n"
+                    f"أضافه: {getattr(actor, 'full_name', 'المالك/نائب المالك') or 'المالك/نائب المالك'} (ID: {actor_id})\n"
+                    "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك."
+                )
         if global_ban_applies(member.id, chat_id):
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
@@ -5972,7 +5995,7 @@ async def chat_member_handler(update, context):
                 await _send_member_welcome_with_bot_photo(context, cm.chat, member, approved=approved)
         except Exception:
             log.exception("WELCOME_CHAT_MEMBER_HANDLER_FAILED chat_id=%s member_id=%s", chat_id, member.id)
-        await notify_owners(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
+        await notify_owner_and_deputies(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}")
     # Bot membership transitions are handled by my_chat_member_handler, which sends
     # the detailed external-group notice to the primary owner and deputies. Do not send
     # a second generic alert here: Telegram may deliver both update types for one event.
@@ -6118,15 +6141,17 @@ async def new_members(update, context):
         configured_welcome = ""
 
     group_title = chat.title or "القروب"
+    _adding_actor = getattr(msg, "from_user", None)
+    _owner_deputy_direct_add = bool(_adding_actor and (is_owner(_adding_actor.id) or is_deputy_owner(_adding_actor.id)))
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
-        if group_feature_enabled(chat.id, "join_approval_enabled"):
+        if group_feature_enabled(chat.id, "join_approval_enabled") and not _owner_deputy_direct_add:
             approval_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)).fetchone()
             if not approval_row or approval_row[0] not in ("approved", "joined"):
                 # The chat_member handler enforces the ban; this avoids welcoming an unapproved join.
                 continue
-        if global_ban_applies(member.id, chat.id):
+        if global_ban_applies(member.id, chat.id) and not _owner_deputy_direct_add:
             try:
                 await context.bot.ban_chat_member(chat_id=chat.id, user_id=member.id)
                 log_action(chat.id, member.id, "global_ban_reentry", "منع عودة عضو محظور جماعيًا")
@@ -6705,7 +6730,11 @@ async def callback(update, context):
         if not (is_owner(uid) or can_use_capability(uid, "join_approval", 0)):
             await safe_callback_answer(q, "تحتاج إلى صلاحية قفل الدخول لجميع القروبات.", show_alert=True); return
         enabling = not global_join_approval_enabled()
-        groups = db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title,chat_id").fetchall()
+        groups = db.execute("""SELECT chat_id, title FROM (
+            SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM watched_groups
+            UNION
+            SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1
+        ) ORDER BY title,chat_id""").fetchall()
         db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(enabling), now(), uid))
         # Keep per-group flags aligned with the master switch so turning it off really unlocks all groups.
         for _cid, _title in groups:
@@ -6896,8 +6925,8 @@ async def callback(update, context):
     if data.startswith("joinreq_approve:") or data.startswith("joinreq_deny:"):
         try: action, chat_raw, user_raw = data.split(":", 2); chat_id, target_id = int(chat_raw), int(user_raw)
         except ValueError: await safe_callback_answer(q, "بيانات الطلب غير صحيحة.", show_alert=True); return
-        if not (is_owner(uid) or can_use_capability(uid, "join_approval", chat_id) or can_use_capability(uid, "reentry", chat_id)):
-            await safe_callback_answer(q, "لا تملك صلاحية الموافقة على هذا الطلب.", show_alert=True); return
+        if not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "الموافقة على طلبات الدخول للمالك الأساسي ونائب المالك فقط.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
         if not reqrow or reqrow[0] not in ("pending", "approved"):
             await safe_callback_answer(q, "الطلب لم يعد معلقًا.", show_alert=True); return
@@ -10996,6 +11025,46 @@ async def group_greeting_worker(app):
             await asyncio.sleep(60)
 
 
+async def ensure_global_join_approval_links_worker(app):
+    """Ensure each registered group has a bot-managed request-only link when the global lock is on."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            if global_join_approval_enabled():
+                groups = db.execute("""SELECT chat_id, title FROM (
+                    SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM watched_groups
+                    UNION
+                    SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1
+                ) ORDER BY chat_id""").fetchall()
+                created = []
+                for chat_id, title in groups:
+                    active = db.execute("SELECT 1 FROM managed_join_invite_links WHERE chat_id=? AND active=1 LIMIT 1", (int(chat_id),)).fetchone()
+                    if active:
+                        continue
+                    try:
+                        link = await create_managed_join_request_link(app.bot, int(chat_id))
+                        created.append(f"• {title}: {link}")
+                    except Exception as exc:
+                        log.warning("Could not ensure join-request link for chat %s: %s", chat_id, exc)
+                    await asyncio.sleep(0.15)
+                if created:
+                    message = "🔐 روابط طلب الانضمام (الموافقة للمالك الأساسي ونائب المالك):\n\n" + "\n".join(created)
+                    recipients = ({int(OWNER_ID)} if OWNER_ID else set())
+                    recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
+                    for recipient in recipients:
+                        try:
+                            for start in range(0, len(message), 3500):
+                                await app.bot.send_message(chat_id=recipient, text=message[start:start+3500])
+                        except Exception as exc:
+                            log.info("Could not send join-request links to %s: %s", recipient, exc)
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Global join-approval link reconciliation failed")
+            await asyncio.sleep(60)
+
+
 async def post_init(app):
     """Start background workers on the running event loop and track them for clean shutdown."""
     worker_specs = [
@@ -11009,6 +11078,7 @@ async def post_init(app):
         (weekly_security_review_worker, "weekly-security-review-worker"),
         (motivation_daily_worker, "motivation-daily-worker"),
         (group_greeting_worker, "group-greeting-worker"),
+        (ensure_global_join_approval_links_worker, "global-join-approval-links-worker"),
     ]
     # Application is a library object: do not assign undocumented private attributes.
     # post_init runs on the application's active event loop, so asyncio.create_task
