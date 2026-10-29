@@ -5628,9 +5628,19 @@ async def my_chat_member_handler(update, context):
 
     if bot_joined:
         register_group(chat, actor)
-        db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), chat.id))
-        db.commit()
         actor_id = int(getattr(actor, "id", 0) or 0)
+        # A previous ordinary message may have registered this chat as internal before
+        # the bot was actually added. A verified membership-add event by someone other
+        # than the configured primary owner is authoritative for external-group status.
+        # Preserve an existing external classification if the primary owner re-adds it.
+        if actor_id and actor_id != int(OWNER_ID or 0):
+            db.execute(
+                "UPDATE external_group_control SET is_external=1, added_by=?, added_by_name=?, added_by_username=?, is_member=1, updated_at=? WHERE chat_id=?",
+                (actor_id, getattr(actor, "full_name", "") or "", getattr(actor, "username", "") or "", now(), chat.id),
+            )
+        else:
+            db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        db.commit()
         ext = external_group_info(chat.id)
         external = bool(ext and ext[0])
         # A previously disabled group stays disabled; adding the bot again does not bypass
@@ -5662,18 +5672,30 @@ async def my_chat_member_handler(update, context):
             f"حالة الخدمة: {'مفعّلة' if enabled else 'متوقفة بقرار سابق من المالك'}\n"
             "الذكاء الاصطناعي للقروبات الخارجية معطّل افتراضيًا."
         )
-        # External-group addition notices are sent to deputy owner(s) only, as requested.
-        # Do not send this notice to the primary owner, delegated owners, or managers.
+        # Notify the primary owner and every registered deputy for external groups.
+        # Gather sends concurrently so both receive the same notice in the same event.
+        # Do not include delegated owners or general managers in this specific alert.
         if external:
-            deputy_rows = db.execute(
-                "SELECT user_id FROM deputy_owners WHERE user_id<>? ORDER BY user_id",
-                (int(OWNER_ID or 0),),
-            ).fetchall()
-            for (deputy_id,) in deputy_rows:
+            recipients = {int(OWNER_ID)} if OWNER_ID else set()
+            recipients.update(
+                int(row[0]) for row in db.execute(
+                    "SELECT user_id FROM deputy_owners ORDER BY user_id"
+                ).fetchall()
+                if int(row[0]) > 0
+            )
+            async def _send_external_group_notice(recipient_id):
                 try:
-                    await context.bot.send_message(chat_id=int(deputy_id), text=notice)
+                    await context.bot.send_message(chat_id=recipient_id, text=notice, disable_web_page_preview=True)
                 except Exception as notify_exc:
-                    log.info("Could not notify deputy owner %s about external group %s: %s", deputy_id, chat.id, notify_exc)
+                    log.warning(
+                        "Could not notify owner/deputy %s about external group %s: %s",
+                        recipient_id, chat.id, notify_exc,
+                    )
+            if recipients:
+                await asyncio.gather(
+                    *(_send_external_group_notice(recipient_id) for recipient_id in sorted(recipients)),
+                    return_exceptions=True,
+                )
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
         if global_join_approval_enabled() and new_status == "administrator":
             try:
@@ -5828,10 +5850,13 @@ async def chat_member_handler(update, context):
         except Exception:
             log.exception("WELCOME_CHAT_MEMBER_HANDLER_FAILED chat_id=%s member_id=%s", chat_id, member.id)
         await notify_owners(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}", "membership")
+    # Bot membership transitions are handled by my_chat_member_handler, which sends
+    # the detailed external-group notice to the primary owner and deputies. Do not send
+    # a second generic alert here: Telegram may deliver both update types for one event.
     if member and member.is_bot and member.id == context.bot.id and old in ("left", "kicked") and new in ("member", "administrator"):
-        await notify_owners(context, f"📡 تمت إضافة البوت إلى مجموعة\nالمجموعة: {cm.chat.title or chat_id}\nالمعرّف: {chat_id}\nالحالة: {new}", "groups")
+        log.debug("Bot-added event handled by my_chat_member_handler chat_id=%s", chat_id)
     if member and member.is_bot and member.id == context.bot.id and new in ("left", "kicked"):
-        await notify_owners(context, f"⚠️ أُزيل البوت أو حُظر من مجموعة\nالمجموعة: {cm.chat.title or chat_id}\nالمعرّف: {chat_id}", "groups")
+        log.debug("Bot-removal event handled by my_chat_member_handler chat_id=%s", chat_id)
     # Welcome / entry message deletion is handled by service messages.
     if s["entry"] and new == "member" and old in ("left", "kicked"):
         # Telegram may not allow deleting every service message in every chat state.
@@ -7381,10 +7406,12 @@ async def callback(update, context):
                     status = getattr(member, "status", "unknown")
                     checked += 1
                     if status in ("left", "kicked"):
+                        was_active = db.execute("SELECT COALESCE(is_member,1) FROM external_group_control WHERE chat_id=?", (int(check_id),)).fetchone()
                         db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
-                        archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
+                        if was_active and was_active[0]:
+                            archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
+                            removed += 1
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(check_id),))
-                        removed += 1
                     elif status in ("member", "administrator", "creator", "restricted"):
                         db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
                     else:
@@ -10763,7 +10790,9 @@ async def active_group_refresh_worker(app):
     while True:
         try:
             bot_user = await app.bot.get_me()
-            rows = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY chat_id").fetchall()
+            rows = db.execute("""SELECT chat_id, title FROM watched_groups
+                UNION SELECT chat_id, title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1
+                ORDER BY chat_id""").fetchall()
             for chat_id, title in rows:
                 try:
                     member = await app.bot.get_chat_member(chat_id=int(chat_id), user_id=bot_user.id)
@@ -10818,8 +10847,11 @@ async def group_greeting_worker(app):
             await asyncio.sleep(max(1, (scheduled_time - datetime.now(tz)).total_seconds()))
             # Use the scheduled date, not a possibly delayed wall-clock date, for deduplication.
             day_key = scheduled_time.date().isoformat()
-            rows = db.execute("""SELECT chat_id, title FROM watched_groups
-                UNION SELECT chat_id, title FROM external_group_control WHERE is_external=1 AND enabled=1 AND is_member=1""").fetchall()
+            rows = db.execute("""SELECT w.chat_id, w.title FROM watched_groups w
+                LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
+                WHERE e.chat_id IS NULL OR e.is_external=0 OR (e.enabled=1 AND COALESCE(e.is_member,1)=1)
+                UNION SELECT chat_id, title FROM external_group_control
+                WHERE is_external=1 AND enabled=1 AND COALESCE(is_member,1)=1""").fetchall()
             bot_user = await app.bot.get_me()
             photo_file_id = None
             try:
