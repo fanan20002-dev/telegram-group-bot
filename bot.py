@@ -2076,7 +2076,10 @@ def panel_markup(uid):
         if can_use_capability(uid, "message_lock") or capability_group_ids(uid, "message_lock"):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
         if can_use_capability(uid, "join_approval", 0):
-            delegated_rows.append([InlineKeyboardButton(("🔓 فتح الدخول لجميع القروبات" if global_join_approval_enabled() else "🔒 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")])
+            delegated_rows.append([
+                InlineKeyboardButton("🔒 قفل الدخول لجميع القروبات", callback_data="joinapproval_global_on"),
+                InlineKeyboardButton("🔓 فتح الدخول لجميع القروبات", callback_data="joinapproval_global_off"),
+            ])
         if (can_use_capability(uid, "reentry") or capability_group_ids(uid, "reentry")
                 or can_use_capability(uid, "join_approval") or capability_group_ids(uid, "join_approval")):
             delegated_rows.append([InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات الانضمام", callback_data="restricted_members")])
@@ -2133,7 +2136,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("👁️ مراقبة القروبات المسجلة", callback_data="monitor_groups")],
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات والتحليل", callback_data="group_controls")],
-        [InlineKeyboardButton(("🔓 فتح الدخول لجميع القروبات" if global_join_approval_enabled() else "🔒 قفل الدخول لجميع القروبات"), callback_data="joinapproval_global_toggle")],
+        [InlineKeyboardButton("🔒 قفل الدخول لجميع القروبات", callback_data="joinapproval_global_on"), InlineKeyboardButton("🔓 فتح الدخول لجميع القروبات", callback_data="joinapproval_global_off")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
@@ -5863,15 +5866,13 @@ async def chat_member_handler(update, context):
     member = cm.new_chat_member.user
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
-        # Primary owner, registered deputy owners, and delegated owners may add members directly.
-        # Other actors must use a join-request link when approval is enabled.
+        # The primary owner and registered deputy owners are explicitly allowed to add
+        # members directly, including members with older re-entry/global-ban records.
         actor = getattr(cm, "from_user", None)
         actor_id = int(getattr(actor, "id", 0) or 0)
-        authorized_direct_add = bool(actor_id and (
-            is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)
-        ))
+        owner_or_deputy_added = bool(actor_id and (is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)))
         restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
-        if restriction and restriction[0] in ("pending", "blocked") and not authorized_direct_add:
+        if restriction and restriction[0] in ("pending", "blocked") and not owner_or_deputy_added:
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                 log_action(chat_id, member.id, "reentry_reblocked", restriction[1] or restriction[0])
@@ -5885,9 +5886,9 @@ async def chat_member_handler(update, context):
             if approved_request:
                 db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
                 db.commit()
-            elif not authorized_direct_add:
-                # With approval enabled, block direct joins/additions unless approved or
-                # explicitly added by the primary owner, a deputy, or a delegated owner.
+            elif not owner_or_deputy_added:
+                # With approval enabled, block direct joins/additions unless the member
+                # was approved or was explicitly added by the primary owner/deputy.
                 log_action(chat_id, member.id, "join_approval_required", f"direct_entry_blocked; actor={actor_id}")
                 try:
                     await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
@@ -5904,13 +5905,13 @@ async def chat_member_handler(update, context):
                 return
             # Direct additions are permitted only when Telegram identifies the primary
             # owner or a registered deputy as the actor. Notify both roles after success.
-            elif authorized_direct_add:
+            elif owner_or_deputy_added:
                 log_action(chat_id, member.id, "owner_deputy_direct_add_allowed", f"actor={actor_id}")
                 await notify_owner_and_deputies(
                     context,
                     f"📥 دخول عضو بإضافة مباشرة مصرح بها\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\n"
                     f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\n"
-                    f"أضافه: {getattr(actor, 'full_name', 'مسؤول مخوّل') or 'مسؤول مخوّل'} (ID: {actor_id})\n"
+                    f"أضافه: {getattr(actor, 'full_name', 'المالك/نائب المالك') or 'المالك/نائب المالك'} (ID: {actor_id})\n"
                     "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك أو المالك المفوّض."
                 )
         if global_ban_applies(member.id, chat_id):
@@ -6728,10 +6729,22 @@ async def callback(update, context):
     uid = q.from_user.id
     data = q.data or ""
 
-    if data == "joinapproval_global_toggle":
+    if data in ("joinapproval_global_toggle", "joinapproval_global_on", "joinapproval_global_off"):
         if not (is_owner(uid) or can_use_capability(uid, "join_approval", 0)):
             await safe_callback_answer(q, "تحتاج إلى صلاحية قفل الدخول لجميع القروبات.", show_alert=True); return
-        enabling = not global_join_approval_enabled()
+        if data == "joinapproval_global_on":
+            enabling = True
+        elif data == "joinapproval_global_off":
+            enabling = False
+        else:
+            enabling = not global_join_approval_enabled()
+        if enabling == global_join_approval_enabled():
+            await safe_callback_answer(q, "قفل الدخول مضبوط بالفعل على هذه الحالة.")
+            try:
+                await q.edit_message_reply_markup(reply_markup=panel_markup(uid))
+            except Exception:
+                pass
+            return
         groups = db.execute("""SELECT chat_id, title FROM (
             SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM watched_groups
             UNION
@@ -11225,6 +11238,11 @@ def main():
             return
         if "terminated by other getUpdates request" in error_text or "Conflict: terminated by other getUpdates request" in error_text:
             log.error("Telegram polling conflict: another instance is polling this bot token. Stop duplicate Render/local instances; only one polling process may run.")
+            return
+        if isinstance(error, (httpx.TimeoutException, httpx.NetworkError)) or "Bad Gateway" in error_text or "Timed out" in error_text:
+            # Telegram/network transient failures should be visible without treating a
+            # single failed request as a fatal application error. PTB's polling loop retries.
+            log.warning("Temporary Telegram/network error; polling should retry automatically: %s", error)
             return
         log.error("Update error: %s", error, exc_info=error)
 
