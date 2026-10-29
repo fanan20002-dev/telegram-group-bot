@@ -693,6 +693,14 @@ db.execute("""CREATE TABLE IF NOT EXISTS group_greeting_deliveries(
     chat_id INTEGER NOT NULL, greeting_date TEXT NOT NULL, period TEXT NOT NULL,
     sent_at TEXT NOT NULL, PRIMARY KEY(chat_id,greeting_date,period)
 )""")
+db.execute("""CREATE TABLE IF NOT EXISTS member_profile_snapshots(
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(chat_id,user_id)
+)""")
 
 db.execute("""CREATE TABLE IF NOT EXISTS motivation_posts(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1924,6 +1932,59 @@ EXTERNAL_CAPABILITY_LABELS = {
     "stats": "📊 الإحصائيات",
     "ai": "🧠 الذكاء الاصطناعي",
 }
+
+
+async def refresh_external_group_membership(bot):
+    """Refresh external-group membership before displaying the active list.
+
+    Only confirmed non-membership is hidden; transient/network errors preserve records.
+    Historical settings and audit data are retained.
+    """
+    bot_user = await bot.get_me()
+    rows = db.execute(
+        "SELECT chat_id,title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1"
+    ).fetchall()
+    checked = removed = uncertain = 0
+    inactive_statuses = {"left", "kicked"}
+    for chat_id, title in rows:
+        cid = int(chat_id)
+        try:
+            member = await bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
+            status = str(getattr(member, "status", "unknown")).lower()
+            is_member_flag = getattr(member, "is_member", None)
+            confirmed_inactive = status in inactive_statuses or (status == "restricted" and is_member_flag is False)
+            checked += 1
+            if confirmed_inactive:
+                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), cid))
+                archive_watched_group(cid, "external_group_open_panel_confirmed_inactive")
+                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
+                removed += 1
+                log.info("External group hidden after confirmed membership check: %s (%s)", title, cid)
+            elif status in ("member", "administrator", "creator") or (status == "restricted" and is_member_flag is True):
+                db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), cid))
+            else:
+                uncertain += 1
+        except (Forbidden, BadRequest) as exc:
+            message = str(exc).lower()
+            definitive = any(token in message for token in (
+                "chat not found", "bot is not a member", "not a member of the chat",
+                "not a member of the supergroup", "user not found", "was kicked", "kicked from",
+            ))
+            if definitive:
+                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), cid))
+                archive_watched_group(cid, "external_group_open_panel_confirmed_inactive_api_error")
+                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
+                removed += 1
+                log.info("External group hidden after definitive Telegram membership error: %s (%s): %s", title, cid, exc)
+            else:
+                uncertain += 1
+                log.warning("External group membership uncertain; preserving record %s (%s): %s", title, cid, exc)
+        except Exception as exc:
+            uncertain += 1
+            log.warning("External group membership check failed; preserving record %s (%s): %s", title, cid, exc)
+        await asyncio.sleep(0.1)
+    db.commit()
+    return checked, removed, uncertain
 
 
 def external_groups_markup():
@@ -5252,6 +5313,62 @@ async def set_member_title_cmd(update, context):
     log_action(chat.id,user.id,"member_title_rule_set",f"threshold={threshold}; title={title}")
     await msg.reply_text(f"✅ تم ضبط اللقب «{title}» ابتداءً من {threshold} نقطة.")
 
+async def track_group_member_profile(update, context):
+    """Track visible profile-name changes when a member next sends a group message.
+
+    Telegram Bot API does not provide a standalone event for a user's profile-name
+    change. Therefore this check can only detect the change on the member's next
+    message/update in a group where the bot receives messages.
+    """
+    msg = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not user or getattr(user, "is_bot", False):
+        return
+    if not external_group_active(chat.id):
+        return
+    display_name = (getattr(user, "full_name", "") or "عضو").strip()[:250]
+    username = (getattr(user, "username", "") or "").strip()[:100]
+    row = db.execute(
+        "SELECT display_name, username FROM member_profile_snapshots WHERE chat_id=? AND user_id=?",
+        (int(chat.id), int(user.id)),
+    ).fetchone()
+    if row is None:
+        db.execute(
+            "INSERT OR IGNORE INTO member_profile_snapshots(chat_id,user_id,display_name,username,updated_at) VALUES(?,?,?,?,?)",
+            (int(chat.id), int(user.id), display_name, username, now()),
+        )
+        db.commit()
+        return
+    old_name, old_username = row[0] or "", row[1] or ""
+    if old_name != display_name or old_username != username:
+        db.execute(
+            "UPDATE member_profile_snapshots SET display_name=?,username=?,updated_at=? WHERE chat_id=? AND user_id=?",
+            (display_name, username, now(), int(chat.id), int(user.id)),
+        )
+        db.commit()
+        # Only announce actual observed changes; never announce a first-seen member.
+        changes = []
+        if old_name != display_name:
+            changes.append(f"الاسم السابق: {html.escape(old_name or 'غير معروف')}\nالاسم الحالي: {html.escape(display_name or 'غير معروف')}")
+        if old_username != username:
+            changes.append(f"المعرّف السابق: @{html.escape(old_username) if old_username else 'غير موجود'}\nالمعرّف الحالي: @{html.escape(username) if username else 'غير موجود'}")
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="✏️ تم رصد تحديث بيانات عضو\n"
+                     f"العضو: {html.escape(display_name)}\n"
+                     f"🆔 ID: {int(user.id)}\n" + "\n".join(changes),
+                parse_mode="HTML",
+                disable_notification=True,
+            )
+            log.info("MEMBER_PROFILE_CHANGE_NOTIFIED chat_id=%s user_id=%s", chat.id, user.id)
+        except Exception as exc:
+            log.info("Member profile change notice failed chat=%s user=%s: %s", chat.id, user.id, exc)
+
+
 async def message_filter(update, context):
     msg = update.effective_message
     chat = update.effective_chat
@@ -5837,6 +5954,12 @@ async def chat_member_handler(update, context):
         )
         db.commit()
         log_action(chat_id, member.id, "member_join", member.full_name)
+        db.execute(
+            "INSERT INTO member_profile_snapshots(chat_id,user_id,display_name,username,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username, updated_at=excluded.updated_at",
+            (int(chat_id), int(member.id), (member.full_name or "عضو")[:250], (member.username or "")[:100], now()),
+        )
+        db.commit()
         # Do not depend solely on Telegram's optional NEW_CHAT_MEMBERS service message.
         # The chat_member update is sufficient to welcome the member; the database key
         # prevents a duplicate if the service-message handler also fires.
@@ -7395,43 +7518,24 @@ async def callback(update, context):
     if data in {"external_groups", "external_groups_refresh"}:
         if not can_manage_external_groups(uid):
             await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
+        if data == "external_groups":
+            # Reconcile membership whenever the panel opens so stale names do not
+            # remain visible merely because the user did not press Refresh.
+            try:
+                await refresh_external_group_membership(context.bot)
+            except Exception:
+                log.exception("External group membership refresh on panel open failed")
         if data == "external_groups_refresh":
             await safe_callback_answer(q, "جارٍ التحقق من عضوية البوت في القروبات…")
-            bot_user = await context.bot.get_me()
-            rows_to_check = db.execute("SELECT chat_id,title FROM external_group_control WHERE is_external=1").fetchall()
-            checked = 0; removed = 0; uncertain = 0
-            for check_id, check_title in rows_to_check:
-                try:
-                    member = await context.bot.get_chat_member(chat_id=int(check_id), user_id=bot_user.id)
-                    status = getattr(member, "status", "unknown")
-                    checked += 1
-                    if status in ("left", "kicked"):
-                        was_active = db.execute("SELECT COALESCE(is_member,1) FROM external_group_control WHERE chat_id=?", (int(check_id),)).fetchone()
-                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
-                        if was_active and was_active[0]:
-                            archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
-                            removed += 1
-                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(check_id),))
-                    elif status in ("member", "administrator", "creator", "restricted"):
-                        db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
-                    else:
-                        uncertain += 1
-                except (Forbidden, BadRequest) as exc:
-                    msg = str(exc).lower()
-                    if any(token in msg for token in ("chat not found", "bot is not a member", "user not found", "kicked")):
-                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
-                        archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
-                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(check_id),))
-                        removed += 1
-                    else:
-                        uncertain += 1
-                        log.warning("External group refresh uncertain for %s: %s", check_id, exc)
-                except Exception as exc:
-                    uncertain += 1
-                    log.warning("External group refresh temporary failure for %s: %s", check_id, exc)
-                await asyncio.sleep(0.1)
-            db.commit()
-            await safe_callback_answer(q, f"تم التحديث: فُحص {checked}، وأُخفي {removed} قروبًا غير متاح، وتعذر التأكد من {uncertain}.")
+            try:
+                checked, removed, uncertain = await refresh_external_group_membership(context.bot)
+                await safe_callback_answer(
+                    q,
+                    f"تم التحديث: فُحص {checked}، وأُخفي {removed} قروبًا غير نشط، وتعذر التأكد من {uncertain}.",
+                )
+            except Exception as refresh_exc:
+                log.exception("External group refresh callback failed")
+                await safe_callback_answer(q, "تعذر إكمال التحديث. لم تُحذف السجلات بسبب هذا الخطأ.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا نشطًا. استخدم زر التحديث للتحقق من العضوية الفعلية. تُحفظ السجلات والإعدادات التاريخية للقروبات التي غادرها البوت.", reply_markup=external_groups_markup()); return
     if data.startswith("external_group:"):
         if not can_manage_external_groups(uid):
@@ -10797,7 +10901,7 @@ async def active_group_refresh_worker(app):
                 try:
                     member = await app.bot.get_chat_member(chat_id=int(chat_id), user_id=bot_user.id)
                     status = getattr(member, "status", "unknown")
-                    if status in ("left", "kicked"):
+                    if status in ("left", "kicked") or (status == "restricted" and getattr(member, "is_member", True) is False):
                         db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
                         archive_watched_group(int(chat_id), "periodic_membership_refresh_confirmed_inactive")
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
@@ -10807,7 +10911,7 @@ async def active_group_refresh_worker(app):
                     message = str(exc).lower()
                     # Only treat definitive membership/chat errors as removal. Other BadRequest
                     # messages can be transient or caused by Telegram API limitations.
-                    if any(token in message for token in ("chat not found", "bot is not a member", "user not found", "kicked")):
+                    if any(token in message for token in ("chat not found", "bot is not a member", "not a member of the chat", "not a member of the supergroup", "user not found", "was kicked", "kicked from")):
                         db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
                         archive_watched_group(int(chat_id), "periodic_membership_refresh_confirmed_inactive")
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
@@ -11032,6 +11136,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, owner_autoreply_text_handler), group=-2)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, broadcast_draft_message), group=-1)
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_listener), group=-1)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, track_group_member_profile), group=-10)
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER), group=0)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(ChatJoinRequestHandler(chat_join_request_handler), group=0)
