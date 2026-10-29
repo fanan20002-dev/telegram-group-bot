@@ -750,7 +750,7 @@ db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updat
 _legacy_join_lock_unconfigured = bool(db.execute(
     "SELECT 1 FROM global_join_approval_settings WHERE id=1 AND COALESCE(updated_at,'')=''"
 ).fetchone())
-db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1 AND COALESCE(updated_at,'')=''", (now(),))
+db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1 AND COALESCE(updated_at,'')=''", (datetime.now(timezone.utc).isoformat(),))
 if _legacy_join_lock_unconfigured:
     # The previous version could leave per-group flags ON while the central row had
     # never been intentionally configured. Clear only owner-managed groups on this
