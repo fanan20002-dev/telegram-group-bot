@@ -3057,15 +3057,8 @@ async def get_verified_active_watched_groups(bot, limit=None):
                 db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
                 db.commit()
                 continue
-            is_member = getattr(member, "is_member", True)
-            if status in ("member", "administrator", "creator") or (status == "restricted" and is_member):
+            if status in ("member", "administrator", "creator", "restricted"):
                 active.append((int(cid), title))
-            else:
-                # Any confirmed non-membership state must not remain in active lists.
-                db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
-                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
-                db.commit()
-                log.info("Removed non-member group from active list: %s (%s), status=%s", title, cid, status)
         except Exception as exc:
             # Unknown/transient API errors must not delete configuration, but unverified
             # groups are omitted from this particular selection list.
@@ -3700,6 +3693,10 @@ def group_owner_panel_markup(chat_id, uid=None):
          InlineKeyboardButton("🏷️ الرتب والصلاحيات", callback_data=f"group_panel_roles:{chat_id}")],
         [InlineKeyboardButton("📊 إحصائيات القروب", callback_data=f"group_panel_stats:{chat_id}"),
          InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
+        [InlineKeyboardButton("👋 إعدادات الترحيب", callback_data=f"welcome_group:{chat_id}"),
+         InlineKeyboardButton("⚠️ إدارة الإنذارات", callback_data=f"group_panel_warnings:{chat_id}")],
+        [InlineKeyboardButton("🗑️ مسح 1–500 رسالة", callback_data=f"group_panel_bulkdelete:{chat_id}"),
+         InlineKeyboardButton("👮 دليل إدارة المشرفين", callback_data=f"group_panel_staffhelp:{chat_id}")],
     ]
     external_tag_default = bool((external_group_info(chat_id) or (0,))[0]) and external_group_cap_enabled(chat_id, "tag")
     if uid is not None and (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "tag", chat_id) or external_tag_default):
@@ -5648,11 +5645,7 @@ async def chat_member_handler(update, context):
     if not cm or not cm.chat:
         return
     chat_id = cm.chat.id
-    # Registration is driven by MY_CHAT_MEMBER when the bot itself is added.
-    # Ordinary member updates must not resurrect stale/unregistered groups in admin panels.
-    if db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-        db.execute("UPDATE watched_groups SET title=? WHERE chat_id=?", (cm.chat.title or "", chat_id))
-        db.commit()
+    register_group(cm.chat, update.effective_user)
     # Define transition values before using them in membership statistics.
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
@@ -6944,7 +6937,6 @@ async def callback(update, context):
         try: target_uid=int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q,"معرّف المستخدم غير صحيح.",show_alert=True); return
         if target_uid <= 0 or target_uid == OWNER_ID: await safe_callback_answer(q,"لا يمكن تعديل حساب المالك الأساسي.",show_alert=True); return
-        await get_verified_active_watched_groups(context.bot, limit=500)
         await q.edit_message_text(f"📍 اختر قروبًا لتحديد صلاحيات المستخدم {target_uid}.",reply_markup=unified_group_list_markup(target_uid)); return
     if data.startswith("unifiedgroup:"):
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
@@ -8097,7 +8089,7 @@ async def callback(update, context):
         return
 
     # لوحة القروب المحلية: كل callback يعيد التحقق من كون المستخدم مشرف Telegram في القروب نفسه.
-    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:")):
+    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:", "group_panel_warnings:", "group_panel_bulkdelete:", "group_panel_staffhelp:")):
         try:
             action, chat_raw = data.split(":", 1)
             group_chat_id = int(chat_raw)
@@ -8117,10 +8109,38 @@ async def callback(update, context):
             required_cap = {
                 "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
                 "group_panel_admin": "members", "group_panel_roles": "members",
-                "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag"
+                "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
+                "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
             }.get(action)
             if required_cap and not external_group_cap_enabled(group_chat_id, required_cap):
                 await safe_callback_answer(q, "هذه الخدمة غير مفعّلة لهذا القروب من المالك الأساسي.", show_alert=True); return
+        if action == "group_panel_bulkdelete":
+            await q.edit_message_text(
+                "🗑️ مسح الرسائل — هذا القروب فقط\n\n"
+                "اكتب داخل القروب: مسح 1 إلى مسح 500، مثل: مسح 50.\n"
+                "سيحذف البوت الرسائل التي رصدها منذ تشغيله فقط، وقد يتعذر حذف بعض الرسائل وفق قيود تيليجرام.\n"
+                "تأكد من العدد قبل التنفيذ. يلزم امتلاك صلاحية الحذف.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]])
+            )
+            return
+        if action == "group_panel_warnings":
+            await q.edit_message_text(
+                "⚠️ إدارة الإنذارات — هذا القروب فقط\n\n"
+                "لإنذار عضو: رد على رسالته واكتب /warn السبب، أو استخدم /warn ID السبب وفق الصلاحيات المتاحة.\n"
+                "يعرض البوت سجل الإنذارات في بطاقة الإنذار، ويمكن للمخولين إلغاء آخر إنذار أو تصفير السجل من الأزرار المتاحة.\n"
+                "الحد الآلي الحالي: عند الإنذار الثالث قد يُكتم العضو 3 أيام وفق نظام البوت وصلاحياته.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]])
+            )
+            return
+        if action == "group_panel_staffhelp":
+            await q.edit_message_text(
+                "👮 إدارة المشرفين والمدراء — هذا القروب فقط\n\n"
+                "لإسناد رتبة داخل نظام البوت، رد على رسالة العضو داخل القروب واكتب: رفع مشرف، رفع مشرف عام، رفع مدير، أو رفع مدير عام.\n"
+                "لإزالة رتبته داخل البوت: رد على رسالته واكتب: تنزيل رتبة.\n"
+                "تنبيه: هذه الرتب داخل البوت ولا ترفع أو تسحب رتبة Telegram تلقائيًا. ترقية مشرف Telegram أو خفضه تتطلب مسارًا منفصلًا وصلاحيات Telegram المناسبة.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]])
+            )
+            return
         if action == "group_panel_toggle_links":
             current = get_settings(group_chat_id).get("links", 0)
             if current and not (is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", group_chat_id))):
@@ -10655,10 +10675,7 @@ async def active_group_refresh_worker(app):
                     message = str(exc).lower()
                     # Only treat definitive membership/chat errors as removal. Other BadRequest
                     # messages can be transient or caused by Telegram API limitations.
-                    if any(token in message for token in (
-                        "chat not found", "bot is not a member", "user not found", "kicked",
-                        "bot was kicked", "not a member of the supergroup", "group chat was upgraded"
-                    )):
+                    if any(token in message for token in ("chat not found", "bot is not a member", "user not found", "kicked")):
                         db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
                         db.commit()
