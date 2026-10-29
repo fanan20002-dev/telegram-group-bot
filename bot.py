@@ -284,13 +284,41 @@ CREATE TABLE IF NOT EXISTS watched_groups(
     added_at TEXT
 )
 """)
+# Keep an audit trail when a group is removed from active lists after confirmed bot departure.
+db.execute("""CREATE TABLE IF NOT EXISTS archived_group_membership_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT DEFAULT '',
+    added_at TEXT DEFAULT '',
+    archived_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'membership_unavailable'
+)""")
+
+def archive_watched_group(chat_id, reason):
+    """Preserve group identity/history before removing it from active selection."""
+    row = db.execute("SELECT title, added_at FROM watched_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
+    if row:
+        db.execute(
+            "INSERT INTO archived_group_membership_events(chat_id,title,added_at,archived_at,reason) VALUES(?,?,?,?,?)",
+            (int(chat_id), row[0] or '', row[1] or '', datetime.now(timezone.utc).isoformat(), str(reason)[:120]),
+        )
+
 # External groups are isolated by chat; all new groups default to no AI and no privileged cross-group tools.
 db.execute("""CREATE TABLE IF NOT EXISTS external_group_control(
     chat_id INTEGER PRIMARY KEY, title TEXT DEFAULT '', is_external INTEGER NOT NULL DEFAULT 1,
     added_by INTEGER NOT NULL DEFAULT 0, added_by_name TEXT DEFAULT '', added_by_username TEXT DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1, ai_enabled INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_member INTEGER NOT NULL DEFAULT 1
 )""")
+# Additive migration: track verified Telegram membership without deleting historical group settings.
+try:
+    _ext_cols = {r[1] for r in db.execute("PRAGMA table_info(external_group_control)").fetchall()}
+    if "is_member" not in _ext_cols:
+        db.execute("ALTER TABLE external_group_control ADD COLUMN is_member INTEGER NOT NULL DEFAULT 1")
+        db.commit()
+except Exception:
+    log.exception("Could not add external group membership status column")
+
 db.execute("""CREATE TABLE IF NOT EXISTS external_group_capabilities(
     chat_id INTEGER NOT NULL, capability TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
     granted_by INTEGER NOT NULL DEFAULT 0, granted_at TEXT NOT NULL,
@@ -661,6 +689,11 @@ db.execute("""CREATE TABLE IF NOT EXISTS motivation_groups(
     enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 )""")
+db.execute("""CREATE TABLE IF NOT EXISTS group_greeting_deliveries(
+    chat_id INTEGER NOT NULL, greeting_date TEXT NOT NULL, period TEXT NOT NULL,
+    sent_at TEXT NOT NULL, PRIMARY KEY(chat_id,greeting_date,period)
+)""")
+
 db.execute("""CREATE TABLE IF NOT EXISTS motivation_posts(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     draft_id INTEGER NOT NULL,
@@ -1897,12 +1930,13 @@ def external_groups_markup():
     rows = []
     groups = db.execute("""SELECT e.chat_id,COALESCE(NULLIF(e.title,''),w.title,e.chat_id),e.enabled,e.added_by_name,e.added_by
         FROM external_group_control e LEFT JOIN watched_groups w ON w.chat_id=e.chat_id
-        WHERE e.is_external=1 ORDER BY e.created_at DESC LIMIT 60""").fetchall()
+        WHERE e.is_external=1 AND COALESCE(e.is_member,1)=1 ORDER BY e.created_at DESC LIMIT 60""").fetchall()
     for cid, title, enabled, added_name, added_by in groups:
         state = "🟢" if enabled else "🔴"
         rows.append([InlineKeyboardButton(f"{state} {str(title)[:45]} · {cid}", callback_data=f"external_group:{cid}")])
     if not rows:
         rows.append([InlineKeyboardButton("لا توجد قروبات خارجية مسجلة حتى الآن", callback_data="noop")])
+    rows.append([InlineKeyboardButton("🔄 تحديث القروبات والتحقق من العضوية", callback_data="external_groups_refresh")])
     rows.append([InlineKeyboardButton("🆘 صندوق الدعم الفني", callback_data="external_support_inbox")])
     rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -3053,6 +3087,7 @@ async def get_verified_active_watched_groups(bot, limit=None):
             member = await bot.get_chat_member(chat_id=int(cid), user_id=bot_id)
             status = getattr(member, "status", "")
             if status in ("left", "kicked"):
+                archive_watched_group(int(cid), "telegram_membership_left_or_kicked")
                 db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
                 db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
                 db.commit()
@@ -4633,7 +4668,31 @@ async def ArabicTextCommand(update, context):
     # This is deliberately checked before other Arabic text commands.
     normalized_role_query = re.sub(r"[؟?!،,.]+$", "", text).strip()
     if normalized_role_query in {"رتبتي", "ما رتبتي", "وش رتبتي", "ماهي رتبتي", "ما هي رتبتي", "منصبي", "ما منصبي"}:
-        await update.effective_message.reply_text(f"🪪 رتبتك: {role_name(update.effective_user.id)}")
+        uid = update.effective_user.id
+        chat_id = update.effective_chat.id
+        local_role = group_role(chat_id, uid)
+        if is_owner(uid):
+            shown_role = "👑 مالك أساسي"
+        elif is_deputy_owner(uid):
+            shown_role = "👑 نائب مالك"
+        elif is_delegated_owner(uid):
+            shown_role = "🛡️ مالك مفوض"
+        elif local_role:
+            shown_role = {"مشرف": "🛡️ مشرف", "مشرف عام": "🛡️ مشرف عام", "مدير": "🔰 مدير", "مدير عام": "🔰 مدير عام"}.get(local_role, local_role)
+        elif is_general_manager(uid):
+            shown_role = "🔰 مدير عام"
+        elif is_protection_manager(uid):
+            shown_role = "🛡️ مدير حماية"
+        else:
+            # Reflect Telegram admin status too, without claiming bot-specific privileges.
+            try:
+                member = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
+                if member.status == "creator": shown_role = "👑 مالك القروب"
+                elif member.status == "administrator": shown_role = "🛡️ مشرف بالقروب"
+                else: shown_role = "👤 عضو"
+            except Exception:
+                shown_role = "👤 عضو"
+        await update.effective_message.reply_text(f"🪪 رتبتك في هذا القروب: {shown_role}")
         return
     if text in {"اعدادات", "إعدادات", "اعدادات البوت", "إعدادات البوت", "مساعدة", "اوامر البوت", "أوامر البوت"}:
         await public_settings(update, context)
@@ -5569,6 +5628,8 @@ async def my_chat_member_handler(update, context):
 
     if bot_joined:
         register_group(chat, actor)
+        db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        db.commit()
         actor_id = int(getattr(actor, "id", 0) or 0)
         ext = external_group_info(chat.id)
         external = bool(ext and ext[0])
@@ -5601,13 +5662,18 @@ async def my_chat_member_handler(update, context):
             f"حالة الخدمة: {'مفعّلة' if enabled else 'متوقفة بقرار سابق من المالك'}\n"
             "الذكاء الاصطناعي للقروبات الخارجية معطّل افتراضيًا."
         )
-        # Group-registration details (especially links) are sent only to the primary owner.
-        # Delegated owners can receive these details only through a separately authorized workflow.
-        if OWNER_ID:
-            try:
-                await context.bot.send_message(chat_id=OWNER_ID, text=notice)
-            except Exception as notify_exc:
-                log.info("Could not notify primary owner about external group %s: %s", chat.id, notify_exc)
+        # External-group addition notices are sent to deputy owner(s) only, as requested.
+        # Do not send this notice to the primary owner, delegated owners, or managers.
+        if external:
+            deputy_rows = db.execute(
+                "SELECT user_id FROM deputy_owners WHERE user_id<>? ORDER BY user_id",
+                (int(OWNER_ID or 0),),
+            ).fetchall()
+            for (deputy_id,) in deputy_rows:
+                try:
+                    await context.bot.send_message(chat_id=int(deputy_id), text=notice)
+                except Exception as notify_exc:
+                    log.info("Could not notify deputy owner %s about external group %s: %s", deputy_id, chat.id, notify_exc)
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
         if global_join_approval_enabled() and new_status == "administrator":
             try:
@@ -5626,7 +5692,8 @@ async def my_chat_member_handler(update, context):
     if bot_left:
         # Remove the group from active group lists immediately. Keep its historical
         # configuration/audit rows intact so this cleanup does not damage other modules.
-        db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        archive_watched_group(chat.id, "bot_removed_from_group_event")
         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (chat.id,))
         db.commit()
         actor_id = int(getattr(actor, "id", 0) or 0)
@@ -7300,10 +7367,45 @@ async def callback(update, context):
         await q.edit_message_text("👑 إدارة نائب المالك\n\nتم تحديث القائمة.", reply_markup=InlineKeyboardMarkup(buttons)); return
 
     # External group control center: owner or users explicitly granted external_groups.
-    if data == "external_groups":
+    if data in {"external_groups", "external_groups_refresh"}:
         if not can_manage_external_groups(uid):
             await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
-        await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا لعرض معلوماته، وصلاحياته المتاحة، وحالة تفعيله. الذكاء الاصطناعي معطل افتراضيًا للقروبات الخارجية.", reply_markup=external_groups_markup()); return
+        if data == "external_groups_refresh":
+            await safe_callback_answer(q, "جارٍ التحقق من عضوية البوت في القروبات…")
+            bot_user = await context.bot.get_me()
+            rows_to_check = db.execute("SELECT chat_id,title FROM external_group_control WHERE is_external=1").fetchall()
+            checked = 0; removed = 0; uncertain = 0
+            for check_id, check_title in rows_to_check:
+                try:
+                    member = await context.bot.get_chat_member(chat_id=int(check_id), user_id=bot_user.id)
+                    status = getattr(member, "status", "unknown")
+                    checked += 1
+                    if status in ("left", "kicked"):
+                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
+                        archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
+                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(check_id),))
+                        removed += 1
+                    elif status in ("member", "administrator", "creator", "restricted"):
+                        db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
+                    else:
+                        uncertain += 1
+                except (Forbidden, BadRequest) as exc:
+                    msg = str(exc).lower()
+                    if any(token in msg for token in ("chat not found", "bot is not a member", "user not found", "kicked")):
+                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(check_id)))
+                        archive_watched_group(int(check_id), "external_group_refresh_confirmed_inactive")
+                        db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(check_id),))
+                        removed += 1
+                    else:
+                        uncertain += 1
+                        log.warning("External group refresh uncertain for %s: %s", check_id, exc)
+                except Exception as exc:
+                    uncertain += 1
+                    log.warning("External group refresh temporary failure for %s: %s", check_id, exc)
+                await asyncio.sleep(0.1)
+            db.commit()
+            await safe_callback_answer(q, f"تم التحديث: فُحص {checked}، وأُخفي {removed} قروبًا غير متاح، وتعذر التأكد من {uncertain}.")
+        await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا نشطًا. استخدم زر التحديث للتحقق من العضوية الفعلية. تُحفظ السجلات والإعدادات التاريخية للقروبات التي غادرها البوت.", reply_markup=external_groups_markup()); return
     if data.startswith("external_group:"):
         if not can_manage_external_groups(uid):
             await safe_callback_answer(q, "غير مصرح لك بإدارة القروبات الخارجية.", show_alert=True); return
@@ -10667,7 +10769,8 @@ async def active_group_refresh_worker(app):
                     member = await app.bot.get_chat_member(chat_id=int(chat_id), user_id=bot_user.id)
                     status = getattr(member, "status", "unknown")
                     if status in ("left", "kicked"):
-                        db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        archive_watched_group(int(chat_id), "periodic_membership_refresh_confirmed_inactive")
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
                         db.commit()
                         log.info("Removed inactive group from active lists: %s (%s)", title, chat_id)
@@ -10676,7 +10779,8 @@ async def active_group_refresh_worker(app):
                     # Only treat definitive membership/chat errors as removal. Other BadRequest
                     # messages can be transient or caused by Telegram API limitations.
                     if any(token in message for token in ("chat not found", "bot is not a member", "user not found", "kicked")):
-                        db.execute("UPDATE external_group_control SET enabled=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), int(chat_id)))
+                        archive_watched_group(int(chat_id), "periodic_membership_refresh_confirmed_inactive")
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(chat_id),))
                         db.commit()
                         log.info("Pruned unreachable group from active lists: %s (%s): %s", title, chat_id, exc)
@@ -10693,17 +10797,97 @@ async def active_group_refresh_worker(app):
             await asyncio.sleep(120)
 
 
+async def group_greeting_worker(app):
+    """Send one public greeting per active group at 07:00 and 20:00 Riyadh time."""
+    tz = ZoneInfo("Asia/Riyadh")
+    messages = {
+        "morning": "🌅 صباح الخير والسعادة على جميع أعضاء القروب\n\n☀️ أسعد الله صباحكم بكل خير، وكتب لكم يومًا مليئًا بالتوفيق والإنجاز والراحة.\n\n🤍 جعل الله صباحكم بداية لكل خير، ورزقكم من واسع فضله.\n\nمع تحيات بوت حماية ومساعدة القروبات 🤖",
+        "evening": "🌙 مساء الخير والسرور على جميع أعضاء القروب\n\n✨ مساؤكم راحة وطمأنينة، وأوقاتكم عامرة بالخير والسعادة.\n\n🤍 نسأل الله أن يجعل مساءكم جميلًا، وأن يرزقكم راحة البال والتوفيق في كل أموركم.\n\nمع تحيات بوت حماية ومساعدة القروبات 🤖",
+    }
+    while True:
+        try:
+            current = datetime.now(tz)
+            # Select the next scheduled occurrence and retain its period after sleeping.
+            schedule = []
+            for hour, period in ((7, "morning"), (20, "evening")):
+                scheduled = current.replace(hour=hour, minute=0, second=0, microsecond=0)
+                if scheduled <= current:
+                    scheduled += timedelta(days=1)
+                schedule.append((scheduled, period))
+            scheduled_time, period = min(schedule, key=lambda item: item[0])
+            await asyncio.sleep(max(1, (scheduled_time - datetime.now(tz)).total_seconds()))
+            # Use the scheduled date, not a possibly delayed wall-clock date, for deduplication.
+            day_key = scheduled_time.date().isoformat()
+            rows = db.execute("""SELECT chat_id, title FROM watched_groups
+                UNION SELECT chat_id, title FROM external_group_control WHERE is_external=1 AND enabled=1 AND is_member=1""").fetchall()
+            bot_user = await app.bot.get_me()
+            photo_file_id = None
+            try:
+                photos = await app.bot.get_user_profile_photos(bot_user.id, limit=1)
+                if photos.total_count and photos.photos:
+                    photo_file_id = photos.photos[0][-1].file_id
+            except Exception as exc:
+                log.debug("Bot profile photo unavailable for greetings: %s", exc)
+            for chat_id, title in rows:
+                try:
+                    exists = db.execute(
+                        "SELECT 1 FROM group_greeting_deliveries WHERE chat_id=? AND greeting_date=? AND period=?",
+                        (int(chat_id), day_key, period),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    member = await app.bot.get_chat_member(chat_id=int(chat_id), user_id=bot_user.id)
+                    if getattr(member, "status", "left") not in ("member", "administrator", "creator"):
+                        continue
+                    if photo_file_id:
+                        await app.bot.send_photo(chat_id=int(chat_id), photo=photo_file_id, caption=messages[period])
+                    else:
+                        await app.bot.send_message(chat_id=int(chat_id), text=messages[period])
+                    db.execute(
+                        "INSERT OR IGNORE INTO group_greeting_deliveries(chat_id,greeting_date,period,sent_at) VALUES(?,?,?,?)",
+                        (int(chat_id), day_key, period, now()),
+                    )
+                    db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.info("Greeting delivery skipped for group %s (%s): %s", chat_id, title, exc)
+                await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Group greeting worker failed")
+            await asyncio.sleep(60)
+
+
 async def post_init(app):
-    """Start long-running assistant workers only after PTB has initialized its event loop."""
-    app.create_task(active_group_refresh_worker(app), name="active-group-refresh-worker")
-    app.create_task(assistant_reminder_worker(app), name="assistant-reminder-worker")
-    app.create_task(automatic_unmute_worker(app), name="automatic-unmute-worker")
-    app.create_task(weekly_stats_worker(app), name="weekly-group-stats-worker")
-    app.create_task(daily_member_activity_worker(app), name="daily-member-activity-worker")
-    app.create_task(owner_activity_audit_worker(app), name="owner-activity-audit-worker")
-    app.create_task(group_analysis_report_worker(app), name="group-analysis-report-worker")
-    app.create_task(weekly_security_review_worker(app), name="weekly-security-review-worker")
-    app.create_task(motivation_daily_worker(app), name="motivation-daily-worker")
+    """Start background workers on the running event loop and track them for clean shutdown."""
+    worker_specs = [
+        (active_group_refresh_worker, "active-group-refresh-worker"),
+        (assistant_reminder_worker, "assistant-reminder-worker"),
+        (automatic_unmute_worker, "automatic-unmute-worker"),
+        (weekly_stats_worker, "weekly-group-stats-worker"),
+        (daily_member_activity_worker, "daily-member-activity-worker"),
+        (owner_activity_audit_worker, "owner-activity-audit-worker"),
+        (group_analysis_report_worker, "group-analysis-report-worker"),
+        (weekly_security_review_worker, "weekly-security-review-worker"),
+        (motivation_daily_worker, "motivation-daily-worker"),
+        (group_greeting_worker, "group-greeting-worker"),
+    ]
+    app._background_worker_tasks = [
+        asyncio.create_task(worker(app), name=name) for worker, name in worker_specs
+    ]
+
+
+async def post_stop(app):
+    """Cancel and await long-running workers to avoid pending-task warnings on shutdown."""
+    tasks = list(getattr(app, "_background_worker_tasks", []))
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    app._background_worker_tasks = []
 
 
 
@@ -10769,7 +10953,7 @@ async def owner_activity_audit_worker(app):
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).post_stop(post_stop).build()
 
     command_handlers = {
         "stats_on": owner_group_feature_command, "stats_off": owner_group_feature_command, "joinalerts_on": owner_group_feature_command, "joinalerts_off": owner_group_feature_command, "leavealerts_on": owner_group_feature_command, "leavealerts_off": owner_group_feature_command, "analysis_on": owner_group_feature_command, "analysis_off": owner_group_feature_command, "joinapproval_on": owner_group_feature_command, "joinapproval_off": owner_group_feature_command, "lockall": lock_all_messages_command, "unlockall": lock_all_messages_command,
