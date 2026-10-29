@@ -742,9 +742,20 @@ db.execute("""CREATE TABLE IF NOT EXISTS global_join_approval_settings(
     id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT '', updated_by INTEGER NOT NULL DEFAULT 0
 )""")
-db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updated_at,updated_by) VALUES(1,1,'',0)")
-# One-time migration: if the old default row was never explicitly changed, enable approval by default.
-db.execute("UPDATE global_join_approval_settings SET enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=1 AND COALESCE(updated_at,'')=''")
+# Safe default: entry locking is OFF until the owner explicitly enables it.
+# Older builds accidentally initialized this switch to ON, which could block direct
+# additions by staff after deployment. Preserve an explicitly saved setting, but repair
+# the legacy untouched default row to OFF exactly once.
+db.execute("INSERT OR IGNORE INTO global_join_approval_settings(id,enabled,updated_at,updated_by) VALUES(1,0,'',0)")
+_legacy_join_lock_unconfigured = bool(db.execute(
+    "SELECT 1 FROM global_join_approval_settings WHERE id=1 AND COALESCE(updated_at,'')=''"
+).fetchone())
+db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1 AND COALESCE(updated_at,'')=''", (now(),))
+if _legacy_join_lock_unconfigured:
+    # The previous version could leave per-group flags ON while the central row had
+    # never been intentionally configured. Clear only owner-managed groups on this
+    # one-time migration; never alter external users' groups.
+    db.execute("UPDATE group_feature_settings SET join_approval_enabled=0 WHERE chat_id IN (SELECT w.chat_id FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE e.chat_id IS NULL OR COALESCE(e.is_external,0)=0)")
 # Track invite links created by this bot so it can revoke those it owns when needed.
 db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
     chat_id INTEGER NOT NULL, invite_link TEXT NOT NULL, link_type TEXT NOT NULL DEFAULT 'join_request',
@@ -5889,9 +5900,19 @@ async def chat_member_handler(update, context):
         # Telegram identifies the actor who added the user in chat_member.from_user.
         # The primary owner and registered deputy owners are explicitly allowed to add
         # members directly, including members with older re-entry/global-ban records.
+        # Telegram's ChatMemberUpdated.from_user is the authoritative actor for an
+        # actual membership transition. Do not use Message.from_user for enforcement:
+        # service messages can omit or misrepresent the actor on some update paths.
         actor = getattr(cm, "from_user", None)
         actor_id = int(getattr(actor, "id", 0) or 0)
-        owner_or_deputy_added = bool(actor_id and (is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)))
+        owner_or_deputy_added = bool(actor_id and (
+            is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)
+        ))
+        log.info(
+            "MEMBER_JOIN_TRANSITION chat_id=%s member_id=%s actor_id=%s owner_authorized=%s approval_enabled=%s",
+            chat_id, member.id, actor_id or 0, int(owner_or_deputy_added),
+            int(group_feature_enabled(chat_id, "join_approval_enabled")),
+        )
         restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
         if restriction and restriction[0] in ("pending", "blocked") and not owner_or_deputy_added:
             try:
@@ -5924,8 +5945,9 @@ async def chat_member_handler(update, context):
                     "على العضو استخدام رابط طلب الانضمام، ثم يوافق المالك الأساسي أو نائب المالك."
                 )
                 return
-            # Direct additions are permitted only when Telegram identifies the primary
-            # owner or a registered deputy as the actor. Notify both roles after success.
+            # Direct additions by the primary owner, a registered deputy, or delegated owner
+            # are explicitly permitted even while the join-request gate is enabled. Telegram
+            # may report actor_id=0 in some transition types; log that case for diagnosis.
             elif owner_or_deputy_added:
                 log_action(chat_id, member.id, "owner_deputy_direct_add_allowed", f"actor={actor_id}")
                 await notify_owner_and_deputies(
@@ -6171,20 +6193,32 @@ async def new_members(update, context):
     _owner_deputy_direct_add = bool(_adding_actor and (
         is_owner(_adding_actor.id) or is_deputy_owner(_adding_actor.id)
         or is_delegated_owner(_adding_actor.id)))
+    log.info(
+        "NEW_MEMBER_SERVICE chat_id=%s actor_id=%s owner_authorized=%s approval_enabled=%s",
+        chat.id, int(getattr(_adding_actor, "id", 0) or 0), int(_owner_deputy_direct_add),
+        int(group_feature_enabled(chat.id, "join_approval_enabled")),
+    )
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
         if group_feature_enabled(chat.id, "join_approval_enabled") and not _owner_deputy_direct_add:
             approval_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)).fetchone()
             if not approval_row or approval_row[0] not in ("approved", "joined"):
-                # The chat_member handler enforces the ban; this avoids welcoming an unapproved join.
+                # This handler only controls welcome/verification side effects. The
+                # authoritative membership enforcement is handled once in
+                # chat_member_handler, avoiding a second actor check based on Message.from_user.
+                log.info("NEW_MEMBER_APPROVAL_WELCOME_SKIPPED chat_id=%s member_id=%s actor_id=%s", chat.id, member.id, int(getattr(_adding_actor, "id", 0) or 0))
                 continue
         if global_ban_applies(member.id, chat.id) and not _owner_deputy_direct_add:
-            try:
-                await context.bot.ban_chat_member(chat_id=chat.id, user_id=member.id)
-                log_action(chat.id, member.id, "global_ban_reentry", "منع عودة عضو محظور جماعيًا")
-            except Exception as exc:
-                log.warning("Global ban enforcement failed chat=%s user=%s: %s", chat.id, member.id, exc)
+            # Enforcement is centralized in chat_member_handler, where Telegram's
+            # ChatMemberUpdated.from_user is the authoritative actor. Do not issue a
+            # second ban from the service-message handler: Telegram may report a
+            # different/missing from_user on the service Message, which previously
+            # caused authorized owner/deputy/delegate additions to be undone here.
+            log.info(
+                "NEW_MEMBER_GLOBAL_BAN_DEFERRED chat_id=%s member_id=%s actor_id=%s reason=centralized_chat_member_enforcement",
+                chat.id, member.id, int(getattr(_adding_actor, "id", 0) or 0),
+            )
             continue
 
         display_name = member.full_name or "عضو"
