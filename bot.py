@@ -758,12 +758,31 @@ def global_join_approval_enabled():
     return bool(row and row[0])
 
 
+def is_owner_managed_group(chat_id):
+    """True only for groups classified as owner-managed, never for external users' groups.
+
+    Legacy watched groups with no external-control row remain owner-managed for compatibility.
+    """
+    row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
+    return row is None or not bool(row[0])
+
+
+def owner_managed_group_rows():
+    """Return registered owner-managed groups only; external groups are intentionally excluded."""
+    return db.execute("""SELECT w.chat_id, COALESCE(NULLIF(w.title,''), CAST(w.chat_id AS TEXT))
+        FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
+        WHERE e.chat_id IS NULL OR COALESCE(e.is_external,0)=0
+        ORDER BY w.title, w.chat_id""").fetchall()
+
+
 def group_feature_enabled(chat_id, feature):
     allowed = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
     if feature not in allowed:
         return False
-    # The global lock takes precedence so new and existing registered groups are covered.
-    if feature == "join_approval_enabled" and global_join_approval_enabled():
+    # The global lock applies only to owner-managed groups. External users' groups
+    # keep their own per-group setting and are never changed by the owner's global buttons.
+    if (feature == "join_approval_enabled" and global_join_approval_enabled()
+            and is_owner_managed_group(chat_id)):
         return True
     row = db.execute(f"SELECT {feature} FROM group_feature_settings WHERE chat_id=?", (chat_id,)).fetchone()
     if row:
@@ -2077,8 +2096,8 @@ def panel_markup(uid):
             delegated_rows.append([InlineKeyboardButton("🔒 قفل/فتح الرسائل في القروبات", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في القروبات", callback_data="allmsg_open:unlock")])
         if can_use_capability(uid, "join_approval", 0):
             delegated_rows.append([
-                InlineKeyboardButton("🔒 قفل الدخول لجميع القروبات", callback_data="joinapproval_global_on"),
-                InlineKeyboardButton("🔓 فتح الدخول لجميع القروبات", callback_data="joinapproval_global_off"),
+                InlineKeyboardButton("🔒 قفل الدخول لقروبات المالك", callback_data="joinapproval_global_on"),
+                InlineKeyboardButton("🔓 فتح الدخول لقروبات المالك", callback_data="joinapproval_global_off"),
             ])
         if (can_use_capability(uid, "reentry") or capability_group_ids(uid, "reentry")
                 or can_use_capability(uid, "join_approval") or capability_group_ids(uid, "join_approval")):
@@ -2136,7 +2155,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("👁️ مراقبة القروبات المسجلة", callback_data="monitor_groups")],
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات والتحليل", callback_data="group_controls")],
-        [InlineKeyboardButton("🔒 قفل الدخول لجميع القروبات", callback_data="joinapproval_global_on"), InlineKeyboardButton("🔓 فتح الدخول لجميع القروبات", callback_data="joinapproval_global_off")],
+        [InlineKeyboardButton("🔒 قفل الدخول لقروبات المالك", callback_data="joinapproval_global_on"), InlineKeyboardButton("🔓 فتح الدخول لقروبات المالك", callback_data="joinapproval_global_off")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
@@ -4916,8 +4935,9 @@ async def owner_group_feature_command(update, context):
         "joinapproval_off": ("join_approval_enabled", 0, "🔓 تم إيقاف اشتراط الموافقة على الانضمام."),
     }
     field, enabled, response = mapping[cmd]
-    if field == "join_approval_enabled" and global_join_approval_enabled():
-        await msg.reply_text("🔐 قفل الدخول المركزي مفعّل لجميع القروبات. استخدم زر قفل الدخول لجميع القروبات في لوحة التحكم لإيقافه قبل تعديل هذا القروب منفردًا.")
+    if (field == "join_approval_enabled" and global_join_approval_enabled()
+            and is_owner_managed_group(chat.id)):
+        await msg.reply_text("🔐 قفل الدخول المركزي مفعّل لقروبات المالك فقط. أوقف القفل المركزي من لوحة المالك قبل تعديل أحد قروباته منفردًا.")
         return
     register_group(chat, user)
     set_group_feature(chat.id, field, enabled)
@@ -5822,7 +5842,8 @@ async def my_chat_member_handler(update, context):
                     return_exceptions=True,
                 )
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
-        if global_join_approval_enabled() and new_status == "administrator":
+        if (global_join_approval_enabled() and is_owner_managed_group(chat.id)
+                and new_status == "administrator"):
             try:
                 invite_link = await create_managed_join_request_link(context.bot, chat.id)
                 if OWNER_ID:
@@ -5914,7 +5935,9 @@ async def chat_member_handler(update, context):
                     f"أضافه: {getattr(actor, 'full_name', 'المالك/نائب المالك') or 'المالك/نائب المالك'} (ID: {actor_id})\n"
                     "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك أو المالك المفوّض."
                 )
-        if global_ban_applies(member.id, chat_id):
+        # Authorized direct additions by the primary owner, deputy, or delegated owner
+        # must not be immediately undone by the global-ban re-entry guard.
+        if global_ban_applies(member.id, chat_id) and not owner_or_deputy_added:
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                 log_action(chat_id, member.id, "global_ban_reentry", "منع عودة عضو محظور جماعيًا")
@@ -6145,7 +6168,9 @@ async def new_members(update, context):
 
     group_title = chat.title or "القروب"
     _adding_actor = getattr(msg, "from_user", None)
-    _owner_deputy_direct_add = bool(_adding_actor and (is_owner(_adding_actor.id) or is_deputy_owner(_adding_actor.id)))
+    _owner_deputy_direct_add = bool(_adding_actor and (
+        is_owner(_adding_actor.id) or is_deputy_owner(_adding_actor.id)
+        or is_delegated_owner(_adding_actor.id)))
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
@@ -6745,11 +6770,13 @@ async def callback(update, context):
             except Exception:
                 pass
             return
-        groups = db.execute("""SELECT chat_id, title FROM (
-            SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM watched_groups
-            UNION
-            SELECT chat_id, COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) AS title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1
-        ) ORDER BY title,chat_id""").fetchall()
+        # Global entry lock is deliberately scoped to owner-managed groups only.
+        # External groups are controlled by their own admins and retain their own settings.
+        groups = owner_managed_group_rows()
+        owner_group_ids = {int(row[0]) for row in groups}
+        if not groups:
+            await safe_callback_answer(q, "لا توجد قروبات تابعة للمالك مسجلة حاليًا.", show_alert=True)
+            return
         db.execute("UPDATE global_join_approval_settings SET enabled=?,updated_at=?,updated_by=? WHERE id=1", (int(enabling), now(), uid))
         # Keep per-group flags aligned with the master switch so turning it off really unlocks all groups.
         for _cid, _title in groups:
@@ -6760,6 +6787,8 @@ async def callback(update, context):
             revoked = 0
             rows = db.execute("SELECT chat_id,invite_link FROM managed_join_invite_links WHERE active=1").fetchall()
             for _cid, _link in rows:
+                if int(_cid) not in owner_group_ids:
+                    continue
                 try:
                     await context.bot.revoke_chat_invite_link(chat_id=int(_cid), invite_link=_link)
                     db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), int(_cid), _link))
@@ -6769,7 +6798,7 @@ async def callback(update, context):
                 await asyncio.sleep(0.1)
             db.commit()
             await q.edit_message_text(
-                f"🔓 تم إيقاف قفل الدخول المركزي لجميع القروبات المسجلة ({len(groups)}).\n"
+                f"🔓 تم إيقاف قفل الدخول المركزي لقروبات المالك فقط ({len(groups)}).\n"
                 f"تم إلغاء {revoked} رابط/روابط طلب انضمام أنشأها البوت. الروابط التي أنشأها مسؤول آخر قد تحتاج إلغاءً يدويًا من تيليجرام.",
                 reply_markup=panel_markup(uid))
             return
@@ -6813,7 +6842,7 @@ async def callback(update, context):
                 log.warning("Global join lock link setup failed chat=%s: %s", _cid, exc)
             await asyncio.sleep(0.1)
         # Send links separately so the authorized operator can distribute them.
-        summary = f"🔐 تم تفعيل قفل الدخول لجميع القروبات المسجلة ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\n\n"
+        summary = f"🔐 تم تفعيل قفل الدخول لقروبات المالك فقط ({len(groups)}).\nروابط طلب الانضمام الجديدة: {created}.\n\n"
         if link_lines:
             chunks = []
             current = summary
@@ -6829,8 +6858,9 @@ async def callback(update, context):
         if failed:
             await context.bot.send_message(chat_id=uid, text="⚠️ قروبات لم يتم تجهيز رابط لها:\n" + "\n".join(failed)[:3500])
         await q.edit_message_text(
-            f"🔐 تم تفعيل قفل الدخول المركزي.\nالقروبات المسجلة: {len(groups)}\n"
+            f"🔐 تم تفعيل قفل الدخول المركزي لقروبات المالك فقط.\nقروبات المالك المسجلة: {len(groups)}\n"
             f"روابط الطلب المنشأة: {created}\nالقروبات التي تعذر تجهيزها: {len(failed)}\n\n"
+            "القروبات الخارجية التي يستخدم أعضاؤها البوت لم تتغير إعداداتها.\n"
             "مهم: الروابط التي أنشأها مسؤول آخر قد لا يمكن للبوت إلغاؤها؛ سيحاول البوت منع الدخول المباشر عند رصده، لكن إلغاء تلك الروابط يدويًا هو الخيار الأكثر أمانًا.",
             reply_markup=panel_markup(uid))
         return
@@ -6859,8 +6889,9 @@ async def callback(update, context):
         allowed_features = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
         if feature not in allowed_features or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await safe_callback_answer(q, "الإعداد غير صالح.", show_alert=True); return
-        if feature == "join_approval_enabled" and global_join_approval_enabled():
-            await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لجميع القروبات. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب منفرد.", show_alert=True); return
+        if (feature == "join_approval_enabled" and global_join_approval_enabled()
+                and is_owner_managed_group(chat_id)):
+            await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لقروبات المالك فقط. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب المالك منفردًا.", show_alert=True); return
         new_state = not group_feature_enabled(chat_id, feature)
         set_group_feature(chat_id, feature, new_state)
         if feature == "join_approval_enabled" and not new_state:
@@ -11225,6 +11256,8 @@ def main():
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER), group=0)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(ChatJoinRequestHandler(chat_join_request_handler), group=0)
+    # Enforce the add-service-message setting independently from member tracking/welcome.
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, service_add_handler), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members), group=1)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ArabicTextCommand), group=2)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_filter), group=3)
