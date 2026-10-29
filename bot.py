@@ -5863,13 +5863,15 @@ async def chat_member_handler(update, context):
     member = cm.new_chat_member.user
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
-        # The primary owner and registered deputy owners are explicitly allowed to add
-        # members directly, including members with older re-entry/global-ban records.
+        # Primary owner, registered deputy owners, and delegated owners may add members directly.
+        # Other actors must use a join-request link when approval is enabled.
         actor = getattr(cm, "from_user", None)
         actor_id = int(getattr(actor, "id", 0) or 0)
-        owner_or_deputy_added = bool(actor_id and (is_owner(actor_id) or is_deputy_owner(actor_id)))
+        authorized_direct_add = bool(actor_id and (
+            is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)
+        ))
         restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
-        if restriction and restriction[0] in ("pending", "blocked") and not owner_or_deputy_added:
+        if restriction and restriction[0] in ("pending", "blocked") and not authorized_direct_add:
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                 log_action(chat_id, member.id, "reentry_reblocked", restriction[1] or restriction[0])
@@ -5883,9 +5885,9 @@ async def chat_member_handler(update, context):
             if approved_request:
                 db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
                 db.commit()
-            elif not owner_or_deputy_added:
-                # With approval enabled, block direct joins/additions unless the member
-                # was approved or was explicitly added by the primary owner/deputy.
+            elif not authorized_direct_add:
+                # With approval enabled, block direct joins/additions unless approved or
+                # explicitly added by the primary owner, a deputy, or a delegated owner.
                 log_action(chat_id, member.id, "join_approval_required", f"direct_entry_blocked; actor={actor_id}")
                 try:
                     await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
@@ -5902,14 +5904,14 @@ async def chat_member_handler(update, context):
                 return
             # Direct additions are permitted only when Telegram identifies the primary
             # owner or a registered deputy as the actor. Notify both roles after success.
-            elif owner_or_deputy_added:
+            elif authorized_direct_add:
                 log_action(chat_id, member.id, "owner_deputy_direct_add_allowed", f"actor={actor_id}")
                 await notify_owner_and_deputies(
                     context,
                     f"📥 دخول عضو بإضافة مباشرة مصرح بها\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\n"
                     f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\n"
-                    f"أضافه: {getattr(actor, 'full_name', 'المالك/نائب المالك') or 'المالك/نائب المالك'} (ID: {actor_id})\n"
-                    "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك."
+                    f"أضافه: {getattr(actor, 'full_name', 'مسؤول مخوّل') or 'مسؤول مخوّل'} (ID: {actor_id})\n"
+                    "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك أو المالك المفوّض."
                 )
         if global_ban_applies(member.id, chat_id):
             try:
