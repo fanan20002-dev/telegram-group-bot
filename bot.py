@@ -94,8 +94,15 @@ def _resolve_database_path():
     return target
 
 DB_PATH = _resolve_database_path()
-db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-db.execute("PRAGMA busy_timeout=30000")
+db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5)
+db.execute("PRAGMA busy_timeout=5000")
+# WAL + NORMAL reduces fsync overhead while retaining SQLite's crash-safe WAL behavior.
+try:
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA temp_store=MEMORY")
+    db.execute("PRAGMA cache_size=-8000")  # approximately 8 MiB page cache
+except sqlite3.DatabaseError:
+    log.exception("Could not apply SQLite performance pragmas")
 try:
     db.execute("PRAGMA journal_mode=WAL")
 except sqlite3.DatabaseError:
@@ -915,11 +922,17 @@ def is_direct_bot_call(message_text, bot_username=""):
         return True
     return False
 
+_auto_replies_initialized = set()
+
 def ensure_auto_replies(chat_id):
+    chat_id = int(chat_id)
+    if chat_id in _auto_replies_initialized:
+        return
     db.execute("INSERT OR IGNORE INTO auto_reply_settings(chat_id,enabled) VALUES(?,1)", (chat_id,))
     for trigger, reply in DEFAULT_AUTO_REPLIES:
         db.execute("INSERT OR IGNORE INTO auto_replies(chat_id,trigger_text,reply_text,enabled) VALUES(?,?,?,1)", (chat_id, trigger, reply))
     db.commit()
+    _auto_replies_initialized.add(chat_id)
 
 async def auto_replies_on(update, context):
     if not await require_admin(update): return
@@ -1197,7 +1210,12 @@ async def send_quiz_stage(context, chat_id, category, stage):
         reply_markup=InlineKeyboardMarkup(rows))
     return token
 
+_settings_initialized_chats = set()
+
 def ensure_settings(chat_id):
+    chat_id = int(chat_id)
+    if chat_id in _settings_initialized_chats:
+        return
     cols = ", ".join(f'"{f}" INTEGER DEFAULT {DEFAULTS[f]}' for f in SETTING_FIELDS)
     # Migrate old schemas without ever dropping the original settings table.
     existing = db.execute("PRAGMA table_info(settings)").fetchall()
@@ -1244,6 +1262,7 @@ def ensure_settings(chat_id):
         values = [int(bool(DEFAULTS[field])) for field in SETTING_FIELDS]
         db.execute(f"INSERT INTO settings(chat_id, {fields_sql}) VALUES(?, {placeholders})", [chat_id, *values])
         db.commit()
+    _settings_initialized_chats.add(chat_id)
 
 # Migrate the small settings table used by the first version.
 ensure_settings(0)
@@ -1552,6 +1571,9 @@ async def require_admin(update):
             return False
     return True
 
+_group_registration_cache = {}
+_GROUP_REGISTRATION_CACHE_SECONDS = 300
+
 def register_group(chat, actor=None):
     """Register a group without assuming that the person who triggered an update owns it.
 
@@ -1563,6 +1585,15 @@ def register_group(chat, actor=None):
         return
 
     actor_id = int(getattr(actor, "id", 0) or 0)
+    cache_key = int(chat.id)
+    cached = _group_registration_cache.get(cache_key)
+    cached_at, cached_title, cached_actor_id = cached if cached else (0.0, None, 0)
+    # A normal message should not repeat the full registration/migration path.
+    # Re-run immediately for a title change or when a known actor is first supplied.
+    actor_needs_update = bool(actor_id and not cached_actor_id)
+    if (cached and time.monotonic() - cached_at < _GROUP_REGISTRATION_CACHE_SECONDS
+            and cached_title == (chat.title or "") and not actor_needs_update):
+        return
     actor_name = getattr(actor, "full_name", "") or ""
     actor_username = getattr(actor, "username", "") or ""
 
@@ -1615,6 +1646,13 @@ def register_group(chat, actor=None):
     db.commit()
     ensure_settings(chat.id)
     ensure_auto_replies(chat.id)
+    _group_registration_cache[cache_key] = (time.monotonic(), chat.title or "", actor_id or cached_actor_id)
+    # Bound memory for very large installations.
+    if len(_group_registration_cache) > 10000:
+        cutoff = time.monotonic() - _GROUP_REGISTRATION_CACHE_SECONDS
+        for old_key, old_value in list(_group_registration_cache.items()):
+            if old_value[0] < cutoff:
+                _group_registration_cache.pop(old_key, None)
 
 
 def external_group_info(chat_id):
@@ -5453,62 +5491,6 @@ async def set_member_title_cmd(update, context):
     log_action(chat.id,user.id,"member_title_rule_set",f"threshold={threshold}; title={title}")
     await msg.reply_text(f"✅ تم ضبط اللقب «{title}» ابتداءً من {threshold} نقطة.")
 
-async def track_group_member_profile(update, context):
-    """Track visible profile-name changes when a member next sends a group message.
-
-    Telegram Bot API does not provide a standalone event for a user's profile-name
-    change. Therefore this check can only detect the change on the member's next
-    message/update in a group where the bot receives messages.
-    """
-    msg = getattr(update, "effective_message", None)
-    chat = getattr(update, "effective_chat", None)
-    user = getattr(update, "effective_user", None)
-    if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-    if not user or getattr(user, "is_bot", False):
-        return
-    if not external_group_active(chat.id):
-        return
-    display_name = (getattr(user, "full_name", "") or "عضو").strip()[:250]
-    username = (getattr(user, "username", "") or "").strip()[:100]
-    row = db.execute(
-        "SELECT display_name, username FROM member_profile_snapshots WHERE chat_id=? AND user_id=?",
-        (int(chat.id), int(user.id)),
-    ).fetchone()
-    if row is None:
-        db.execute(
-            "INSERT OR IGNORE INTO member_profile_snapshots(chat_id,user_id,display_name,username,updated_at) VALUES(?,?,?,?,?)",
-            (int(chat.id), int(user.id), display_name, username, now()),
-        )
-        db.commit()
-        return
-    old_name, old_username = row[0] or "", row[1] or ""
-    if old_name != display_name or old_username != username:
-        db.execute(
-            "UPDATE member_profile_snapshots SET display_name=?,username=?,updated_at=? WHERE chat_id=? AND user_id=?",
-            (display_name, username, now(), int(chat.id), int(user.id)),
-        )
-        db.commit()
-        # Only announce actual observed changes; never announce a first-seen member.
-        changes = []
-        if old_name != display_name:
-            changes.append(f"الاسم السابق: {html.escape(old_name or 'غير معروف')}\nالاسم الحالي: {html.escape(display_name or 'غير معروف')}")
-        if old_username != username:
-            changes.append(f"المعرّف السابق: @{html.escape(old_username) if old_username else 'غير موجود'}\nالمعرّف الحالي: @{html.escape(username) if username else 'غير موجود'}")
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="✏️ تم رصد تحديث بيانات عضو\n"
-                     f"العضو: {html.escape(display_name)}\n"
-                     f"🆔 ID: {int(user.id)}\n" + "\n".join(changes),
-                parse_mode="HTML",
-                disable_notification=True,
-            )
-            log.info("MEMBER_PROFILE_CHANGE_NOTIFIED chat_id=%s user_id=%s", chat.id, user.id)
-        except Exception as exc:
-            log.info("Member profile change notice failed chat=%s user=%s: %s", chat.id, user.id, exc)
-
-
 async def message_filter(update, context):
     msg = update.effective_message
     chat = update.effective_chat
@@ -5525,7 +5507,6 @@ async def message_filter(update, context):
         db.execute("INSERT INTO member_daily_activity(chat_id,activity_date,user_id,message_count,last_message_at) VALUES(?,?,?,1,?) "
                    "ON CONFLICT(chat_id,activity_date,user_id) DO UPDATE SET message_count=member_daily_activity.message_count+1,last_message_at=excluded.last_message_at",
                    (chat.id, activity_date, msg.from_user.id, now()))
-        db.commit()
         # نقطة تفاعل تلقائية بحد أقصى مرة كل 10 دقائق للعضو في القروب، لتقليل استغلال الرسائل المتكررة.
         if msg.text and len(msg.text.strip()) >= 3 and not msg.text.strip().startswith("/"):
             ensure_member_title_rules(chat.id)
@@ -5536,7 +5517,7 @@ async def message_filter(update, context):
                            "ON CONFLICT(chat_id,user_id) DO UPDATE SET points=member_reputation.points+1,last_auto_award=excluded.last_auto_award,updated_at=excluded.updated_at",
                            (chat.id, uid, current_epoch, now()))
                 db.execute("INSERT INTO member_points_events(chat_id,user_id,points,event_type,awarded_by,reason,created_at) VALUES(?,?,1,'message_activity',0,'مشاركة نصية مع فترة تهدئة',?)", (chat.id, uid, now()))
-                db.commit()
+        db.commit()
     # الردود الآلية: تهيئة الردود الافتراضية مرة واحدة لكل قروب، مع تهدئة لمنع الإزعاج.
     if msg.from_user and not msg.from_user.is_bot and msg.text and not msg.text.startswith("/"):
         ensure_auto_replies(chat.id)
@@ -11582,7 +11563,8 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, owner_autoreply_text_handler), group=-2)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, broadcast_draft_message), group=-1)
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_listener), group=-1)
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, track_group_member_profile), group=-10)
+    # Profile-name changes are already tracked by message_filter via member_activity.
+    # Registering a second all-messages handler duplicated DB reads/writes and notifications.
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER), group=0)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(ChatJoinRequestHandler(chat_join_request_handler), group=0)
