@@ -1392,14 +1392,14 @@ async def is_telegram_group_admin(bot, uid, chat_id):
 
 async def can_access_group(bot, uid, chat_id):
     """الوصول لقروب محدد فقط؛ مشرف Telegram يدير قروبه ولا يرث صلاحيات مالك البوت."""
-    if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+    watched = db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+    if not watched and not external_group_active(chat_id):
         return False
     if not is_owner(uid) and not external_group_active(chat_id):
         return False
     if is_owner(uid):
         return True
-    if (is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
+    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
         return True
     if group_role(chat_id, uid):
         try:
@@ -1410,12 +1410,17 @@ async def can_access_group(bot, uid, chat_id):
     return await is_telegram_group_admin(bot, uid, chat_id)
 
 async def accessible_groups(bot, uid):
-    groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-    if (is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
-        return groups
+    # Include both owner-managed groups and active external groups; the latter are
+    # intentionally stored outside watched_groups to keep registries separated.
+    rows = db.execute(
+        "SELECT chat_id,title FROM watched_groups "
+        "UNION SELECT chat_id,title FROM external_group_control WHERE enabled=1 AND is_member=1 "
+        "ORDER BY title"
+    ).fetchall()
+    if is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+        return rows
     allowed = []
-    for chat_id, title in groups:
+    for chat_id, title in rows:
         if await can_access_group(bot, uid, chat_id):
             allowed.append((chat_id, title))
     return allowed
@@ -1474,7 +1479,8 @@ def is_manager(uid):
 def can_use_panel(uid):
     # صلاحيات المستخدمين الممنوحة من المالك تفتح لوحة محدودة بالميزات المصرح بها فقط.
     has_capability = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? LIMIT 1", (uid,)).fetchone())
-    return is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid) or has_capability
+    return (is_owner(uid) or is_deputy_owner(uid) or is_general_manager(uid)
+            or is_protection_manager(uid) or is_delegated_owner(uid) or has_capability)
 
 def can_manage_security(uid):
     return is_general_manager(uid) or is_protection_manager(uid)
@@ -4338,16 +4344,17 @@ async def managers(update, context):
     await update.effective_message.reply_text(text)
 
 def membership_notification_recipients():
-    """المالك والنائب دائمًا؛ المفوض فقط عند منحه صلاحية الإشعارات صراحةً."""
+    """إشعارات العضوية تذهب حصريًا إلى المالك الأساسي ونواب المالك المسجلين."""
     recipients = {int(OWNER_ID)} if OWNER_ID else set()
-    recipients.update(int(r[0]) for r in db.execute("SELECT user_id FROM deputy_owners"))
-    recipients.update(int(r[0]) for r in db.execute("SELECT user_id FROM delegated_owners"))
-    return {uid for uid in recipients if uid == OWNER_ID or is_deputy_owner(uid)
-            or can_use_capability(uid, "membership_notifications", 0)}
+    recipients.update(
+        int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners")
+        if int(row[0]) > 0
+    )
+    return recipients
 
 
 async def notify_owners(context, text, event="general"):
-    # إشعارات العضوية لها سياسة مستقلة: لا تصل للمفوض إلا بتفويض صريح.
+    # إشعارات العضوية محصورة بالمالك الأساسي ونوابه؛ بقية الأحداث تتبع مستلميها المحددين.
     if event == "membership":
         recipients = membership_notification_recipients()
     else:
@@ -4364,7 +4371,7 @@ async def notify_owners(context, text, event="general"):
 
 
 async def notify_owner_and_deputies(context, text, reply_markup=None):
-    """إشعارات الدخول وطلبات الانضمام للمالك والنائب والمفوض المفوض بالإشعارات فقط."""
+    """إشعارات الدخول وطلبات الانضمام للمالك الأساسي ونواب المالك فقط."""
     for recipient in membership_notification_recipients():
         try:
             await context.bot.send_message(chat_id=recipient, text=text, reply_markup=reply_markup)
@@ -6000,21 +6007,21 @@ async def chat_member_handler(update, context):
     member = cm.new_chat_member.user
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
-        # The primary owner and registered deputy owners are explicitly allowed to add
-        # members directly, including members with older re-entry/global-ban records.
+        # The primary owner, registered deputies, and delegated owners are allowed
+        # to add members directly, including while link-based approval is enforced.
         # Telegram's ChatMemberUpdated.from_user is the authoritative actor for an
         # actual membership transition. Do not use Message.from_user for enforcement:
         # service messages can omit or misrepresent the actor on some update paths.
         actor = getattr(cm, "from_user", None)
         actor_id = int(getattr(actor, "id", 0) or 0)
-        owner_or_deputy_added = is_authorized_manual_add(chat_id, member, actor)
+        authorized_staff_direct_add = is_authorized_manual_add(chat_id, member, actor)
         log.info(
             "MEMBER_JOIN_TRANSITION chat_id=%s member_id=%s actor_id=%s owner_authorized=%s approval_enabled=%s",
-            chat_id, member.id, actor_id or 0, int(owner_or_deputy_added),
+            chat_id, member.id, actor_id or 0, int(authorized_staff_direct_add),
             int(group_feature_enabled(chat_id, "join_approval_enabled")),
         )
         restriction = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat_id, member.id)).fetchone()
-        if restriction and restriction[0] in ("pending", "blocked") and not owner_or_deputy_added:
+        if restriction and restriction[0] in ("pending", "blocked") and not authorized_staff_direct_add:
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                 log_action(chat_id, member.id, "reentry_reblocked", restriction[1] or restriction[0])
@@ -6028,7 +6035,7 @@ async def chat_member_handler(update, context):
             if approved_request:
                 db.execute("UPDATE join_request_events SET status='joined' WHERE chat_id=? AND user_id=?", (chat_id, member.id))
                 db.commit()
-            elif not owner_or_deputy_added:
+            elif not authorized_staff_direct_add:
                 # With approval enabled, block direct joins/additions unless the member
                 # was approved or was explicitly added by the primary owner/deputy.
                 log_action(chat_id, member.id, "join_approval_required", f"direct_entry_blocked; actor={actor_id}")
@@ -6048,18 +6055,18 @@ async def chat_member_handler(update, context):
             # Direct additions by the primary owner, a registered deputy, or delegated owner
             # are explicitly permitted even while the join-request gate is enabled. Telegram
             # may report actor_id=0 in some transition types; log that case for diagnosis.
-            elif owner_or_deputy_added:
+            elif authorized_staff_direct_add:
                 log_action(chat_id, member.id, "owner_deputy_direct_add_allowed", f"actor={actor_id}")
                 await notify_owner_and_deputies(
                     context,
                     f"📥 دخول عضو بإضافة مباشرة مصرح بها\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\n"
                     f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\n"
                     f"أضافه: {getattr(actor, 'full_name', 'المالك/نائب المالك') or 'المالك/نائب المالك'} (ID: {actor_id})\n"
-                    "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك أو المالك المفوّض."
+                    "تم السماح بالدخول لأن الإضافة تمت بواسطة المالك الأساسي أو نائب المالك أو المفوض."
                 )
         # Authorized direct additions by the primary owner, deputy, or delegated owner
         # must not be immediately undone by the global-ban re-entry guard.
-        if global_ban_applies(member.id, chat_id) and not owner_or_deputy_added:
+        if global_ban_applies(member.id, chat_id) and not authorized_staff_direct_add:
             try:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                 log_action(chat_id, member.id, "global_ban_reentry", "منع عودة عضو محظور جماعيًا")
@@ -6073,12 +6080,12 @@ async def chat_member_handler(update, context):
         if old in ("left", "kicked") and new in ("member", "administrator", "restricted"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "join", _riyadh_now().isoformat()))
             db.commit()
-            if group_feature_enabled(chat_id, "join_notices_enabled") and not owner_or_deputy_added:
+            if group_feature_enabled(chat_id, "join_notices_enabled") and not authorized_staff_direct_add:
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=f"📥 انضم عضو جديد إلى القروب: {html.escape(member.full_name or 'عضو')}\n🆔 ID: {member.id}", parse_mode="HTML")
                 except Exception as exc:
                     log.info("Join notice failed chat=%s user=%s: %s", chat_id, member.id, exc)
-            elif owner_or_deputy_added:
+            elif authorized_staff_direct_add:
                 log.info("PUBLIC_JOIN_NOTICE_SUPPRESSED_MANUAL_ADD chat_id=%s member_id=%s actor_id=%s", chat_id, member.id, actor_id)
         elif old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
@@ -6140,13 +6147,13 @@ async def chat_member_handler(update, context):
         # The chat_member update is sufficient to welcome the member; the database key
         # prevents a duplicate if the service-message handler also fires.
         try:
-            if external_group_cap_enabled(chat_id, "welcome") and not owner_or_deputy_added:
+            if external_group_cap_enabled(chat_id, "welcome") and not authorized_staff_direct_add:
                 approval_row = db.execute(
                     "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)
                 ).fetchone()
                 approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
                 await _send_member_welcome_with_bot_photo(context, cm.chat, member, approved=approved)
-            elif owner_or_deputy_added:
+            elif authorized_staff_direct_add:
                 log.info("PUBLIC_WELCOME_SUPPRESSED_MANUAL_ADD chat_id=%s member_id=%s actor_id=%s", chat_id, member.id, actor_id)
         except Exception:
             log.exception("WELCOME_CHAT_MEMBER_HANDLER_FAILED chat_id=%s member_id=%s", chat_id, member.id)
@@ -6305,8 +6312,8 @@ async def new_members(update, context):
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
-        _owner_deputy_direct_add = is_authorized_manual_add(chat.id, member, _adding_actor)
-        if group_feature_enabled(chat.id, "join_approval_enabled") and not _owner_deputy_direct_add:
+        _authorized_staff_direct_add = is_authorized_manual_add(chat.id, member, _adding_actor)
+        if group_feature_enabled(chat.id, "join_approval_enabled") and not _authorized_staff_direct_add:
             approval_row = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)).fetchone()
             if not approval_row or approval_row[0] not in ("approved", "joined"):
                 # This handler only controls welcome/verification side effects. The
@@ -6314,7 +6321,7 @@ async def new_members(update, context):
                 # chat_member_handler, avoiding a second actor check based on Message.from_user.
                 log.info("NEW_MEMBER_APPROVAL_WELCOME_SKIPPED chat_id=%s member_id=%s actor_id=%s", chat.id, member.id, int(getattr(_adding_actor, "id", 0) or 0))
                 continue
-        if global_ban_applies(member.id, chat.id) and not _owner_deputy_direct_add:
+        if global_ban_applies(member.id, chat.id) and not _authorized_staff_direct_add:
             # Enforcement is centralized in chat_member_handler, where Telegram's
             # ChatMemberUpdated.from_user is the authoritative actor. Do not issue a
             # second ban from the service-message handler: Telegram may report a
@@ -6339,13 +6346,13 @@ async def new_members(update, context):
             log.exception("MEMBER_ACTIVITY_SAVE_FAILED chat_id=%s member_id=%s", chat.id, member.id)
 
         # Keep the existing per-group welcome toggle; use the bot profile photo and separate templates.
-        if external_group_cap_enabled(chat.id, "welcome") and not _owner_deputy_direct_add:
+        if external_group_cap_enabled(chat.id, "welcome") and not _authorized_staff_direct_add:
             approval_row = db.execute(
                 "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)
             ).fetchone()
             approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
             await _send_member_welcome_with_bot_photo(context, chat, member, approved=approved)
-        elif _owner_deputy_direct_add:
+        elif _authorized_staff_direct_add:
             log.info("PUBLIC_WELCOME_SUPPRESSED_MANUAL_ADD_SERVICE chat_id=%s member_id=%s actor_id=%s", chat.id, member.id, int(getattr(_adding_actor, "id", 0) or 0))
         else:
             log.info("WELCOME_DISABLED chat_id=%s member_id=%s", chat.id, member.id)
@@ -7126,6 +7133,8 @@ async def callback(update, context):
         except ValueError: await safe_callback_answer(q, "بيانات الطلب غير صحيحة.", show_alert=True); return
         if not (is_owner(uid) or is_deputy_owner(uid)):
             await safe_callback_answer(q, "الموافقة على طلبات الدخول للمالك الأساسي ونائب المالك فقط.", show_alert=True); return
+        if not db.execute("SELECT 1 FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone():
+            await safe_callback_answer(q, "طلب الانضمام غير موجود أو انتهت صلاحيته.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
         if not reqrow or reqrow[0] not in ("pending", "approved"):
             await safe_callback_answer(q, "الطلب لم يعد معلقًا.", show_alert=True); return
@@ -8635,11 +8644,13 @@ async def callback(update, context):
         except (ValueError, TypeError):
             await safe_callback_answer(q, "بيانات القروب غير صحيحة.", show_alert=True)
             return
-        if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
-            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
+        if not (is_owner(uid) or is_delegated_owner(uid)
+                or await can_access_group(context.bot, uid, group_chat_id)):
+            await safe_callback_answer(q, "هذه اللوحة متاحة لمالك القروب ونائبه والمفوّض المخوّل ومشرفيه فقط.", show_alert=True)
             return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
-            await safe_callback_answer(q, "القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
+        if (not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+                and not external_group_active(group_chat_id)):
+            await safe_callback_answer(q, "القروب غير مسجل أو أن البوت غير نشط فيه.", show_alert=True)
             return
         ext_info = external_group_info(group_chat_id)
         if ext_info and ext_info[0] and not is_owner(uid) and not ext_info[1]:
