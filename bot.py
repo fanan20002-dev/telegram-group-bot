@@ -3229,7 +3229,7 @@ async def get_verified_active_watched_groups(bot, limit=None):
             if status in ("left", "kicked"):
                 archive_watched_group(int(cid), "telegram_membership_left_or_kicked")
                 db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
-                db.execute("UPDATE external_group_control SET enabled=0, updated_at=? WHERE chat_id=?", (now(), int(cid)))
+                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,bot_status='left',last_checked_at=?,updated_at=? WHERE chat_id=?", (now(), now(), int(cid)))
                 db.commit()
                 continue
             if status in ("member", "administrator", "creator", "restricted"):
@@ -4488,9 +4488,15 @@ async def monitor_cmd(update, context):
     if update.effective_chat.type != ChatType.PRIVATE:
         await update.effective_message.reply_text("افتح البوت في الخاص ثم استخدم /monitor لمتابعة القروبات المسجلة.")
         return
-    groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title COLLATE NOCASE").fetchall()
+    # Refresh membership first; then show ONLY owner-managed groups here.
+    # External groups remain exclusively in the external-groups management center.
+    try:
+        await get_verified_active_watched_groups(context.bot)
+    except Exception as exc:
+        log.warning("Owner group list refresh failed; preserving current records: %s", exc)
+    groups = owner_managed_group_rows()
     if not groups:
-        await update.effective_message.reply_text("لا توجد قروبات مسجلة بعد.")
+        await update.effective_message.reply_text("لا توجد قروبات مملوكة/مدارة من المالك الأساسي ونشطة حاليًا.")
         return
     rows = [[InlineKeyboardButton(f"👁️ {(title or str(chat_id))[:45]}", callback_data=f"monitor_group:{chat_id}")] for chat_id,title in groups[:20]]
     if len(groups) > 20:
@@ -8257,9 +8263,18 @@ async def callback(update, context):
             await safe_callback_answer(q, "مركز المراقبة الشامل للمالك الأساسي فقط.", show_alert=True); return
         try: page = int(data.split(":", 1)[1]) if ":" in data else 0
         except ValueError: page = 0
-        groups = db.execute("SELECT chat_id,title,added_at FROM watched_groups ORDER BY title COLLATE NOCASE").fetchall()
+        # Refresh Telegram membership on every manual refresh and keep external groups
+        # out of the owner's own-groups monitor. Transient API failures preserve records.
+        try:
+            await get_verified_active_watched_groups(context.bot)
+        except Exception as exc:
+            log.warning("Owner monitor refresh failed; preserving current records: %s", exc)
+        groups = db.execute("""SELECT w.chat_id,w.title,w.added_at
+            FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
+            WHERE e.chat_id IS NULL OR COALESCE(e.is_external,0)=0
+            ORDER BY w.title COLLATE NOCASE""").fetchall()
         if not groups:
-            await q.edit_message_text("لا توجد قروبات مسجلة بعد. أضف البوت إلى القروب واجعله يستقبل الرسائل ثم أرسل /start داخل القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
+            await q.edit_message_text("لا توجد قروبات مملوكة/مدارة من المالك الأساسي ونشطة حاليًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
         per_page = 20
         pages = max(1, (len(groups) + per_page - 1) // per_page)
         page = max(0, min(page, pages - 1))
@@ -8272,7 +8287,7 @@ async def callback(update, context):
         if page < pages - 1: nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"monitor_groups_page:{page+1}"))
         if nav: rows.append(nav)
         rows += [[InlineKeyboardButton("🔄 تحديث القائمة", callback_data=f"monitor_groups_page:{page}")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
-        await q.edit_message_text(f"👁️ مراقبة القروبات المسجلة\n\nإجمالي القروبات المسجلة في قاعدة البيانات: {len(groups)}\nالصفحة {page+1} من {pages}\n🟢 = أرشفة الرسائل مفعّلة | ⚪ = الأرشفة متوقفة\nاختر قروبًا لعرض العدد الحالي للأعضاء وحالة البوت والإحصائيات.", reply_markup=InlineKeyboardMarkup(rows)); return
+        await q.edit_message_text(f"👁️ مراقبة القروبات المسجلة\n\nإجمالي قروبات المالك الأساسية النشطة: {len(groups)}\nالصفحة {page+1} من {pages}\n🟢 = أرشفة الرسائل مفعّلة | ⚪ = الأرشفة متوقفة\nاختر قروبًا لعرض العدد الحالي للأعضاء وحالة البوت والإحصائيات.", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("monitor_group:"):
         try: monitor_chat_id = int(data.split(":", 1)[1])
