@@ -319,6 +319,34 @@ try:
 except Exception:
     log.exception("Could not add external group membership status column")
 
+# Additive monitoring metadata and audit history for external groups.
+try:
+    _ext_cols = {r[1] for r in db.execute("PRAGMA table_info(external_group_control)").fetchall()}
+    for _col, _ddl in (
+        ("last_checked_at", "TEXT NOT NULL DEFAULT ''"),
+        ("bot_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("bot_permissions", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if _col not in _ext_cols:
+            db.execute(f"ALTER TABLE external_group_control ADD COLUMN {_col} {_ddl}")
+    db.execute("""CREATE TABLE IF NOT EXISTS external_group_audit_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL DEFAULT 0, event_type TEXT NOT NULL,
+        details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_external_group_audit_chat ON external_group_audit_events(chat_id,id DESC)")
+    db.commit()
+except Exception:
+    log.exception("Could not initialize external group monitoring metadata")
+
+def log_external_group_event(chat_id, actor_id, event_type, details=''):
+    try:
+        db.execute("INSERT INTO external_group_audit_events(chat_id,actor_id,event_type,details,created_at) VALUES(?,?,?,?,?)",
+                   (int(chat_id), int(actor_id or 0), str(event_type)[:80], str(details)[:1000], now()))
+        db.commit()
+    except Exception:
+        log.exception("Could not record external group audit event")
+
 db.execute("""CREATE TABLE IF NOT EXISTS external_group_capabilities(
     chat_id INTEGER NOT NULL, capability TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
     granted_by INTEGER NOT NULL DEFAULT 0, granted_at TEXT NOT NULL,
@@ -1538,6 +1566,10 @@ def register_group(chat, actor=None):
         VALUES(?,?,?,?,?,?,1,0,?,?)""",
         (chat.id, chat.title or "", 0 if actor_id and actor_id == OWNER_ID else 1,
          actor_id, actor_name, actor_username, now(), now()))
+    _old_title_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=?", (chat.id,)).fetchone()
+    _old_title = (_old_title_row[0] or "") if _old_title_row else ""
+    if _old_title and chat.title and _old_title != chat.title:
+        log_external_group_event(chat.id, 0, "title_observed_change", f"{_old_title} -> {chat.title}")
     db.execute("UPDATE external_group_control SET title=? WHERE chat_id=? AND COALESCE(title,'')<>?", (chat.title or "", chat.id, chat.title or ""))
     # Enrich unknown actor metadata without reclassifying a group from an ordinary message.
     # Only the first trusted bot-membership event determines whether a newly registered group
@@ -1986,10 +2018,16 @@ async def refresh_external_group_membership(bot):
             member = await bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
             status = str(getattr(member, "status", "unknown")).lower()
             is_member_flag = getattr(member, "is_member", None)
+            _rights = []
+            for _right in ("can_manage_chat", "can_delete_messages", "can_restrict_members", "can_invite_users", "can_pin_messages", "can_promote_members", "can_change_info"):
+                if bool(getattr(member, _right, False)):
+                    _rights.append(_right)
+            db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status=?,bot_permissions=? WHERE chat_id=?",
+                       (now(), status, ",".join(_rights), cid))
             confirmed_inactive = status in inactive_statuses or (status == "restricted" and is_member_flag is False)
             checked += 1
             if confirmed_inactive:
-                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), cid))
+                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=?,last_checked_at=?,bot_status='left' WHERE chat_id=?", (now(), now(), cid))
                 archive_watched_group(cid, "external_group_open_panel_confirmed_inactive")
                 db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
                 removed += 1
@@ -2005,16 +2043,18 @@ async def refresh_external_group_membership(bot):
                 "not a member of the supergroup", "user not found", "was kicked", "kicked from",
             ))
             if definitive:
-                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), cid))
+                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=?,last_checked_at=?,bot_status='left' WHERE chat_id=?", (now(), now(), cid))
                 archive_watched_group(cid, "external_group_open_panel_confirmed_inactive_api_error")
                 db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
                 removed += 1
                 log.info("External group hidden after definitive Telegram membership error: %s (%s): %s", title, cid, exc)
             else:
                 uncertain += 1
+                db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status='unknown' WHERE chat_id=?", (now(), cid))
                 log.warning("External group membership uncertain; preserving record %s (%s): %s", title, cid, exc)
         except Exception as exc:
             uncertain += 1
+            db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status='unknown' WHERE chat_id=?", (now(), cid))
             log.warning("External group membership check failed; preserving record %s (%s): %s", title, cid, exc)
         await asyncio.sleep(0.1)
     db.commit()
@@ -7252,21 +7292,59 @@ async def callback(update, context):
     if data == "external_monitor_center":
         if not (is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "external_monitor", 0))):
             await safe_callback_answer(q, "مركز المراقبة للمالك الأساسي، أو للنائب عند منحه صلاحية الاطلاع.", show_alert=True); return
-        rows = db.execute("""SELECT w.chat_id, w.title, COALESCE(e.is_external,0), COALESCE(e.enabled,1), COALESCE(e.updated_at,'')
-                            FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
-                            ORDER BY COALESCE(e.is_external,0) DESC, w.title COLLATE NOCASE LIMIT 100""").fetchall()
-        external = [r for r in rows if int(r[2]) == 1]
-        active = sum(1 for r in external if int(r[3]) == 1)
-        lines = ["👁️ مركز مراقبة القروبات الخارجية", f"إجمالي القروبات الخارجية: {len(external)}", f"النشطة حسب سجل البوت: {active}", ""]
-        if external:
-            for cid, title, _ext, enabled, updated in external:
-                status = "🟢 مسجل/نشط" if enabled else "🔴 معطل في سجل البوت"
-                lines.append(f"• {title or 'قروب بدون اسم'}\n  ID: {cid} — {status}")
-        else:
+        try:
+            await refresh_external_group_membership(context.bot)
+        except Exception:
+            log.exception("External monitor refresh failed")
+        rows = db.execute("""SELECT e.chat_id, COALESCE(NULLIF(e.title,''),w.title,e.chat_id),
+            COALESCE(e.enabled,0), COALESCE(e.is_member,1), COALESCE(e.bot_status,'unknown'),
+            COALESCE(e.last_checked_at,''), COALESCE(e.bot_permissions,'')
+            FROM external_group_control e LEFT JOIN watched_groups w ON w.chat_id=e.chat_id
+            WHERE e.is_external=1 ORDER BY e.created_at DESC LIMIT 100""").fetchall()
+        active = sum(1 for r in rows if int(r[2]) == 1 and int(r[3]) == 1 and r[4] in ('member','administrator','creator','restricted'))
+        lines = ["👁️ مركز مراقبة القروبات الخارجية", f"إجمالي القروبات المسجلة: {len(rows)}", f"البوت متصل وموجود حسب آخر تحقق: {active}", ""]
+        buttons = []
+        for cid, title, enabled, is_member, bot_status, checked_at, permissions in rows:
+            state = "🟢 موجود" if is_member and bot_status in ('member','administrator','creator','restricted') else ("🔴 غير موجود" if not is_member or bot_status in ('left','kicked') else "🟡 تعذر التحقق")
+            role = "مشرف" if bot_status == 'administrator' else ("مالك" if bot_status == 'creator' else ("عضو" if bot_status in ('member','restricted') else bot_status))
+            lines.append(f"• {title or 'قروب بدون اسم'}\n  ID: {cid} — {state} — {role}\n  خدمات البوت: {'مفعّلة' if enabled else 'متوقفة'}\n  آخر تحقق: {checked_at or 'لم يتم بعد'}")
+            buttons.append([InlineKeyboardButton(f"🔎 {str(title)[:32]} · التفاصيل", callback_data=f"external_monitor_detail:{cid}")])
+        if not rows:
             lines.append("لا توجد قروبات خارجية مسجلة حاليًا.")
-        lines += ["", "ملاحظة: هذه شاشة اطلاع فقط؛ حالة النشاط تعكس سجل البوت ولا تثبت أن القروب متاح حاليًا على تيليجرام.", "تغييرات اسم القروب وصورته لا يرسل لها Bot API إشعارًا مباشرًا مضمونًا؛ لا نعرضها كتغييرات مؤكدة دون رصد فعلي."]
-        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 تحديث", callback_data="external_monitor_center")],[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
+        lines += ["", "ملاحظة: حالة البوت مبنية على آخر استعلام ناجح إلى Telegram. تغييرات الاسم والصورة ليست أحداثًا مباشرة مضمونة من Bot API؛ تُعرض فقط عند رصدها."]
+        buttons += [[InlineKeyboardButton("🔄 تحديث وفحص العضوية", callback_data="external_monitor_center")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
         return
+
+    if data.startswith("external_monitor_detail:"):
+        if not (is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "external_monitor", 0))):
+            await safe_callback_answer(q, "غير مصرح لك بالاطلاع على تفاصيل المراقبة.", show_alert=True); return
+        try: monitor_cid = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        row = db.execute("""SELECT title,bot_status,last_checked_at,bot_permissions,is_member,enabled
+            FROM external_group_control WHERE chat_id=? AND is_external=1""", (monitor_cid,)).fetchone()
+        if not row:
+            await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
+        title, status, checked, perms, is_member, enabled = row
+        try:
+            member = await context.bot.get_chat_member(chat_id=monitor_cid, user_id=context.bot.id)
+            status = str(getattr(member, 'status', status)).lower()
+            rights = [x for x in ('can_manage_chat','can_delete_messages','can_restrict_members','can_invite_users','can_pin_messages','can_promote_members','can_change_info') if bool(getattr(member,x,False))]
+            perms = ','.join(rights)
+            checked = now()
+            is_member = int(status in ('member','administrator','creator') or (status == 'restricted' and getattr(member,'is_member',False)))
+            db.execute("UPDATE external_group_control SET bot_status=?,bot_permissions=?,last_checked_at=?,is_member=? WHERE chat_id=?", (status,perms,checked,is_member,monitor_cid)); db.commit()
+        except Exception as exc:
+            log.warning("Could not refresh external monitor detail for %s: %s", monitor_cid, exc)
+        role = {'administrator':'مشرف','creator':'مالك','member':'عضو','restricted':'مقيّد','left':'غادر','kicked':'محظور'}.get(status, status or 'غير معروف')
+        rights_ar = {'can_manage_chat':'إدارة القروب','can_delete_messages':'حذف الرسائل','can_restrict_members':'تقييد الأعضاء','can_invite_users':'دعوة الأعضاء','can_pin_messages':'تثبيت الرسائل','can_promote_members':'ترقية المشرفين','can_change_info':'تغيير معلومات القروب'}
+        rights_text = '، '.join(rights_ar.get(x,x) for x in (perms or '').split(',') if x) or 'لا توجد صلاحيات مشرف مسجلة'
+        events = db.execute("SELECT event_type,details,created_at FROM external_group_audit_events WHERE chat_id=? ORDER BY id DESC LIMIT 8", (monitor_cid,)).fetchall()
+        event_text = '\n'.join(f"• {et}: {det} ({at})" for et,det,at in events) or 'لا توجد أحداث مسجلة بعد.'
+        body = (f"🌐 تفاصيل مراقبة القروب\n\nالقروب: {html.escape(title or str(monitor_cid))}\nID: {monitor_cid}\n"
+                f"حالة وجود البوت: {'موجود' if is_member else 'غير موجود/غير مؤكد'}\nرتبة البوت: {html.escape(role)}\n"
+                f"خدمات البوت: {'مفعّلة' if enabled else 'متوقفة'}\nصلاحيات Telegram: {html.escape(rights_text)}\nآخر تحقق: {html.escape(checked or 'غير متاح')}\n\nآخر أحداث مسجلة:\n{html.escape(event_text)}")
+        await q.edit_message_text(body, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 إعادة الفحص", callback_data=f"external_monitor_detail:{monitor_cid}")],[InlineKeyboardButton("⬅️ مركز المراقبة", callback_data="external_monitor_center")]])); return
 
     # Primary-owner-only unified permissions and group assignment workflow.
     if data == "unified_permissions":
@@ -7774,6 +7852,7 @@ async def callback(update, context):
                 await safe_callback_answer(q, "تعذر التحقق من وجود البوت في القروب. أضف البوت أولًا ثم أعد المحاولة.", show_alert=True); return
         db.execute("UPDATE external_group_control SET enabled=?,updated_at=? WHERE chat_id=?", (new_enabled, now(), ext_chat_id)); db.commit()
         log_action(ext_chat_id, uid, "external_group_toggle", f"enabled={new_enabled}")
+        log_external_group_event(ext_chat_id, uid, "service_toggle", f"enabled={new_enabled}")
         await safe_callback_answer(q, "تم إيقاف خدمات البوت عن القروب." if not new_enabled else "تم تفعيل البوت للقروب.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data.startswith("external_ai:"):
@@ -7788,6 +7867,7 @@ async def callback(update, context):
             VALUES(?,'ai',?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,granted_by=excluded.granted_by,granted_at=excluded.granted_at""",
             (ext_chat_id, enabled, uid, now()))
         db.commit(); log_action(ext_chat_id, uid, "external_ai_permission", f"enabled={enabled}")
+        log_external_group_event(ext_chat_id, uid, "ai_permission", f"enabled={enabled}")
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data.startswith("external_cap:"):
         if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
@@ -7803,6 +7883,7 @@ async def callback(update, context):
             VALUES(?,?,?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,granted_by=excluded.granted_by,granted_at=excluded.granted_at""",
             (ext_chat_id, cap, enabled, uid, now()))
         db.commit(); log_action(ext_chat_id, uid, "external_capability", f"{cap}={enabled}")
+        log_external_group_event(ext_chat_id, uid, "capability_change", f"{cap}={enabled}")
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
     if data == "external_support_inbox":
         if not is_owner(uid): await safe_callback_answer(q, "صندوق الدعم للمالك الأساسي فقط.", show_alert=True); return
