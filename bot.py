@@ -333,6 +333,10 @@ try:
         ("last_checked_at", "TEXT NOT NULL DEFAULT ''"),
         ("bot_status", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("bot_permissions", "TEXT NOT NULL DEFAULT ''"),
+        ("telegram_owner_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("invite_link", "TEXT NOT NULL DEFAULT ''"),
+        ("member_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_member_event_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if _col not in _ext_cols:
             db.execute(f"ALTER TABLE external_group_control ADD COLUMN {_col} {_ddl}")
@@ -3921,34 +3925,33 @@ async def help_cmd(update, context):
     await update.effective_message.reply_text(text)
 
 def group_owner_panel_markup(chat_id, uid=None):
-    """لوحة إشراف حديثة ومحدودة بالقروب الحالي، وتُظهر التاق فقط للمصرح لهم."""
-    s = get_settings(chat_id)
-    link_label = "🔓 السماح بالروابط" if s.get("links") else "🔒 منع الروابط"
-    link_callback = f"group_panel_toggle_links:{chat_id}"
+    """واجهة مقسمة إلى أقسام واضحة لمالك القروب ومشرفيه، ومحدودة بالقروب الحالي."""
+    settings = get_settings(chat_id)
+    links_label = "🔓 السماح بالروابط" if settings.get("links") else "🔒 منع الروابط"
+    links_callback = f"group_panel_toggle_links:{chat_id}"
     can_open_links = uid is None or is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", chat_id))
-    if s.get("links") and not can_open_links:
-        link_label = "🔒 الروابط مقفلة — الفتح للمالك"
-        link_callback = "panel_links_locked"
+    if settings.get("links") and not can_open_links:
+        links_label, links_callback = "🔒 الروابط مقفلة — الفتح للمالك", "panel_links_locked"
+    ext = external_group_info(chat_id)
+    ai_enabled = bool(ext and ext[0] and ext[2])
+    ai_label = "🧠 إيقاف الذكاء الاصطناعي" if ai_enabled else "🧠 تشغيل الذكاء الاصطناعي"
+    ai_callback = f"group_panel_ai:{chat_id}"
     rows = [
-        [InlineKeyboardButton("🛡️ مركز الحماية والإعدادات", callback_data=f"group_panel_settings:{chat_id}")],
-        [InlineKeyboardButton(link_label, callback_data=link_callback)],
-        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"),
-         InlineKeyboardButton("🏷️ الرتب والصلاحيات", callback_data=f"group_panel_roles:{chat_id}")],
-        [InlineKeyboardButton("📊 إحصائيات القروب", callback_data=f"group_panel_stats:{chat_id}"),
-         InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
-        [InlineKeyboardButton("👋 إعدادات الترحيب", callback_data=f"welcome_group:{chat_id}"),
-         InlineKeyboardButton("⚠️ إدارة الإنذارات", callback_data=f"group_panel_warnings:{chat_id}")],
-        [InlineKeyboardButton("🗑️ مسح 1–500 رسالة", callback_data=f"group_panel_bulkdelete:{chat_id}"),
-         InlineKeyboardButton("👮 دليل إدارة المشرفين", callback_data=f"group_panel_staffhelp:{chat_id}")],
+        [InlineKeyboardButton("🛡️ الحماية", callback_data=f"group_panel_settings:{chat_id}"), InlineKeyboardButton("⚙️ إعدادات القروب", callback_data=f"group_panel_settings:{chat_id}")],
+        [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"), InlineKeyboardButton("🪪 الصلاحيات والرتب", callback_data=f"group_panel_roles:{chat_id}")],
+        [InlineKeyboardButton("📨 طلبات الانضمام", callback_data=f"group_panel_joinrequests:{chat_id}"), InlineKeyboardButton("⚠️ الإنذارات والمخالفات", callback_data=f"group_panel_warnings:{chat_id}")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data=f"group_panel_stats:{chat_id}"), InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
+        [InlineKeyboardButton("📣 النشر والإعلانات", callback_data=f"group_panel_support:{chat_id}"), InlineKeyboardButton("👋 الترحيب", callback_data=f"welcome_group:{chat_id}")],
+        [InlineKeyboardButton(links_label, callback_data=links_callback)],
     ]
-    external_tag_default = bool((external_group_info(chat_id) or (0,))[0]) and external_group_cap_enabled(chat_id, "tag")
-    if uid is not None and (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "tag", chat_id) or external_tag_default):
-        rows.insert(2, [InlineKeyboardButton("📣 استدعاء التاق للأعضاء", callback_data=f"group_panel_tag:{chat_id}")])
-    else:
-        rows.insert(2, [InlineKeyboardButton("🔐 التاق (يتطلب موافقة المالك)", callback_data="panel_tag_locked")])
-    rows.append([InlineKeyboardButton("🆘 الدعم الفني", callback_data=f"group_panel_support:{chat_id}")])
-    rows.append([InlineKeyboardButton("⚠️ قائمة المخالفين", callback_data=f"group_panel_violators:{chat_id}")])
-    rows.append([InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")])
+    if ext and ext[0]:
+        rows.append([InlineKeyboardButton(ai_label, callback_data=ai_callback)])
+    if uid is not None and (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "tag", chat_id) or (ext and ext[0] and external_group_cap_enabled(chat_id, "tag"))):
+        rows.append([InlineKeyboardButton("📣 استدعاء التاق للأعضاء", callback_data=f"group_panel_tag:{chat_id}")])
+    rows.extend([
+        [InlineKeyboardButton("🗑️ حذف الرسائل (1–500)", callback_data=f"group_panel_bulkdelete:{chat_id}"), InlineKeyboardButton("👮 إدارة المشرفين", callback_data=f"group_panel_staffhelp:{chat_id}")],
+        [InlineKeyboardButton("🆘 الدعم الفني", callback_data=f"group_panel_staffhelp:{chat_id}"), InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")],
+    ])
     return InlineKeyboardMarkup(rows)
 
 async def panel(update, context):
@@ -4377,6 +4380,33 @@ async def notify_owner_and_deputies(context, text, reply_markup=None):
             await context.bot.send_message(chat_id=recipient, text=text, reply_markup=reply_markup)
         except Exception as exc:
             log.info("تعذر إرسال إشعار العضوية إلى %s: %s", recipient, exc)
+
+
+async def notify_group_stakeholders(context, chat_id, text):
+    """Notify the verified Telegram group creator plus the bot owner and deputies.
+
+    Only known Telegram creator IDs are used; transient API failures never broaden recipients.
+    """
+    recipients = set(membership_notification_recipients())
+    row = db.execute("SELECT telegram_owner_id FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
+    group_owner_id = int(row[0] or 0) if row else 0
+    if not group_owner_id:
+        try:
+            admins = await context.bot.get_chat_administrators(int(chat_id))
+            creator = next((item.user for item in admins if getattr(item, "status", "") == "creator"), None)
+            group_owner_id = int(creator.id) if creator else 0
+            if group_owner_id:
+                db.execute("UPDATE external_group_control SET telegram_owner_id=? WHERE chat_id=?", (group_owner_id, int(chat_id)))
+                db.commit()
+        except Exception as exc:
+            log.debug("Could not resolve group creator for notifications chat=%s: %s", chat_id, exc)
+    if group_owner_id > 0:
+        recipients.add(group_owner_id)
+    for recipient in sorted(recipients):
+        try:
+            await context.bot.send_message(chat_id=recipient, text=text, disable_web_page_preview=True)
+        except Exception as exc:
+            log.info("تعذر إرسال إشعار القروب %s إلى %s: %s", chat_id, recipient, exc)
 
 def archive_is_enabled(chat_id):
     row = db.execute("SELECT enabled FROM archive_settings WHERE chat_id=?", (chat_id,)).fetchone()
@@ -6079,7 +6109,15 @@ async def chat_member_handler(update, context):
     if member and not member.is_bot:
         if old in ("left", "kicked") and new in ("member", "administrator", "restricted"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "join", _riyadh_now().isoformat()))
+            db.execute("UPDATE external_group_control SET last_member_event_at=?,member_count=COALESCE(member_count,0)+1,updated_at=? WHERE chat_id=?", (now(), now(), chat_id))
             db.commit()
+            try:
+                current_count = await context.bot.get_chat_member_count(chat_id)
+            except Exception:
+                current_count = "غير متاح"
+            if isinstance(current_count, int):
+                db.execute("UPDATE external_group_control SET member_count=? WHERE chat_id=?", (current_count, chat_id)); db.commit()
+            await notify_group_stakeholders(context, chat_id, f"📥 دخول عضو جديد\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name or 'عضو'} (ID: {member.id})\nعدد الأعضاء الحالي: {current_count}\nرابط القروب: {('https://t.me/' + cm.chat.username) if getattr(cm.chat, 'username', None) else 'الرابط الخاص محفوظ إن كان متاحًا'}")
             if group_feature_enabled(chat_id, "join_notices_enabled") and not authorized_staff_direct_add:
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=f"📥 انضم عضو جديد إلى القروب: {html.escape(member.full_name or 'عضو')}\n🆔 ID: {member.id}", parse_mode="HTML")
@@ -6089,12 +6127,20 @@ async def chat_member_handler(update, context):
                 log.info("PUBLIC_JOIN_NOTICE_SUPPRESSED_MANUAL_ADD chat_id=%s member_id=%s actor_id=%s", chat_id, member.id, actor_id)
         elif old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
             db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
+            db.execute("UPDATE external_group_control SET last_member_event_at=?,updated_at=? WHERE chat_id=?", (now(), now(), chat_id))
             # Retire any previous approved-link marker so a later manual addition is
             # still correctly classified as a direct addition by an authorized owner.
             db.execute("UPDATE join_request_events SET status='left' WHERE chat_id=? AND user_id=? AND status IN ('approved','joined')", (chat_id, member.id))
             # Allow a fresh welcome if this same Telegram user genuinely joins again later.
             db.execute("DELETE FROM welcome_sent_events WHERE chat_id=? AND user_id=?", (chat_id, member.id))
             db.commit()
+            try:
+                current_count = await context.bot.get_chat_member_count(chat_id)
+            except Exception:
+                current_count = "غير متاح"
+            if isinstance(current_count, int):
+                db.execute("UPDATE external_group_control SET member_count=? WHERE chat_id=?", (current_count, chat_id)); db.commit()
+            await notify_group_stakeholders(context, chat_id, f"📤 خروج عضو\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name or 'عضو'} (ID: {member.id})\nعدد الأعضاء الحالي: {current_count}\nرابط القروب: {('https://t.me/' + cm.chat.username) if getattr(cm.chat, 'username', None) else 'الرابط الخاص محفوظ إن كان متاحًا'}")
             if group_feature_enabled(chat_id, "leave_notices_enabled"):
                 try:
                     reason = "تمت إزالته/حظره" if new == "kicked" else "غادر القروب"
@@ -8637,7 +8683,7 @@ async def callback(update, context):
         return
 
     # لوحة القروب المحلية: كل callback يعيد التحقق من كون المستخدم مشرف Telegram في القروب نفسه.
-    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:", "group_panel_warnings:", "group_panel_bulkdelete:", "group_panel_staffhelp:")):
+    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:", "group_panel_warnings:", "group_panel_bulkdelete:", "group_panel_staffhelp:", "group_panel_ai:", "group_panel_joinrequests:")):
         try:
             action, chat_raw = data.split(":", 1)
             group_chat_id = int(chat_raw)
@@ -8660,10 +8706,29 @@ async def callback(update, context):
                 "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
                 "group_panel_admin": "members", "group_panel_roles": "members",
                 "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
-                "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
+                "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members",
+                "group_panel_joinrequests": "members"
             }.get(action)
             if required_cap and not external_group_cap_enabled(group_chat_id, required_cap):
                 await safe_callback_answer(q, "هذه الخدمة غير مفعّلة لهذا القروب من المالك الأساسي.", show_alert=True); return
+        if action == "group_panel_ai":
+            ext_row = db.execute("SELECT is_external,ai_enabled FROM external_group_control WHERE chat_id=?", (group_chat_id,)).fetchone()
+            if not ext_row or not ext_row[0]:
+                await safe_callback_answer(q, "إعداد الذكاء الاصطناعي غير متاح لهذا القروب.", show_alert=True); return
+            if not is_owner(uid) and not await can_access_group(context.bot, uid, group_chat_id):
+                await safe_callback_answer(q, "لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
+            new_state = 0 if int(ext_row[1] or 0) else 1
+            db.execute("UPDATE external_group_control SET ai_enabled=?,updated_at=? WHERE chat_id=?", (new_state, now(), group_chat_id))
+            db.execute("INSERT INTO external_group_capabilities(chat_id,capability,enabled,granted_by,granted_at) VALUES(?,'ai',?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,granted_by=excluded.granted_by,granted_at=excluded.granted_at", (group_chat_id, new_state, uid, now()))
+            db.execute("INSERT INTO ai_group_settings(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at", (group_chat_id, new_state, uid, now()))
+            db.commit()
+            log_external_group_event(group_chat_id, uid, "group_owner_ai_toggle", f"enabled={new_state}")
+            await q.edit_message_text("🧠 الذكاء الاصطناعي للقروب: " + ("مفعّل" if new_state else "متوقف") + "\n\nيمكن للمالك الأساسي متابعة الحالة من مركز مراقبة القروبات.", reply_markup=group_owner_panel_markup(group_chat_id, uid))
+            return
+        if action == "group_panel_joinrequests":
+            pending = db.execute("SELECT COUNT(*) FROM join_request_events WHERE chat_id=? AND status='pending'", (group_chat_id,)).fetchone()[0]
+            await q.edit_message_text(f"📨 طلبات الانضمام\n\nالطلبات المعلقة المسجلة: {pending}\n\nتُدار الموافقات وفق إعدادات القروب وصلاحيات تيليجرام.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]]))
+            return
         if action == "group_panel_bulkdelete":
             await q.edit_message_text(
                 "🗑️ مسح الرسائل — هذا القروب فقط\n\n"
@@ -8738,11 +8803,17 @@ async def callback(update, context):
             await safe_callback_answer(q, f"تم إرسال {len(mentions)} منشن مسجل على {len(chunks)} رسالة تلقائيًا.", show_alert=True)
             return
         if action == "group_panel_home":
-            title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
+            title_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=?", (group_chat_id,)).fetchone()
+            title = (title_row[0] if title_row else str(group_chat_id)) or str(group_chat_id)
+            try: member_count = await context.bot.get_chat_member_count(group_chat_id)
+            except Exception: member_count = "غير متاح"
+            ext_data = db.execute("SELECT invite_link,ai_enabled,bot_status FROM external_group_control WHERE chat_id=?", (group_chat_id,)).fetchone()
+            group_link = (ext_data[0] if ext_data else "") or "غير متاح"
+            ai_state = "مفعّل" if ext_data and ext_data[1] else "متوقف"
+            bot_state = (ext_data[2] if ext_data else "unknown")
             await q.edit_message_text(
-                f"🛡️ لوحة القروب: {html.escape((title_row[0] if title_row else str(group_chat_id)) or str(group_chat_id))}\n\n"
-                "هذه لوحة محلية بصلاحيات القروب فقط؛ لا تتيح إدارة مالك البوت أو القروبات الأخرى.",
-                parse_mode="HTML", reply_markup=group_owner_panel_markup(group_chat_id, uid))
+                f"👑 <b>لوحة إدارة القروب</b>\n\n<b>{html.escape(title)}</b>\n🆔 <code>{group_chat_id}</code>\n👥 عدد الأعضاء: <b>{member_count}</b>\n🤖 حالة البوت: <b>{html.escape(str(bot_state))}</b>\n🧠 الذكاء الاصطناعي: <b>{ai_state}</b>\n🔗 رابط القروب: {html.escape(group_link)}\n\nاختر القسم المطلوب من الأزرار أدناه. صلاحياتك محصورة بهذا القروب.",
+                parse_mode="HTML", disable_web_page_preview=True, reply_markup=group_owner_panel_markup(group_chat_id, uid))
             return
         if action == "group_panel_settings":
             await q.edit_message_text(settings_text(0), reply_markup=settings_page_markup(group_chat_id, 0, f"group_panel_home:{group_chat_id}"))
@@ -11267,11 +11338,21 @@ async def active_group_refresh_worker(app):
                     elif owner_is_creator is False:
                         current_external = 1
 
+                    fresh_owner_id = 0
                     try:
                         chat_obj = await app.bot.get_chat(cid)
                         fresh_title = getattr(chat_obj, "title", None) or title or str(cid)
+                        public_username = getattr(chat_obj, "username", None)
+                        fresh_link = (f"https://t.me/{public_username}" if public_username else (getattr(chat_obj, "invite_link", "") or ""))
+                        try:
+                            creator_rows = await app.bot.get_chat_administrators(cid)
+                            creator = next((item.user for item in creator_rows if getattr(item, "status", "") == "creator"), None)
+                            fresh_owner_id = int(creator.id) if creator else 0
+                        except Exception as creator_exc:
+                            log.debug("Could not resolve Telegram creator for %s: %s", cid, creator_exc)
                     except Exception:
                         fresh_title = title or str(cid)
+                        fresh_link = ""
 
                     db.execute("""INSERT OR IGNORE INTO external_group_control
                         (chat_id,title,is_external,added_by,added_by_name,added_by_username,
@@ -11279,9 +11360,17 @@ async def active_group_refresh_worker(app):
                         VALUES(?,?,?,0,'','',1,0,?,?,1)""",
                         (cid, fresh_title, current_external, now(), now()))
                     db.execute("""UPDATE external_group_control SET
-                        title=?, is_external=?, is_member=1, bot_status=?, last_checked_at=?, updated_at=?
+                        title=?, is_external=?, is_member=1, bot_status=?, last_checked_at=?, updated_at=?,
+                        telegram_owner_id=CASE WHEN ?>0 THEN ? ELSE telegram_owner_id END,
+                        invite_link=CASE WHEN ?<>'' THEN ? ELSE invite_link END
                         WHERE chat_id=?""",
-                        (fresh_title, current_external, bot_status, now(), now(), cid))
+                        (fresh_title, current_external, bot_status, now(), now(), fresh_owner_id, fresh_owner_id,
+                         fresh_link, fresh_link, cid))
+                    try:
+                        member_count = await app.bot.get_chat_member_count(cid)
+                        db.execute("UPDATE external_group_control SET member_count=? WHERE chat_id=?", (int(member_count), cid))
+                    except Exception:
+                        pass
                     if current_external == 0:
                         # Owner-owned groups belong only in the owner's lists.
                         db.execute("INSERT OR IGNORE INTO watched_groups(chat_id,title,added_at) VALUES(?,?,?)",
