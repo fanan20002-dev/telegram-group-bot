@@ -400,6 +400,15 @@ db.execute("""CREATE TABLE IF NOT EXISTS global_ban_groups(
     user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
     PRIMARY KEY(user_id, chat_id)
 )""")
+# Local bans created by each group owner; isolated per group and independent of central global bans.
+db.execute("""CREATE TABLE IF NOT EXISTS group_scoped_bans(
+    chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, display_name TEXT DEFAULT '',
+    reason TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+    created_by INTEGER NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,user_id)
+)""")
+db.execute("CREATE INDEX IF NOT EXISTS idx_group_scoped_bans_active ON group_scoped_bans(chat_id,active)")
+db.commit()
 db.execute("""CREATE TABLE IF NOT EXISTS security_review_runs(
     week_start TEXT PRIMARY KEY, created_at TEXT NOT NULL, report TEXT NOT NULL
 )""")
@@ -1947,6 +1956,9 @@ async def send_member_mass_mention(bot, chat_id):
 
 
 def global_ban_applies(user_id, chat_id):
+    local = db.execute("SELECT 1 FROM group_scoped_bans WHERE user_id=? AND chat_id=? AND active=1", (user_id, chat_id)).fetchone()
+    if local:
+        return True
     row = db.execute("SELECT scope,active FROM global_bans WHERE user_id=?", (user_id,)).fetchone()
     if not row or not row[1]:
         return False
@@ -2551,6 +2563,28 @@ async def process_private_workflows(update, context):
     if not msg or not user or not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
     raw = (msg.text or "").strip()
+    local_ban_state = context.user_data.get("local_group_ban_state")
+    if local_ban_state:
+        if raw.lower() == "/cancel":
+            context.user_data.pop("local_group_ban_state", None)
+            await msg.reply_text("تم إلغاء الحظر."); return
+        if not raw.isdigit() or int(raw) <= 0:
+            await msg.reply_text("أرسل رقم ID صحيحًا فقط، أو /cancel للإلغاء."); return
+        target_id = int(raw); chat_id = int(local_ban_state["chat_id"])
+        # Revalidate that the requester is still an admin of this exact group.
+        if not await is_telegram_group_admin(context.bot, user.id, chat_id):
+            context.user_data.pop("local_group_ban_state", None)
+            await msg.reply_text("لم تعد تملك صلاحية إدارة هذه المجموعة."); return
+        display = db.execute("SELECT display_name FROM member_activity WHERE chat_id=? AND user_id=? ORDER BY rowid DESC LIMIT 1", (chat_id,target_id)).fetchone()
+        try:
+            await context.bot.ban_chat_member(chat_id=chat_id,user_id=target_id)
+        except Exception as exc:
+            await msg.reply_text(f"تعذر حظر العضو. تحقق من صلاحية البوت لحظر الأعضاء. التفاصيل: {str(exc)[:180]}"); return
+        db.execute("INSERT INTO group_scoped_bans(chat_id,user_id,display_name,reason,active,created_by,created_at) VALUES(?,?,?,'حظر من لوحة مالك المجموعة',1,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name,reason=excluded.reason,active=1,created_by=excluded.created_by,created_at=excluded.created_at", (chat_id,target_id,(display[0] if display else ""),user.id,now()))
+        db.commit(); log_action(chat_id,user.id,"group_scoped_ban",f"target={target_id}")
+        context.user_data.pop("local_group_ban_state", None)
+        await msg.reply_text(f"🚫 تم حظر العضو ID: {target_id} من هذه المجموعة فقط.")
+        return
     # Button-driven deputy-owner workflow: only the primary owner can add a deputy.
     if context.user_data.get("awaiting_deputy_owner_id"):
         if not is_owner(user.id):
@@ -3937,14 +3971,15 @@ async def help_cmd(update, context):
 def group_owner_panel_markup(chat_id, uid=None):
     """واجهة مقسمة إلى أقسام واضحة لمالك القروب ومشرفيه، ومحدودة بالقروب الحالي."""
     settings = get_settings(chat_id)
-    links_label = "🔓 السماح بالروابط" if settings.get("links") else "🔒 منع الروابط"
+    # links=1 means links are blocked; links=0 means links are allowed.
+    # The group owner/admin is authorized by the group-panel access check below,
+    # so the local panel must always expose the toggle in both directions.
+    links_label = "🔒 الروابط مقفلة — اضغط للسماح" if settings.get("links") else "🔓 الروابط مفتوحة — اضغط للمنع"
     links_callback = f"group_panel_toggle_links:{chat_id}"
-    can_open_links = uid is None or is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", chat_id))
-    if settings.get("links") and not can_open_links:
-        links_label, links_callback = "🔒 الروابط مقفلة — الفتح للمالك", "panel_links_locked"
     ext = external_group_info(chat_id)
     rows = [
         [InlineKeyboardButton("🛡️ الحماية", callback_data=f"group_panel_settings:{chat_id}"), InlineKeyboardButton("⚙️ إعدادات القروب", callback_data=f"group_panel_settings:{chat_id}")],
+        [InlineKeyboardButton("🚫 حظر الأعضاء وفك الحظر", callback_data=f"group_panel_ban:{chat_id}"), InlineKeyboardButton("📋 قائمة المحظورين", callback_data=f"group_panel_banlist:{chat_id}")],
         [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"), InlineKeyboardButton("🪪 الصلاحيات والرتب", callback_data=f"group_panel_roles:{chat_id}")],
         [InlineKeyboardButton("📨 طلبات الانضمام", callback_data=f"group_panel_joinrequests:{chat_id}"), InlineKeyboardButton("⚠️ الإنذارات والمخالفات", callback_data=f"group_panel_warnings:{chat_id}")],
         [InlineKeyboardButton("📊 الإحصائيات", callback_data=f"group_panel_stats:{chat_id}"), InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
@@ -8715,11 +8750,14 @@ async def callback(update, context):
         return
 
     # لوحة القروب المحلية: كل callback يعيد التحقق من كون المستخدم مشرف Telegram في القروب نفسه.
-    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:", "group_panel_warnings:", "group_panel_bulkdelete:", "group_panel_staffhelp:", "group_panel_ai:", "group_panel_joinrequests:", "group_panel_joinapproval:", "group_panel_membership_notices:", "group_panel_name_notices:", "group_panel_toggle_feature:", "group_panel_health:", "group_panel_card:", "group_panel_report:", "group_panel_invite:")):
+    if data.startswith(("group_panel_home:", "group_panel_settings:", "group_panel_ban:", "group_panel_banlist:", "group_panel_banun:", "group_panel_admin:", "group_panel_roles:", "group_panel_logs:", "group_panel_stats:", "group_panel_toggle_links:", "group_panel_tag:", "group_panel_warnings:", "group_panel_bulkdelete:", "group_panel_staffhelp:", "group_panel_ai:", "group_panel_joinrequests:", "group_panel_joinapproval:", "group_panel_membership_notices:", "group_panel_name_notices:", "group_panel_toggle_feature:", "group_panel_health:", "group_panel_card:", "group_panel_report:", "group_panel_invite:")):
         try:
             if data.startswith("group_panel_toggle_feature:"):
                 _parts = data.split(":", 2)
                 action, chat_raw, _feature_part = _parts[0], _parts[1], _parts[2]
+            elif data.startswith("group_panel_banun:"):
+                _parts = data.split(":", 2)
+                action, chat_raw = _parts[0], _parts[1]
             else:
                 action, chat_raw = data.split(":", 1)
             group_chat_id = int(chat_raw)
@@ -8740,6 +8778,7 @@ async def callback(update, context):
         if ext_info and ext_info[0] and not is_owner(uid):
             required_cap = {
                 "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
+                "group_panel_ban": "members", "group_panel_banlist": "members", "group_panel_banun": "members",
                 "group_panel_admin": "members", "group_panel_roles": "members",
                 "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
                 "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members",
@@ -8749,6 +8788,27 @@ async def callback(update, context):
             }.get(action)
             if required_cap and not external_group_cap_enabled(group_chat_id, required_cap):
                 await safe_callback_answer(q, "هذه الخدمة غير مفعّلة لهذا القروب من المالك الأساسي.", show_alert=True); return
+        if action == "group_panel_ban":
+            context.user_data["local_group_ban_state"] = {"chat_id": group_chat_id}
+            await q.message.reply_text("🚫 حظر عضو من هذه المجموعة فقط\nأرسل رقم ID للعضو. أرسل /cancel للإلغاء.")
+            return
+        if action == "group_panel_banlist":
+            bans = db.execute("SELECT user_id,display_name,reason,created_at FROM group_scoped_bans WHERE chat_id=? AND active=1 ORDER BY created_at DESC LIMIT 40", (group_chat_id,)).fetchall()
+            rows = [[InlineKeyboardButton(f"🔓 فك حظر {name or uid} ({uid})", callback_data=f"group_panel_banun:{group_chat_id}:{uid}")] for uid,name,reason,created in bans]
+            rows.append([InlineKeyboardButton("➕ حظر عضو", callback_data=f"group_panel_ban:{group_chat_id}")])
+            rows.append([InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")])
+            body = "📋 المحظورون في هذه المجموعة\n\n" + ("لا يوجد أعضاء محظورون عبر لوحة البوت." if not bans else "\n".join(f"• {name or 'عضو'} — ID: {uid}\n  السبب: {reason or 'غير محدد'} | {created}" for uid,name,reason,created in bans))
+            await q.edit_message_text(body[:3900], reply_markup=InlineKeyboardMarkup(rows)); return
+        if action == "group_panel_banun":
+            try: target_id = int(data.rsplit(":",1)[1])
+            except ValueError: await safe_callback_answer(q, "معرّف العضو غير صحيح.", show_alert=True); return
+            db.execute("UPDATE group_scoped_bans SET active=0 WHERE chat_id=? AND user_id=?", (group_chat_id,target_id)); db.commit()
+            try:
+                await context.bot.unban_chat_member(chat_id=group_chat_id,user_id=target_id,only_if_banned=True)
+                result = "تم فك الحظر من هذه المجموعة. يمكن للعضو طلب الانضمام مجددًا وفق إعدادات الموافقة."
+            except Exception as exc:
+                result = f"تم تحديث سجل الحظر، لكن تعذر تنفيذ فك الحظر عبر تيليجرام: {str(exc)[:160]}"
+            await q.edit_message_text("🔓 " + result, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 قائمة المحظورين", callback_data=f"group_panel_banlist:{group_chat_id}")],[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]])); return
         if action == "group_panel_health":
             st = get_settings(group_chat_id)
             checks = [
@@ -8902,9 +8962,9 @@ async def callback(update, context):
             )
             return
         if action == "group_panel_toggle_links":
-            current = get_settings(group_chat_id).get("links", 0)
-            if current and not (is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", group_chat_id))):
-                await safe_callback_answer(q, "فتح الروابط للأعضاء يتطلب صلاحية المالك أو تفويض الحماية.", show_alert=True); return
+            current = int(bool(get_settings(group_chat_id).get("links", 0)))
+            # Access to this callback was already restricted to the bot owner,
+            # delegated users, or a Telegram admin of this exact group.
             set_setting(group_chat_id, "links", 0 if current else 1)
             log_action(group_chat_id, uid, "setting", f"links={0 if current else 1}")
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
