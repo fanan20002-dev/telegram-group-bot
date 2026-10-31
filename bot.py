@@ -732,6 +732,15 @@ db.execute("""CREATE TABLE IF NOT EXISTS group_greeting_deliveries(
     chat_id INTEGER NOT NULL, greeting_date TEXT NOT NULL, period TEXT NOT NULL,
     sent_at TEXT NOT NULL, PRIMARY KEY(chat_id,greeting_date,period)
 )""")
+# Separate idempotency ledger for the approved bot advertisement and Friday reminder.
+db.execute("""CREATE TABLE IF NOT EXISTS scheduled_announcement_deliveries(
+    chat_id INTEGER NOT NULL,
+    delivery_date TEXT NOT NULL,
+    delivery_type TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, delivery_date, delivery_type)
+)""")
+db.commit()
 db.execute("""CREATE TABLE IF NOT EXISTS member_profile_snapshots(
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -11482,6 +11491,100 @@ async def group_greeting_worker(app):
             await asyncio.sleep(60)
 
 
+async def scheduled_group_announcements_worker(app):
+    """Publish the approved daily bot ad at 22:00 and Friday reminder at 11:00 Riyadh time.
+
+    Only active group/supergroup chats are eligible; channels are explicitly excluded.
+    Each delivery is recorded per chat/date/type to prevent duplicate sends after restarts.
+    """
+    tz = ZoneInfo("Asia/Riyadh")
+    bot_ad = (
+        "🤖 بوت حماية ومساعدة القروبات\n\n"
+        "مع بوت حماية ومساعدة القروبات ستحصل على أدوات متكاملة لإدارة قروبك وحمايته بكل سهولة.\n\n"
+        "🔒 حماية ذكية\n"
+        "👑 تحكم بالصلاحيات\n"
+        "🚫 مكافحة الإزعاج والروابط\n"
+        "📈 متابعة وإحصائيات\n"
+        "🤖 مساعد ذكي للإدارة\n\n"
+        "📌 ابدأ تجربتك الآن:\n"
+        "🔗 https://t.me/khaled211_bot"
+    )
+    friday_text = (
+        "🕌 تذكير بيوم الجمعة\n\n"
+        "لا تنسوا الإكثار من الصلاة على النبي ﷺ، واغتنموا فضل هذا اليوم المبارك بالدعاء والذكر وقراءة سورة الكهف.\n\n"
+        "قال رسول الله ﷺ: «خير يوم طلعت عليه الشمس يوم الجمعة» — رواه مسلم.\n\n"
+        "🤖 بوت حماية ومساعدة القروبات\n"
+        "إدارة أسهل، حماية أقوى، وتحكم متكامل بقروبك.\n\n"
+        "🔒 حماية ذكية | 👑 تحكم بالصلاحيات\n"
+        "🚫 مكافحة الإزعاج والروابط | 📈 متابعة وإحصائيات\n\n"
+        "📌 ابدأ تجربتك الآن:\n"
+        "🔗 https://t.me/khaled211_bot"
+    )
+
+    def next_occurrence(current):
+        candidates = []
+        daily = current.replace(hour=22, minute=0, second=0, microsecond=0)
+        if daily <= current:
+            daily += timedelta(days=1)
+        candidates.append((daily, "daily_ad"))
+        days_until_friday = (4 - current.weekday()) % 7
+        friday = (current + timedelta(days=days_until_friday)).replace(
+            hour=11, minute=0, second=0, microsecond=0
+        )
+        if friday <= current:
+            friday += timedelta(days=7)
+        candidates.append((friday, "friday_reminder"))
+        return min(candidates, key=lambda item: item[0])
+
+    while True:
+        try:
+            current = datetime.now(tz)
+            scheduled_time, delivery_type = next_occurrence(current)
+            await asyncio.sleep(max(1, (scheduled_time - datetime.now(tz)).total_seconds()))
+            delivery_date = scheduled_time.date().isoformat()
+            message = friday_text if delivery_type == "friday_reminder" else bot_ad
+
+            # Internal owner-managed groups and active external groups are both included.
+            rows = db.execute("""SELECT chat_id, title FROM watched_groups
+                UNION
+                SELECT chat_id, title FROM external_group_control
+                WHERE enabled=1 AND COALESCE(is_member,1)=1
+                ORDER BY title""").fetchall()
+            bot_user = await app.bot.get_me()
+            for chat_id, title in rows:
+                try:
+                    chat_id = int(chat_id)
+                    already_sent = db.execute(
+                        "SELECT 1 FROM scheduled_announcement_deliveries WHERE chat_id=? AND delivery_date=? AND delivery_type=?",
+                        (chat_id, delivery_date, delivery_type),
+                    ).fetchone()
+                    if already_sent:
+                        continue
+                    chat = await app.bot.get_chat(chat_id)
+                    # Telegram channels must never receive these announcements.
+                    if getattr(chat, "type", None) not in ("group", "supergroup"):
+                        continue
+                    member = await app.bot.get_chat_member(chat_id=chat_id, user_id=bot_user.id)
+                    if getattr(member, "status", "left") not in ("member", "administrator", "creator"):
+                        continue
+                    await app.bot.send_message(chat_id=chat_id, text=message, disable_web_page_preview=True)
+                    db.execute(
+                        "INSERT OR IGNORE INTO scheduled_announcement_deliveries(chat_id,delivery_date,delivery_type,sent_at) VALUES(?,?,?,?)",
+                        (chat_id, delivery_date, delivery_type, now()),
+                    )
+                    db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.info("Scheduled announcement skipped for group %s (%s): %s", chat_id, title, exc)
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scheduled group announcements worker failed")
+            await asyncio.sleep(60)
+
+
 async def ensure_global_join_approval_links_worker(app):
     """Ensure each registered group has a bot-managed request-only link when the global lock is on."""
     await asyncio.sleep(8)
@@ -11534,7 +11637,7 @@ async def post_init(app):
         (group_analysis_report_worker, "group-analysis-report-worker"),
         (weekly_security_review_worker, "weekly-security-review-worker"),
         (motivation_daily_worker, "motivation-daily-worker"),
-        (group_greeting_worker, "group-greeting-worker"),
+        (scheduled_group_announcements_worker, "scheduled-group-announcements-worker"),
         (ensure_global_join_approval_links_worker, "global-join-approval-links-worker"),
     ]
     # Application is a library object: do not assign undocumented private attributes.
