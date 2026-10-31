@@ -1694,16 +1694,23 @@ def external_group_active(chat_id):
     return bool(row and row[0])
 
 
+def support_group_info(chat_id):
+    """Find an active group in either the owner or external-group registry."""
+    row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
+    if row:
+        return row
+    return db.execute(
+        "SELECT title FROM external_group_control WHERE chat_id=? AND enabled=1 AND is_member=1",
+        (int(chat_id),)
+    ).fetchone()
+
+
 def external_group_cap_enabled(chat_id, capability):
     row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
     if not row or not row[0]:
         return True
     cap = db.execute("SELECT enabled FROM external_group_capabilities WHERE chat_id=? AND capability=?", (chat_id, capability)).fetchone()
-    # Backward-compatible default: older external groups may not have a row yet.
-    # Treat a missing welcome row as enabled; an explicit enabled=0 remains disabled.
-    if not cap:
-        return capability == "welcome"
-    return bool(cap[0])
+    return bool(cap and cap[0])
 
 
 def record_member_violation(chat_id, user, reason, abusive=False):
@@ -2254,7 +2261,7 @@ def panel_markup(uid):
     if is_delegated_owner(uid) and not is_owner(uid):
         delegated_rows = [
             [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
+            [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start")],
             [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
             [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
@@ -2288,8 +2295,7 @@ def panel_markup(uid):
              InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="administration_groups")],
             [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
              InlineKeyboardButton("📋 السجلات", callback_data="logs")],
-            [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"),
-             InlineKeyboardButton("👋 الترحيب", callback_data="welcome")],
+            [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings")],
             [InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts"),
              InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
         ]
@@ -2338,7 +2344,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
-        [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
+        [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
@@ -2733,7 +2739,7 @@ async def process_private_workflows(update, context):
     if _is_aistatus_alias(raw):
         return
     if any(context.user_data.get(key) is not None for key in (
-        "external_support_state", "mass_ban_state", "support_reply_ticket_id",
+        "external_support_state", "awaiting_group_broadcast", "mass_ban_state", "support_reply_ticket_id",
         "awaiting_calendar_search", "owner_autoreply_state",
         "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast",
         "awaiting_broadcast", "awaiting_delegated_owner_id", "awaiting_deputy_owner_id", "awaiting_staff_permissions_id",
@@ -2750,10 +2756,10 @@ async def process_private_workflows(update, context):
         if len(raw) < 5:
             await msg.reply_text("يرجى كتابة وصف أوضح للمشكلة (5 أحرف على الأقل)، أو /cancel للإلغاء."); return
         chat_id = int(support_state.get("chat_id", 0) or 0)
-        group_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
-        if not group_row:
+        group_row = support_group_info(chat_id)
+        if not group_row or not await is_telegram_group_admin(context.bot, user.id, chat_id):
             context.user_data.pop("external_support_state", None)
-            await msg.reply_text("القروب غير مسجل في البوت؛ تعذر إنشاء طلب الدعم."); return
+            await msg.reply_text("تعذر إنشاء الطلب لأن البوت لم يعد نشطًا في القروب أو لأن صلاحية المشرف لم تعد متاحة لحسابك."); return
         cur = db.execute("""INSERT INTO external_support_tickets
             (chat_id,group_title,requester_id,requester_name,requester_username,message,status,created_at)
             VALUES(?,?,?,?,?,?,'new',?)""",
@@ -3767,7 +3773,7 @@ async def assistant_private_document(update, context):
     if not user or not msg or update.effective_chat.type != ChatType.PRIVATE or not msg.document:
         return
     # Do not intercept media used by existing owner workflows such as broadcast drafts.
-    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation"):
+    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_group_broadcast"):
         return
     doc = msg.document
     filename = (doc.file_name or "").lower()
@@ -3836,7 +3842,7 @@ async def assistant_private_text(update, context):
     # Do not answer workflow drafts as if they were ordinary assistant prompts.
     if context.user_data.pop("_skip_assistant_private_message_id", None) == msg.message_id:
         return
-    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_channel_broadcast"):
+    if context.user_data.get("owner_autoreply_state") or context.user_data.get("awaiting_welcome_chat") or context.user_data.get("awaiting_broadcast") or context.user_data.get("awaiting_broadcast_confirmation") or context.user_data.get("awaiting_channel_broadcast") or context.user_data.get("awaiting_group_broadcast"):
         return
     remember_assistant_user(user)
     if OPENAI_API_KEY and is_owner(user.id):
@@ -3852,19 +3858,28 @@ async def start(update, context):
     remember_delegated_user(update.effective_user)
     if update.effective_chat.type == ChatType.PRIVATE:
         remember_assistant_user(update.effective_user)
+        if context.args and context.args[0].startswith("publish_"):
+            try:
+                publish_chat_id = int(context.args[0].split("_", 1)[1])
+            except (ValueError, IndexError):
+                await update.effective_message.reply_text("رابط النشر غير صحيح."); return
+            if not support_group_info(publish_chat_id) or not await is_telegram_group_admin(context.bot, update.effective_user.id, publish_chat_id):
+                await update.effective_message.reply_text("النشر متاح لمالك القروب ومشرفيه الفعليين فقط، ويشترط أن يكون البوت نشطًا في القروب."); return
+            context.user_data["awaiting_group_broadcast"] = {"chat_id": publish_chat_id}
+            await update.effective_message.reply_text(
+                "📣 أرسل الآن الإعلان الذي تريد نشره في هذا القروب فقط (نص أو صورة أو فيديو أو ملف مع تعليق).\n"
+                "ستظهر لك معاينة قبل الإرسال. أرسل /cancel للإلغاء."
+            )
+            return
         if context.args and context.args[0].startswith("support_"):
             try:
                 support_chat_id = int(context.args[0].split("_", 1)[1])
             except (ValueError, IndexError):
                 await update.effective_message.reply_text("رابط الدعم غير صحيح."); return
-            support_group_exists = (
-                db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (support_chat_id,)).fetchone()
-                or db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND COALESCE(is_member,1)=1", (support_chat_id,)).fetchone()
-            )
-            if not support_group_exists or not await is_telegram_group_admin(context.bot, update.effective_user.id, support_chat_id):
-                await update.effective_message.reply_text("لا يمكن فتح طلب دعم لهذا القروب إلا لمالكه أو أحد مشرفيه الفعليين في تيليجرام."); return
+            group_row = support_group_info(support_chat_id)
+            if not group_row or not await is_telegram_group_admin(context.bot, update.effective_user.id, support_chat_id):
+                await update.effective_message.reply_text("لا يمكن فتح طلب دعم لهذا القروب إلا إذا كان البوت نشطًا فيه وكنت مالكه أو أحد مشرفيه الفعليين في تيليجرام."); return
             context.user_data["external_support_state"] = {"chat_id": support_chat_id}
-            group_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? UNION ALL SELECT title FROM watched_groups WHERE chat_id=? LIMIT 1", (support_chat_id, support_chat_id)).fetchone()
             await update.effective_message.reply_text(
                 f"🆘 الدعم الفني — {group_row[0] if group_row else support_chat_id}\nاكتب وصف المشكلة التي تواجهها مع البوت. أرسل /cancel للإلغاء."
             )
@@ -3991,7 +4006,7 @@ def group_owner_panel_markup(chat_id, uid=None):
         [InlineKeyboardButton("👥 إدارة الأعضاء", callback_data=f"group_panel_admin:{chat_id}"), InlineKeyboardButton("🪪 الصلاحيات والرتب", callback_data=f"group_panel_roles:{chat_id}")],
         [InlineKeyboardButton("📨 طلبات الانضمام", callback_data=f"group_panel_joinrequests:{chat_id}"), InlineKeyboardButton("⚠️ الإنذارات والمخالفات", callback_data=f"group_panel_warnings:{chat_id}")],
         [InlineKeyboardButton("📊 الإحصائيات", callback_data=f"group_panel_stats:{chat_id}"), InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
-        [InlineKeyboardButton("📣 النشر والإعلانات", callback_data=f"group_panel_support:{chat_id}"), InlineKeyboardButton("👋 الترحيب", callback_data=f"welcome_group:{chat_id}")],
+        [InlineKeyboardButton("📣 النشر والإعلانات", callback_data=f"group_panel_broadcast:{chat_id}")],
         [InlineKeyboardButton(links_label, callback_data=links_callback)],
         [InlineKeyboardButton("🔐 طلب موافقة مسبقة للدخول", callback_data=f"group_panel_joinapproval:{chat_id}")],
         [InlineKeyboardButton("🔔 إشعارات الدخول والخروج", callback_data=f"group_panel_membership_notices:{chat_id}")],
@@ -4003,7 +4018,7 @@ def group_owner_panel_markup(chat_id, uid=None):
         [InlineKeyboardButton("🗑️ حذف الرسائل (1–500)", callback_data=f"group_panel_bulkdelete:{chat_id}"), InlineKeyboardButton("👮 إدارة المشرفين", callback_data=f"group_panel_staffhelp:{chat_id}")],
         [InlineKeyboardButton("🩺 فحص الحماية", callback_data=f"group_panel_health:{chat_id}"), InlineKeyboardButton("📄 بطاقة المجموعة", callback_data=f"group_panel_card:{chat_id}")],
         [InlineKeyboardButton("📊 تقرير المجموعة", callback_data=f"group_panel_report:{chat_id}"), InlineKeyboardButton("📢 مشاركة البوت", callback_data=f"group_panel_invite:{chat_id}")],
-        [InlineKeyboardButton("🆘 الدعم الفني", callback_data=f"group_panel_support_ticket:{chat_id}"), InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")],
+        [InlineKeyboardButton("🆘 الدعم الفني", callback_data=f"group_panel_support:{chat_id}"), InlineKeyboardButton("🔄 تحديث اللوحة", callback_data=f"group_panel_home:{chat_id}")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -6346,7 +6361,7 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
     intro = (f"🌷 نـورت مـلـتـقـانـا بـ 『{display_name}』 ✨" if approved
              else f"🎉 يـا مـرحـبـا بـ 『{display_name}』 نـوّرت الـقـروب 🌟")
     time_label = "وقت القبول" if approved else "وقت الدخول"
-    default_text = (
+    text = (
         f"ᯓ˹ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ {title} ˼\n"
         "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\n"
         f"{intro}\n"
@@ -6359,35 +6374,20 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
         "💫 حـيـاك الله بـيـنـنـا، ونـتـمـنـى لـك أجـمـل الأوقـات 🤍\n"
         "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°"
     )
-    custom_row = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat.id,)).fetchone()
-    custom_template = (custom_row[0] or "").strip() if custom_row else ""
-    if custom_template:
-        group_name = chat.title or "القروب"
-        text = (custom_template.replace("{name}", member.full_name or "عضو")
-                .replace("{group}", group_name)
-                .replace("{id}", str(member.id))
-                .replace("{username}", ("@" + member.username) if member.username else "بدون يوزر"))
-        use_html = False
-    else:
-        text = default_text
-        use_html = True
     try:
         photos = await context.bot.get_user_profile_photos(user_id=context.bot.id, limit=1)
         if photos and photos.total_count and photos.photos:
             photo_id = photos.photos[0][-1].file_id
-            kwargs = {"parse_mode": "HTML"} if use_html else {}
-            await context.bot.send_photo(chat_id=chat.id, photo=photo_id, caption=text[:1024], **kwargs)
+            await context.bot.send_photo(chat_id=chat.id, photo=photo_id, caption=text[:1024], parse_mode="HTML")
         else:
-            kwargs = {"parse_mode": "HTML"} if use_html else {}
-            await context.bot.send_message(chat_id=chat.id, text=text[:4000], **kwargs)
+            await context.bot.send_message(chat_id=chat.id, text=text[:4000], parse_mode="HTML")
         log.info("WELCOME_SENT chat_id=%s member_id=%s approved=%s photo_attempted=1", chat.id, member.id, approved)
         return True
     except Exception as exc:
         # If the photo endpoint or sendPhoto fails, fall back to text so the welcome is not lost.
         log.warning("WELCOME_PHOTO_SEND_FAILED chat_id=%s member_id=%s error=%r", chat.id, member.id, exc)
         try:
-            fallback_kwargs = {"parse_mode": "HTML"} if use_html else {}
-            await context.bot.send_message(chat_id=chat.id, text=text[:4000], **fallback_kwargs)
+            await context.bot.send_message(chat_id=chat.id, text=text[:4000], parse_mode="HTML")
             return True
         except Exception as fallback_exc:
             db.execute("DELETE FROM welcome_sent_events WHERE chat_id=? AND user_id=?", (chat.id, member.id))
@@ -6652,6 +6652,37 @@ async def broadcast_draft_message(update, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالك المفوّض", callback_data="delegated_owner")]])
         )
         return
+    # Per-group publishing from the group owner's own panel.
+    group_broadcast_state = context.user_data.get("awaiting_group_broadcast")
+    if group_broadcast_state:
+        if (msg.text or "").strip().lower() == "/cancel":
+            context.user_data.pop("awaiting_group_broadcast", None)
+            context.user_data.pop("group_broadcast_draft", None)
+            await msg.reply_text("تم إلغاء إعلان القروب.")
+            return
+        try:
+            target_chat_id = int(group_broadcast_state.get("chat_id", 0))
+        except (TypeError, ValueError):
+            target_chat_id = 0
+        if not target_chat_id or not support_group_info(target_chat_id) or not await is_telegram_group_admin(context.bot, user.id, target_chat_id):
+            context.user_data.pop("awaiting_group_broadcast", None)
+            await msg.reply_text("انتهت صلاحية طلب النشر أو لم تعد تملك صلاحية المشرف في القروب. افتح النشر من لوحة القروب مجددًا.")
+            return
+        context.user_data["group_broadcast_draft"] = {
+            "chat_id": chat.id, "message_id": msg.message_id, "target_chat_id": target_chat_id
+        }
+        context.user_data.pop("awaiting_group_broadcast", None)
+        title_row = support_group_info(target_chat_id)
+        await msg.reply_text(
+            f"👀 معاينة الإعلان جاهزة.\nالقروب المستهدف: {title_row[0] or target_chat_id}\n"
+            "لن يُرسل الإعلان إلا إلى هذا القروب بعد التأكيد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأكيد النشر", callback_data=f"group_broadcast_confirm:{target_chat_id}")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="group_broadcast_cancel")],
+            ])
+        )
+        return
+
     # Handle an active broadcast draft BEFORE pending admin actions. Otherwise a
     # stale awaiting_admin_action flag can intercept the ad and demand a numeric ID.
     if context.user_data.get("awaiting_broadcast") and (is_owner(user.id) or is_delegated_owner(user.id)):
@@ -6710,7 +6741,7 @@ async def broadcast_draft_message(update, context):
             context.user_data.pop("awaiting_admin_action", None)
         return
     welcome_chat_id = context.user_data.get("awaiting_welcome_chat")
-    if welcome_chat_id and await can_access_group(context.bot, user.id, welcome_chat_id):
+    if welcome_chat_id and (is_general_manager(user.id) or is_protection_manager(user.id) or is_delegated_owner(user.id)) and await can_access_group(context.bot, user.id, welcome_chat_id):
         body = msg.text or msg.caption
         if not body:
             await msg.reply_text("أرسل نص ترحيب أو تعليقًا نصيًا.")
@@ -8069,29 +8100,28 @@ async def callback(update, context):
             await safe_callback_answer(q, "الطلب غير موجود.", show_alert=True); return
         context.user_data["support_reply_ticket_id"] = ticket_id
         await q.message.reply_text(f"✍️ أرسل الرد على طلب الدعم #{ticket_id}. أرسل /cancel للإلغاء."); return
-    if data.startswith("group_panel_support_ticket:"):
+    if data.startswith("group_panel_broadcast:"):
         try:
-            support_chat_id = int(data.split(":", 1)[1])
+            publish_chat_id = int(data.split(":", 1)[1])
         except ValueError:
             await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        support_group_exists = (
-            db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (support_chat_id,)).fetchone()
-            or db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND COALESCE(is_member,1)=1", (support_chat_id,)).fetchone()
-        )
-        if not support_group_exists or not await is_telegram_group_admin(context.bot, uid, support_chat_id):
-            await safe_callback_answer(q, "الدعم متاح لمالك القروب ومشرفيه الفعليين فقط.", show_alert=True); return
+        if not support_group_info(publish_chat_id) or not await is_telegram_group_admin(context.bot, uid, publish_chat_id):
+            await safe_callback_answer(q, "النشر متاح لمالك القروب ومشرفيه الفعليين فقط، ويشترط أن يكون البوت نشطًا في القروب.", show_alert=True); return
         bot_username = getattr(context.bot, "username", "") or ""
         if not bot_username:
             bot_username = (await context.bot.get_me()).username or ""
-        link = f"https://t.me/{bot_username}?start=support_{support_chat_id}"
-        await safe_callback_answer(q, "تم تجهيز رابط الدعم.")
-        await q.message.reply_text("🆘 لفتح طلب دعم خاص، اضغط الزر التالي ثم أرسل وصف المشكلة:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("فتح الدعم الفني", url=link)]]))
+        link = f"https://t.me/{bot_username}?start=publish_{publish_chat_id}"
+        await q.message.reply_text(
+            "📣 لكتابة إعلان لهذا القروب فقط، افتح المحادثة الخاصة مع البوت عبر الزر التالي:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ كتابة إعلان للقروب", url=link)]])
+        )
         return
+
     if data.startswith("group_panel_support:"):
         try: support_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (support_chat_id,)).fetchone() or not await is_telegram_group_admin(context.bot, uid, support_chat_id):
-            await safe_callback_answer(q, "الدعم متاح لمالك القروب ومشرفيه الفعليين فقط.", show_alert=True); return
+        if not support_group_info(support_chat_id) or not await is_telegram_group_admin(context.bot, uid, support_chat_id):
+            await safe_callback_answer(q, "الدعم متاح لمالك القروب ومشرفيه الفعليين فقط، ويشترط أن يكون البوت نشطًا في القروب.", show_alert=True); return
         bot_username = getattr(context.bot, "username", "") or ""
         if not bot_username:
             bot_username = (await context.bot.get_me()).username or ""
@@ -10487,9 +10517,7 @@ async def callback(update, context):
             await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
         group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         if not group:
-            group = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND enabled=1 AND is_member=1", (chat_id,)).fetchone()
-        if not group:
-            await q.edit_message_text("لم يتم العثور على القروب أو أن البوت لم يعد موجودًا فيه.")
+            await q.edit_message_text("لم يتم العثور على القروب.")
             return
         current = db.execute("SELECT message FROM welcome_messages WHERE chat_id=?", (chat_id,)).fetchone()
         text = current[0] if current and current[0] else "غير مفعّل؛ لم تُحدّد رسالة ترحيب."
@@ -10508,7 +10536,7 @@ async def callback(update, context):
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "ليس لديك صلاحية هذا القروب", show_alert=True); return
         context.user_data["awaiting_welcome_chat"] = chat_id
-        await q.edit_message_text("أرسل رسالة الترحيب الجديدة في الخاص مع البوت. استخدم {name} لاسم العضو و {group} لاسم القروب و {id} للمعرّف و {username} لليوزر.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"welcome_group:{chat_id}")]]))
+        await q.edit_message_text("أرسل رسالة الترحيب الجديدة في الخاص مع البوت. استخدم {name} لاسم العضو و {group} لاسم القروب.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء", callback_data=f"welcome_group:{chat_id}")]]))
         return
 
     if data.startswith("welcome_off:"):
@@ -10658,6 +10686,38 @@ async def callback(update, context):
         await q.edit_message_text("تم إلغاء تجهيز الإعلان.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]))
         return
 
+    if data == "group_broadcast_cancel":
+        context.user_data.pop("group_broadcast_draft", None)
+        context.user_data.pop("awaiting_group_broadcast", None)
+        await q.edit_message_text("تم إلغاء إعلان القروب.")
+        return
+
+    if data.startswith("group_broadcast_confirm:"):
+        try:
+            target_chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        draft = context.user_data.get("group_broadcast_draft") or {}
+        if (int(draft.get("target_chat_id", 0) or 0) != target_chat_id
+                or not support_group_info(target_chat_id)
+                or not await is_telegram_group_admin(context.bot, uid, target_chat_id)):
+            context.user_data.pop("group_broadcast_draft", None)
+            await q.edit_message_text("تعذر النشر: انتهت صلاحية المعاينة أو لم تعد تملك صلاحية المشرف في القروب.")
+            return
+        try:
+            await context.bot.copy_message(
+                chat_id=target_chat_id, from_chat_id=draft["chat_id"], message_id=draft["message_id"],
+                connect_timeout=8, read_timeout=12, write_timeout=12, pool_timeout=8
+            )
+            await q.edit_message_text("✅ تم نشر الإعلان في القروب المحدد.")
+        except Exception as exc:
+            log.warning("Group-panel broadcast failed chat_id=%s user_id=%s error=%r", target_chat_id, uid, exc)
+            await q.edit_message_text("⚠️ تعذر إرسال الإعلان. تحقق من أن البوت ما زال موجودًا في القروب ولديه صلاحية إرسال الرسائل.")
+        finally:
+            context.user_data.pop("group_broadcast_draft", None)
+            context.user_data.pop("awaiting_group_broadcast", None)
+        return
+
     if data == "broadcast_confirm":
         draft = context.user_data.get("broadcast_draft")
         selected = context.user_data.get("broadcast_selected_groups", [])
@@ -10665,14 +10725,26 @@ async def callback(update, context):
         if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")) or not draft or not selected:
             await q.edit_message_text("⛔ انتهت صلاحية الإعلان أو لا توجد قروبات مصرح بها. ابدأ من جديد.")
             return
-        sent, failed = 0, 0
-        for chat_id in selected:
-            try:
-                await context.bot.copy_message(chat_id=chat_id, from_chat_id=draft["chat_id"], message_id=draft["message_id"])
-                sent += 1
-            except Exception as e:
-                failed += 1
-                log.warning("Broadcast failed for %s: %s", chat_id, e)
+        semaphore = asyncio.Semaphore(5)
+
+        async def _send_broadcast_target(chat_id):
+            async with semaphore:
+                try:
+                    await context.bot.copy_message(
+                        chat_id=chat_id, from_chat_id=draft["chat_id"], message_id=draft["message_id"],
+                        connect_timeout=8, read_timeout=12, write_timeout=12, pool_timeout=8
+                    )
+                    return True
+                except Exception as exc:
+                    log.warning("Broadcast failed for chat_id=%s: %s", chat_id, exc)
+                    return False
+
+        results = await asyncio.gather(
+            *(_send_broadcast_target(chat_id) for chat_id in selected),
+            return_exceptions=True,
+        )
+        sent = sum(result is True for result in results)
+        failed = len(results) - sent
         context.user_data.pop("broadcast_draft", None)
         context.user_data.pop("awaiting_broadcast", None)
         context.user_data.pop("broadcast_selected_groups", None)
@@ -11167,7 +11239,7 @@ async def owner_autoreply_text_handler(update, context):
 
 
 async def cancel_owner_autoreply(update, context):
-    keys = ("owner_autoreply_state", "awaiting_motivation_edit", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_delegated_owner_id", "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search", "awaiting_calendar_search", "awaiting_admin_action", "awaiting_broadcast", "broadcast_draft", "broadcast_selected_groups", "awaiting_welcome_chat", "external_support_state", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups", "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_badge_state", "awaiting_channel_broadcast")
+    keys = ("owner_autoreply_state", "awaiting_motivation_edit", "awaiting_general_inquiry", "inquiry_reply_id", "awaiting_channel_broadcast", "channel_broadcast_draft", "channel_broadcast_selected", "awaiting_staff_permissions_id", "awaiting_delegated_owner_id", "awaiting_unified_target_id", "awaiting_warning_grant", "awaiting_warning_log_search", "awaiting_archive_search", "awaiting_calendar_search", "awaiting_admin_action", "awaiting_broadcast", "broadcast_draft", "broadcast_selected_groups", "awaiting_welcome_chat", "external_support_state", "awaiting_group_broadcast", "group_broadcast_draft", "support_reply_ticket_id", "mass_ban_state", "massban_selected_groups", "awaiting_admin_action", "staff_task_state", "staff_shift_state", "staff_badge_state", "awaiting_channel_broadcast")
     cancelled = False
     for key in keys:
         if context.user_data.pop(key, None) is not None:
