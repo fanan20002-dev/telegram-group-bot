@@ -11942,6 +11942,7 @@ async def post_init(app):
         (assistant_reminder_worker, "assistant-reminder-worker"),
         (automatic_unmute_worker, "automatic-unmute-worker"),
         (weekly_stats_worker, "weekly-group-stats-worker"),
+        (weekly_engagement_awards_worker, "weekly-engagement-awards-worker"),
         (daily_member_activity_worker, "daily-member-activity-worker"),
         (owner_activity_audit_worker, "owner-activity-audit-worker"),
         (group_analysis_report_worker, "group-analysis-report-worker"),
@@ -12030,6 +12031,122 @@ async def owner_activity_audit_worker(app):
         except Exception:
             log.exception("خطأ في مراقبة النشاط الإداري")
             await asyncio.sleep(10)
+
+
+
+async def weekly_engagement_awards_worker(app):
+    """Publish member engagement awards each Friday at 18:00 Riyadh time."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_engagement_awards_sent(
+            chat_id INTEGER NOT NULL,
+            week_start TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id, week_start)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS member_achievement_awards(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            week_start TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            award_title TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            awarded_at TEXT NOT NULL,
+            UNIQUE(chat_id,user_id,week_start)
+        )
+    """)
+    db.commit()
+    while True:
+        try:
+            local_now = _riyadh_now()
+            # Friday = weekday 4; post once at 18:00 local Saudi time.
+            days_until_friday = (4 - local_now.weekday()) % 7
+            target = local_now.replace(hour=18, minute=0, second=0, microsecond=0) + __import__("datetime").timedelta(days=days_until_friday)
+            if target <= local_now:
+                target += __import__("datetime").timedelta(days=7)
+            await asyncio.sleep(max(5, (target - local_now).total_seconds()))
+
+            local_now = _riyadh_now()
+            week_key = _week_start(local_now)
+            # Include both owner-managed/internal groups and active external groups.
+            group_rows = db.execute("""
+                SELECT chat_id, COALESCE(NULLIF(title,''), CAST(chat_id AS TEXT)) AS title
+                FROM watched_groups
+                UNION
+                SELECT chat_id, COALESCE(NULLIF(title,''), CAST(chat_id AS TEXT)) AS title
+                FROM external_group_control
+                WHERE is_external=1 AND COALESCE(is_member,1)=1 AND COALESCE(enabled,1)=1
+                ORDER BY title COLLATE NOCASE
+            """).fetchall()
+            for chat_id, title in group_rows:
+                chat_id = int(chat_id)
+                try:
+                    if not external_group_active(chat_id):
+                        continue
+                    already_sent = db.execute(
+                        "SELECT 1 FROM weekly_engagement_awards_sent WHERE chat_id=? AND week_start=?",
+                        (chat_id, week_key)
+                    ).fetchone()
+                    if already_sent:
+                        continue
+                    winners = db.execute("""
+                        SELECT wa.user_id, wa.message_count,
+                               COALESCE(NULLIF(ma.display_name,''),'عضو')
+                        FROM weekly_message_activity wa
+                        LEFT JOIN member_activity ma
+                          ON ma.chat_id=wa.chat_id AND ma.user_id=wa.user_id
+                        WHERE wa.chat_id=? AND wa.week_start=?
+                        ORDER BY wa.message_count DESC, wa.user_id ASC
+                        LIMIT 5
+                    """, (chat_id, week_key)).fetchall()
+                    if not winners:
+                        db.execute(
+                            "INSERT OR IGNORE INTO weekly_engagement_awards_sent(chat_id,week_start,sent_at) VALUES(?,?,?)",
+                            (chat_id, week_key, now())
+                        )
+                        db.commit()
+                        continue
+
+                    award_titles = ["نجم التفاعل", "متألق الأسبوع", "عضو مميز", "صاحب الهمة", "روح القروب"]
+                    medals = ["🥇", "🥈", "🥉", "🏅", "🌟"]
+                    lines = [
+                        "🏆 نجوم التفاعل وأوسمة الإنجاز",
+                        f"📅 أسبوع {week_key}",
+                        f"👥 القروب: {title}",
+                        "",
+                    ]
+                    for rank, (user_id, count, display_name) in enumerate(winners, 1):
+                        award_title = award_titles[rank - 1]
+                        medal = medals[rank - 1]
+                        safe_name = html.escape(str(display_name or "عضو")[:70])
+                        lines.append(f'{medal} <a href="tg://user?id={int(user_id)}">{safe_name}</a> — {award_title} ({int(count)} رسالة)')
+                        db.execute("""
+                            INSERT OR IGNORE INTO member_achievement_awards
+                            (chat_id,user_id,week_start,rank,award_title,message_count,awarded_at)
+                            VALUES(?,?,?,?,?,?,?)
+                        """, (chat_id, int(user_id), week_key, rank, award_title, int(count), now()))
+                    lines.extend(["", "👏 شكرًا لكل من شارك وتفاعل، وننتظر منافسة أقوى الأسبوع القادم!"])
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text="\n".join(lines),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO weekly_engagement_awards_sent(chat_id,week_start,sent_at) VALUES(?,?,?)",
+                        (chat_id, week_key, now())
+                    )
+                    db.commit()
+                    await asyncio.sleep(0.15)
+                except Exception as group_exc:
+                    log.warning("Weekly engagement award report failed for group %s: %s", chat_id, group_exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Weekly engagement awards worker failed")
+            await asyncio.sleep(300)
 
 def main():
     if not TOKEN:
