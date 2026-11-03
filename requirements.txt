@@ -1,1 +1,1 @@
-python-telegram-bot>=22.0,<23
+python-telegram-bot>=20.0,<23.0\nhttpx>=0.25\nPillow>=10.0\npython-docx>=1.0\npypdf>=4.0\n

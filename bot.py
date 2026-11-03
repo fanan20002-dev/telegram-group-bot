@@ -13185,6 +13185,17 @@ def _render_member_welcome_image(member_name, member_number, member_id, username
         output.seek(0)
         output.name = "welcome_member.jpg"
         return output
+    except ImportError as exc:
+        # Pillow is required to personalize the embedded welcome-card image.
+        # Keep the exception explicit in Render logs so a missing dependency
+        # can be distinguished from malformed template data or drawing errors.
+        log.error(
+            "WELCOME_IMAGE_RENDER_FAILED: required image dependency is unavailable (%s). "
+            "Install Pillow from requirements.txt and redeploy.",
+            exc,
+            exc_info=True,
+        )
+        return None
     except Exception:
         log.exception("WELCOME_IMAGE_RENDER_FAILED")
         return None
