@@ -355,6 +355,20 @@ def log_external_group_event(chat_id, actor_id, event_type, details=''):
     except Exception:
         log.exception("Could not record external group audit event")
 
+# Unified directory for internal and external groups: current invite link and member count.
+db.execute("""CREATE TABLE IF NOT EXISTS group_link_directory(
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    group_type TEXT NOT NULL DEFAULT 'external',
+    invite_link TEXT NOT NULL DEFAULT '',
+    member_count INTEGER,
+    link_status TEXT NOT NULL DEFAULT 'unknown',
+    last_updated_at TEXT NOT NULL DEFAULT '',
+    last_member_event_at TEXT NOT NULL DEFAULT ''
+)""")
+db.execute("CREATE INDEX IF NOT EXISTS idx_group_link_directory_type ON group_link_directory(group_type,title)")
+db.commit()
+
 db.execute("""CREATE TABLE IF NOT EXISTS external_group_capabilities(
     chat_id INTEGER NOT NULL, capability TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
     granted_by INTEGER NOT NULL DEFAULT 0, granted_at TEXT NOT NULL,
@@ -2122,6 +2136,109 @@ async def refresh_external_group_membership(bot):
     return checked, removed, uncertain
 
 
+async def sync_group_link_record(bot, chat_id, *, member_event=False):
+    """Refresh group title/count and a link only when Telegram exposes or permits it."""
+    chat_id = int(chat_id)
+    try:
+        chat = await bot.get_chat(chat_id)
+        title = getattr(chat, "title", None) or str(chat_id)
+        username = getattr(chat, "username", None)
+        link = f"https://t.me/{username}" if username else ""
+        link_status = "public" if link else "private_unavailable"
+        # For private groups, Telegram may expose the bot's primary invite link only
+        # when it has sufficient admin rights. Reuse a stored link to avoid minting
+        # a new invite on every refresh.
+        if not link:
+            exposed = getattr(chat, "invite_link", None)
+            if exposed:
+                link, link_status = exposed, "available"
+            else:
+                stored = db.execute("SELECT invite_link FROM group_link_directory WHERE chat_id=?", (chat_id,)).fetchone()
+                if stored and stored[0]:
+                    link, link_status = stored[0], "stored_unverified"
+                else:
+                    try:
+                        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+                        can_invite = bool(getattr(bot_member, "can_invite_users", False)) or getattr(bot_member, "status", "") == "creator"
+                        if can_invite:
+                            created = await bot.create_chat_invite_link(chat_id=chat_id, name="رابط دليل القروبات")
+                            link, link_status = created.invite_link, "created_by_bot"
+                    except Exception as link_exc:
+                        log.debug("Invite link unavailable for %s: %s", chat_id, link_exc)
+        try:
+            member_count = await bot.get_chat_member_count(chat_id)
+        except Exception as count_exc:
+            log.debug("Member count unavailable for %s: %s", chat_id, count_exc)
+            old = db.execute("SELECT member_count FROM group_link_directory WHERE chat_id=?", (chat_id,)).fetchone()
+            member_count = old[0] if old else None
+        group_row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
+        group_type = "external" if group_row and bool(group_row[0]) else "internal"
+        timestamp = now()
+        db.execute("""INSERT INTO group_link_directory(chat_id,title,group_type,invite_link,member_count,link_status,last_updated_at,last_member_event_at)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+            title=excluded.title,group_type=excluded.group_type,
+            invite_link=CASE WHEN excluded.invite_link<>'' THEN excluded.invite_link ELSE group_link_directory.invite_link END,
+            member_count=COALESCE(excluded.member_count,group_link_directory.member_count),
+            link_status=CASE WHEN excluded.invite_link<>'' THEN excluded.link_status ELSE group_link_directory.link_status END,
+            last_updated_at=excluded.last_updated_at,
+            last_member_event_at=CASE WHEN ? THEN excluded.last_member_event_at ELSE group_link_directory.last_member_event_at END""",
+            (chat_id,title,group_type,link,member_count,link_status,timestamp,timestamp if member_event else "",1 if member_event else 0))
+        db.commit()
+        return True
+    except Exception as exc:
+        log.warning("Could not sync group link directory for %s: %s", chat_id, exc)
+        return False
+
+
+async def group_link_directory_worker(app):
+    """Periodic safety sync for counts/titles/links missed by Telegram update delivery."""
+    await asyncio.sleep(45)
+    while True:
+        try:
+            updated, failed = await refresh_group_link_directory(app.bot)
+            log.info("Group link directory sync: updated=%s failed=%s", updated, failed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Periodic group-link directory refresh failed")
+        await asyncio.sleep(600)
+
+
+async def refresh_group_link_directory(bot):
+    """Refresh all currently tracked internal and external groups without dropping records on API errors."""
+    rows = db.execute("""SELECT e.chat_id FROM external_group_control e
+        WHERE COALESCE(e.is_member,1)=1 AND e.enabled=1
+        ORDER BY e.is_external,e.title""").fetchall()
+    # Also include tracked groups if legacy metadata is incomplete.
+    known = {int(r[0]) for r in rows}
+    for (cid,) in db.execute("SELECT chat_id FROM watched_groups").fetchall():
+        if int(cid) not in known:
+            known.add(int(cid))
+    updated = failed = 0
+    for cid in sorted(known):
+        if await sync_group_link_record(bot, cid):
+            updated += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.08)
+    return updated, failed
+
+
+def group_links_markup():
+    rows = db.execute("""SELECT chat_id,title,group_type,invite_link,member_count,link_status
+        FROM group_link_directory ORDER BY group_type,title LIMIT 80""").fetchall()
+    buttons = []
+    for cid,title,kind,link,count,status in rows:
+        kind_label = "داخلي" if kind == "internal" else "خارجي"
+        count_label = f"{count:,}" if isinstance(count, int) else "؟"
+        buttons.append([InlineKeyboardButton(f"{'🏠' if kind == 'internal' else '🌐'} {str(title)[:32]} · {count_label}", callback_data=f"group_link_detail:{cid}")])
+    if not buttons:
+        buttons.append([InlineKeyboardButton("لا توجد قروبات مسجلة", callback_data="noop")])
+    buttons.append([InlineKeyboardButton("🔄 تحديث الروابط والأعضاء", callback_data="group_links_refresh")])
+    buttons.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def external_groups_markup():
     rows = []
     groups = db.execute("""SELECT e.chat_id,COALESCE(NULLIF(e.title,''),w.title,e.chat_id),e.enabled,e.added_by_name,e.added_by
@@ -2291,6 +2408,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("🧩 إعدادات النظام العليا", callback_data="owner_system")],
     ]
     if is_owner(uid) or can_manage_external_groups(uid):
+        owner_rows.append([InlineKeyboardButton("🔗 دليل روابط القروبات الداخلية والخارجية", callback_data="group_links")])
         owner_rows.append([InlineKeyboardButton("🌐 إدارة القروبات الخارجية", callback_data="external_groups")])
     if is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "external_monitor", 0)):
         owner_rows.append([InlineKeyboardButton("👁️ مركز مراقبة القروبات الخارجية", callback_data="external_monitor_center")])
@@ -5872,6 +5990,10 @@ async def my_chat_member_handler(update, context):
         else:
             db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), chat.id))
         db.commit()
+        try:
+            await sync_group_link_record(context.bot, chat.id)
+        except Exception:
+            log.exception("Group-link directory sync failed after bot joined chat=%s", chat.id)
         ext = external_group_info(chat.id)
         external = bool(ext and ext[0])
         # A previously disabled group stays disabled; adding the bot again does not bypass
@@ -5947,6 +6069,7 @@ async def my_chat_member_handler(update, context):
         # Remove the group from active group lists immediately. Keep its historical
         # configuration/audit rows intact so this cleanup does not damage other modules.
         db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=? WHERE chat_id=?", (now(), chat.id))
+        db.execute("UPDATE group_link_directory SET link_status='bot_left',last_updated_at=? WHERE chat_id=?", (now(), chat.id))
         archive_watched_group(chat.id, "bot_removed_from_group_event")
         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (chat.id,))
         db.commit()
@@ -5999,6 +6122,11 @@ async def chat_member_handler(update, context):
     old = cm.old_chat_member.status
     new = cm.new_chat_member.status
     member = cm.new_chat_member.user
+    # Keep the directory count and timestamps synchronized with Telegram membership events.
+    try:
+        await sync_group_link_record(context.bot, chat_id, member_event=True)
+    except Exception:
+        log.exception("Group-link directory update failed for membership event chat=%s", chat_id)
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
         # The primary owner and registered deputy owners are explicitly allowed to add
@@ -14842,6 +14970,40 @@ async def callback(update, context):
         buttons.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
         await q.edit_message_text("👑 إدارة نائب المالك\n\nتم تحديث القائمة.", reply_markup=InlineKeyboardMarkup(buttons)); return
 
+    # Unified group links directory: owner / users with external-group center access.
+    if data in {"group_links", "group_links_refresh"}:
+        if not (is_owner(uid) or can_manage_external_groups(uid)):
+            await safe_callback_answer(q, "غير مصرح لك بعرض دليل روابط القروبات.", show_alert=True); return
+        if data == "group_links_refresh":
+            await safe_callback_answer(q, "جارٍ تحديث بيانات القروبات…")
+            updated, failed = await refresh_group_link_directory(context.bot)
+            await safe_callback_answer(q, f"تم تحديث {updated} قروب؛ تعذر تحديث {failed}.")
+        else:
+            # Opening the panel also reconciles stale metadata.
+            await refresh_group_link_directory(context.bot)
+        await q.edit_message_text("🔗 دليل روابط القروبات الداخلية والخارجية\n\nتُحدّث الأسماء والأعداد من تيليجرام عند فتح الدليل أو الضغط على تحديث. رابط الدعوة الخاص لا يظهر إلا إذا كان متاحًا للبوت بالصلاحيات.", reply_markup=group_links_markup()); return
+    if data.startswith("group_link_detail:"):
+        if not (is_owner(uid) or can_manage_external_groups(uid)):
+            await safe_callback_answer(q, "غير مصرح لك بعرض بيانات القروبات.", show_alert=True); return
+        try: link_chat_id = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        await sync_group_link_record(context.bot, link_chat_id)
+        row = db.execute("SELECT title,group_type,invite_link,member_count,link_status,last_updated_at FROM group_link_directory WHERE chat_id=?", (link_chat_id,)).fetchone()
+        if not row:
+            await safe_callback_answer(q, "القروب غير موجود في الدليل.", show_alert=True); return
+        title,kind,link,count,status,updated_at = row
+        kind_label = "داخلي" if kind == "internal" else "خارجي"
+        link_text = link or "غير متاح — تحقق من صلاحية إدارة روابط الدعوة للبوت"
+        count_text = f"{count:,}" if isinstance(count,int) else "غير متاح"
+        detail = (f"🔗 بيانات القروب\n\nالاسم: {html.escape(title)}\nالنوع: {kind_label}\nالمعرّف: {link_chat_id}\n"
+                  f"عدد الأعضاء: {count_text}\nالرابط: {html.escape(link_text)}\nحالة الرابط: {html.escape(status)}\nآخر تحديث: {html.escape(updated_at or 'غير متوفر')}")
+        buttons = []
+        if link.startswith("https://"):
+            buttons.append([InlineKeyboardButton("🔗 فتح رابط القروب", url=link)])
+        buttons.append([InlineKeyboardButton("🔄 تحديث هذه البيانات", callback_data=f"group_link_detail:{link_chat_id}")])
+        buttons.append([InlineKeyboardButton("⬅️ دليل روابط القروبات", callback_data="group_links")])
+        await q.edit_message_text(detail, parse_mode="HTML", disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons)); return
+
     # External group control center: owner or users explicitly granted external_groups.
     if data in {"external_groups", "external_groups_refresh"}:
         if not can_manage_external_groups(uid):
@@ -18469,6 +18631,7 @@ async def post_init(app):
     """Start background workers on the running event loop and track them for clean shutdown."""
     worker_specs = [
         (active_group_refresh_worker, "active-group-refresh-worker"),
+        (group_link_directory_worker, "group-link-directory-worker"),
         (assistant_reminder_worker, "assistant-reminder-worker"),
         (automatic_unmute_worker, "automatic-unmute-worker"),
         (weekly_stats_worker, "weekly-group-stats-worker"),
