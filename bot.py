@@ -6355,12 +6355,15 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
         member_number = number_row[0] if number_row else member_number
 
     moment = _riyadh_now()
-    display_name = html.escape(member.full_name or "عضو")
+    raw_name = (member.full_name or member.first_name or "عضو").strip()
+    # Avoid displaying punctuation-only Telegram names as the member's name.
+    if not raw_name or not any(ch.isalnum() for ch in raw_name):
+        raw_name = member.first_name or "عضو"
+    display_name = html.escape(raw_name)
     username = "@" + html.escape(member.username) if member.username else "لا يوجد"
-    title = "♛ تـم قـبـول طـلـب انـضـمـامـك ♛" if approved else "♛ عـضـو جـديـد ♛"
     time_label = "وقت القبول" if approved else "وقت الدخول"
     text = (
-        f"ᯓ˹ ♛ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ ˼\\n"
+        "ᯓ˹ ♛ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ ˼\\n"
         "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\\n"
         "✨ <b>أهلًا وسهلًا بك، ومرحبًا بانضمامك إلى مجتمعنا الراقي.</b>\\n\\n"
         "يسعدنا حضورك، ونعتز بانضمامك إلى أسرتنا؛ فبوجودك تزداد أركان المكان تميّزًا، وبمشاركتك ترتقي مسيرتنا.\\n"
@@ -6372,8 +6375,7 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
         f"°︙ اليوزر ⇚ 『{username}』\\n"
         f"°︙ التاريخ ⇚ 『{moment.strftime('%d-%m-%Y')}』\\n"
         f"°︙ {time_label} ⇚ 『{moment.strftime('%I:%M %p').lstrip('0')}』\\n\\n"
-        "🤍 <b>يسرّنا انضمامك إلى أسرتنا، ونعتز بوجودك بيننا. نأمل أن تجد في قروبنا ما يليق بتطلعاتك، وأن تكون أيامك معنا مليئة بالفائدة والتقدير.</b>\\n\\n"
-        "✨ <b>بكل التقدير، نرحّب بانضمامك، ونعتز بك عضوًا في مجتمعنا. حضورك إضافة، ووجودك محل ترحيب واعتزاز.</b>\\n"
+        "🤍 <b>نتمنى لك تجربة ممتعة ومفيدة، وأن تجد بيننا كل ما يليق بتطلعاتك.</b>\\n"
         "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°"
     )
     try:
