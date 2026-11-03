@@ -851,8 +851,10 @@ def group_feature_enabled(chat_id, feature):
     row = db.execute(f"SELECT {feature} FROM group_feature_settings WHERE chat_id=?", (chat_id,)).fetchone()
     if row:
         return bool(row[0])
-    # Approval is opt-in for backward compatibility; existing notice/stat features stay enabled.
-    return feature != "join_approval_enabled"
+    # Mandatory join approval is the default for ALL managed/internal and external groups.
+    # Explicit per-group settings can still be stored for UI/state, but missing settings
+    # must never silently allow auto-approval.
+    return True if feature == "join_approval_enabled" else True
 
 def set_group_feature(chat_id, feature, enabled):
     allowed = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
@@ -5941,14 +5943,9 @@ async def chat_join_request_handler(update, context):
         display_name=excluded.display_name, username=excluded.username, status='pending', requested_at=excluded.requested_at, decided_at='', decided_by=0""",
         (chat.id, user.id, user.full_name or "عضو", user.username or "", now()))
     db.commit()
-    if not approval_on and not restricted:
-        try:
-            await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=user.id)
-            db.execute("UPDATE join_request_events SET status='approved',decided_at=?,decided_by=? WHERE chat_id=? AND user_id=?", (now(), OWNER_ID or 0, chat.id, user.id))
-            db.commit()
-        except Exception as exc:
-            log.warning("Auto-approval of join request failed chat=%s user=%s: %s", chat.id, user.id, exc)
-        return
+    # Never auto-approve join requests. They remain pending until an authorized
+    # owner/deputy explicitly approves or rejects them. This is enforced for
+    # internal and external groups alike.
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ موافقة على الدخول", callback_data=f"joinreq_approve:{chat.id}:{user.id}"),
          InlineKeyboardButton("❌ رفض الطلب", callback_data=f"joinreq_deny:{chat.id}:{user.id}")]
