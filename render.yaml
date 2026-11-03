@@ -1,12 +1,5 @@
-services:
-  - type: web
-    name: telegram-group-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    plan: free
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: OWNER_ID
-        sync: false
+python-telegram-bot>=20.0,<23.0
+httpx>=0.25
+Pillow>=10.0
+python-docx>=1.0
+pypdf>=4.0
