@@ -6358,20 +6358,22 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
     display_name = html.escape(member.full_name or "عضو")
     username = "@" + html.escape(member.username) if member.username else "لا يوجد"
     title = "♛ تـم قـبـول طـلـب انـضـمـامـك ♛" if approved else "♛ عـضـو جـديـد ♛"
-    intro = (f"🌷 نـورت مـلـتـقـانـا بـ 『{display_name}』 ✨" if approved
-             else f"🎉 يـا مـرحـبـا بـ 『{display_name}』 نـوّرت الـقـروب 🌟")
     time_label = "وقت القبول" if approved else "وقت الدخول"
     text = (
-        f"ᯓ˹ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ {title} ˼\n"
-        "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\n"
-        f"{intro}\n"
-        f"°︙ اسم العضو ⇚ 『{display_name}』\n"
-        f"°︙ رقم العضوية ⇚ 『{member_number}』\n"
-        f"°︙ حساب ID ⇚ 『{member.id}』\n"
-        f"°︙ اليوزر ⇚ 『{username}』\n"
-        f"°︙ التاريخ ⇚ 『{moment.strftime('%d-%m-%Y')}』\n"
-        f"°︙ {time_label} ⇚ 『{moment.strftime('%I:%M %p').lstrip('0')}』\n"
-        "💫 حـيـاك الله بـيـنـنـا، ونـتـمـنـى لـك أجـمـل الأوقـات 🤍\n"
+        f"ᯓ˹ ♛ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 ♛ ˼\\n"
+        "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\\n"
+        "✨ <b>أهلًا وسهلًا بك، ومرحبًا بانضمامك إلى مجتمعنا الراقي.</b>\\n\\n"
+        "يسعدنا حضورك، ونعتز بانضمامك إلى أسرتنا؛ فبوجودك تزداد أركان المكان تميّزًا، وبمشاركتك ترتقي مسيرتنا.\\n"
+        "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°\\n"
+        "🌷 <b>معلومات العضو</b>\\n"
+        f"°︙ اسم العضو ⇚ 『{display_name}』\\n"
+        f"°︙ رقم العضوية ⇚ 『{member_number}』\\n"
+        f"°︙ حساب ID ⇚ 『{member.id}』\\n"
+        f"°︙ اليوزر ⇚ 『{username}』\\n"
+        f"°︙ التاريخ ⇚ 『{moment.strftime('%d-%m-%Y')}』\\n"
+        f"°︙ {time_label} ⇚ 『{moment.strftime('%I:%M %p').lstrip('0')}』\\n\\n"
+        "🤍 <b>يسرّنا انضمامك إلى أسرتنا، ونعتز بوجودك بيننا. نأمل أن تجد في قروبنا ما يليق بتطلعاتك، وأن تكون أيامك معنا مليئة بالفائدة والتقدير.</b>\\n\\n"
+        "✨ <b>بكل التقدير، نرحّب بانضمامك، ونعتز بك عضوًا في مجتمعنا. حضورك إضافة، ووجودك محل ترحيب واعتزاز.</b>\\n"
         "°•━━━━━━━ ✦ ✧ ✦ ━━━━━━━•°"
     )
     try:
