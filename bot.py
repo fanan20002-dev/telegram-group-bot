@@ -3344,6 +3344,34 @@ async def process_private_workflows(update, context):
         return
 
 
+async def current_saudi_time_date_text():
+    """Return current Saudi time plus Gregorian and Hijri dates."""
+    current = datetime.now(ZoneInfo("Asia/Riyadh"))
+    weekdays = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
+    gregorian = current.strftime("%d/%m/%Y")
+    hijri_line = "🌙 التاريخ الهجري: غير متاح حاليًا"
+    try:
+        converted = await calendar_date_text(current.strftime("%Y-%m-%d"))
+        if converted:
+            for line in converted.splitlines():
+                if line.startswith("🌙 التاريخ الهجري:"):
+                    hijri_line = line
+                    break
+    except Exception as exc:
+        log.debug("Current Hijri date lookup failed: %s", exc)
+    return (f"🕒 الوقت الحالي: {current.strftime('%H:%M')} بتوقيت السعودية\n"
+            f"📅 اليوم: {weekdays[current.weekday()]}\n"
+            f"📅 التاريخ الميلادي: {gregorian}\n"
+            f"{hijri_line}\n\n"
+            "قد يختلف التاريخ الهجري يومًا بحسب ثبوت الهلال في السعودية.")
+
+
+def is_time_date_keyword(text_value):
+    """Match only standalone 'الوقت' or 'اليوم' requests, not arbitrary sentences."""
+    cleaned = re.sub(r"[؟?!،,.؛:]+$", "", (text_value or "").strip())
+    return normalized_arabic_text(cleaned) in {"الوقت", "اليوم"}
+
+
 async def channel_post_listener(update, context):
     """Receives channel posts only from channels linked by the primary owner."""
     post = update.channel_post
@@ -3353,6 +3381,9 @@ async def channel_post_listener(update, context):
     if not row:
         return
     text_value = (post.text or post.caption or "").strip()
+    if is_time_date_keyword(text_value):
+        await context.bot.send_message(post.chat.id, await current_saudi_time_date_text())
+        return
     if text_value.startswith("/botstatus"):
         await context.bot.send_message(post.chat.id, "🟢 البوت مرتبط بهذه القناة ويستقبل منشوراتها. لإدارة النشر استخدم /panel في الخاص مع البوت.")
 
@@ -4739,16 +4770,18 @@ async def managers(update, context):
     await update.effective_message.reply_text(text)
 
 def membership_notification_recipients():
-    """المالك والنائب دائمًا؛ المفوض فقط عند منحه صلاحية الإشعارات صراحةً."""
+    """Return only the primary owner and deputy owners for join/leave notifications.
+
+    Delegated owners, managers, and staff are intentionally excluded regardless of
+    capability grants, matching the owner's fixed notification policy.
+    """
     recipients = {int(OWNER_ID)} if OWNER_ID else set()
     recipients.update(int(r[0]) for r in db.execute("SELECT user_id FROM deputy_owners"))
-    recipients.update(int(r[0]) for r in db.execute("SELECT user_id FROM delegated_owners"))
-    return {uid for uid in recipients if uid == OWNER_ID or is_deputy_owner(uid)
-            or can_use_capability(uid, "membership_notifications", 0)}
+    return recipients
 
 
 async def notify_owners(context, text, event="general"):
-    # إشعارات العضوية لها سياسة مستقلة: لا تصل للمفوض إلا بتفويض صريح.
+    # Membership events are strictly limited to the owner and deputy owners.
     if event == "membership":
         recipients = membership_notification_recipients()
     else:
@@ -4765,7 +4798,7 @@ async def notify_owners(context, text, event="general"):
 
 
 async def notify_owner_and_deputies(context, text, reply_markup=None):
-    """إشعارات الدخول وطلبات الانضمام للمالك والنائب والمفوض المفوض بالإشعارات فقط."""
+    """Send membership events only to the primary owner and deputy owners."""
     for recipient in membership_notification_recipients():
         try:
             await context.bot.send_message(chat_id=recipient, text=text, reply_markup=reply_markup)
@@ -5303,6 +5336,9 @@ async def ArabicTextCommand(update, context):
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     text = (update.effective_message.text or "").strip().lower()
+    if is_time_date_keyword(text):
+        await update.effective_message.reply_text(await current_saudi_time_date_text())
+        return
     # Reply with the sender's actual registered role when they ask in a group.
     # This is deliberately checked before other Arabic text commands.
     normalized_role_query = re.sub(r"[؟?!،,.]+$", "", text).strip()
@@ -18904,7 +18940,7 @@ async def active_group_refresh_worker(app):
 
 
 async def group_greeting_worker(app):
-    """Send one public greeting per active group at 07:00 and 20:00 Riyadh time."""
+    """Legacy scheduled greetings; intentionally not registered in post_init."""
     tz = ZoneInfo("Asia/Riyadh")
     messages = {
         "morning": "🌅 صباح الخير والسعادة على جميع أعضاء القروب\n\n☀️ أسعد الله صباحكم بكل خير، وكتب لكم يومًا مليئًا بالتوفيق والإنجاز والراحة.\n\n🤍 جعل الله صباحكم بداية لكل خير، ورزقكم من واسع فضله.\n\nمع تحيات بوت حماية ومساعدة القروبات 🤖",
@@ -19021,7 +19057,7 @@ async def post_init(app):
         (group_analysis_report_worker, "group-analysis-report-worker"),
         (weekly_security_review_worker, "weekly-security-review-worker"),
         (motivation_daily_worker, "motivation-daily-worker"),
-        (group_greeting_worker, "group-greeting-worker"),
+        # Scheduled morning/evening greetings are intentionally disabled per owner request.
         (ensure_global_join_approval_links_worker, "global-join-approval-links-worker"),
     ]
     # Application is a library object: do not assign undocumented private attributes.
