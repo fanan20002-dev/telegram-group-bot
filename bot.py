@@ -5780,7 +5780,7 @@ async def message_filter(update, context):
 
     # مالك البوت والطاقم المخوّل ومشرفو Telegram الفعليون معفيون من فلاتر الحذف التلقائي.
     # يمنع هذا حذف روابط/صور/فيديو المشرفين المعتمدين، مع بقاء الأعضاء العاديين تحت الحماية.
-    if (is_manager(uid) or is_delegated_owner(uid) or is_protection_manager(uid)
+    if (is_manager(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or is_protection_manager(uid)
             or can_use_capability(uid, "protection", chat.id)
             or group_role(chat.id, uid) in ("مشرف", "مشرف عام", "مدير", "مدير عام")):
         return
