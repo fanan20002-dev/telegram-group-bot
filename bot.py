@@ -2079,44 +2079,37 @@ EXTERNAL_CAPABILITY_LABELS = {
 
 
 async def refresh_external_group_membership(bot):
-    """Refresh external-group membership before displaying the active list.
+    """Verify external-group membership concurrently before showing its active panel.
 
-    Only confirmed non-membership is hidden; transient/network errors preserve records.
-    Historical settings and audit data are retained.
+    Confirmed departures are hidden from active lists while historical settings remain.
+    Temporary errors preserve membership state and are reported as uncertain.
     """
     bot_user = await bot.get_me()
     rows = db.execute(
         "SELECT chat_id,title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1"
     ).fetchall()
+    semaphore = asyncio.Semaphore(8)
+
+    async def _check(chat_id, title):
+        cid = int(chat_id)
+        async with semaphore:
+            try:
+                member = await bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
+                return cid, title, member, None
+            except Exception as exc:
+                return cid, title, None, exc
+
+    results = await asyncio.gather(*(_check(cid, title) for cid, title in rows), return_exceptions=True)
     checked = removed = uncertain = 0
     inactive_statuses = {"left", "kicked"}
-    for chat_id, title in rows:
-        cid = int(chat_id)
-        try:
-            member = await bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
-            status = str(getattr(member, "status", "unknown")).lower()
-            is_member_flag = getattr(member, "is_member", None)
-            _rights = []
-            for _right in ("can_manage_chat", "can_delete_messages", "can_restrict_members", "can_invite_users", "can_pin_messages", "can_promote_members", "can_change_info"):
-                if bool(getattr(member, _right, False)):
-                    _rights.append(_right)
-            db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status=?,bot_permissions=? WHERE chat_id=?",
-                       (now(), status, ",".join(_rights), cid))
-            confirmed_inactive = status in inactive_statuses or (status == "restricted" and is_member_flag is False)
-            checked += 1
-            if confirmed_inactive:
-                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=?,last_checked_at=?,bot_status='left' WHERE chat_id=?", (now(), now(), cid))
-                archive_watched_group(cid, "external_group_open_panel_confirmed_inactive")
-                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
-                removed += 1
-                log.info("External group hidden after confirmed membership check: %s (%s)", title, cid)
-            elif status in ("member", "administrator", "creator") or (status == "restricted" and is_member_flag is True):
-                db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), cid))
-            else:
-                uncertain += 1
-        except (Forbidden, BadRequest) as exc:
-            message = str(exc).lower()
-            definitive = any(token in message for token in (
+    for result in results:
+        if isinstance(result, BaseException):
+            uncertain += 1
+            continue
+        cid, title, member, error = result
+        if error is not None:
+            message = str(error).lower()
+            definitive = isinstance(error, (Forbidden, BadRequest)) and any(token in message for token in (
                 "chat not found", "bot is not a member", "not a member of the chat",
                 "not a member of the supergroup", "user not found", "was kicked", "kicked from",
             ))
@@ -2125,16 +2118,31 @@ async def refresh_external_group_membership(bot):
                 archive_watched_group(cid, "external_group_open_panel_confirmed_inactive_api_error")
                 db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
                 removed += 1
-                log.info("External group hidden after definitive Telegram membership error: %s (%s): %s", title, cid, exc)
+                log.info("External group hidden after definitive Telegram membership error: %s (%s)", title, cid)
             else:
                 uncertain += 1
                 db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status='unknown' WHERE chat_id=?", (now(), cid))
-                log.warning("External group membership uncertain; preserving record %s (%s): %s", title, cid, exc)
-        except Exception as exc:
+                log.warning("External group membership uncertain; preserving record %s (%s): %s", title, cid, error)
+            continue
+
+        status = str(getattr(member, "status", "unknown")).lower()
+        is_member_flag = getattr(member, "is_member", None)
+        rights = [right for right in (
+            "can_manage_chat", "can_delete_messages", "can_restrict_members", "can_invite_users",
+            "can_pin_messages", "can_promote_members", "can_change_info",
+        ) if bool(getattr(member, right, False))]
+        db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status=?,bot_permissions=? WHERE chat_id=?", (now(), status, ",".join(rights), cid))
+        confirmed_inactive = status in inactive_statuses or (status == "restricted" and is_member_flag is False)
+        checked += 1
+        if confirmed_inactive:
+            db.execute("UPDATE external_group_control SET enabled=0,is_member=0,updated_at=?,last_checked_at=?,bot_status='left' WHERE chat_id=?", (now(), now(), cid))
+            archive_watched_group(cid, "external_group_open_panel_confirmed_inactive")
+            db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
+            removed += 1
+        elif status in ("member", "administrator", "creator") or (status == "restricted" and is_member_flag is True):
+            db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), cid))
+        else:
             uncertain += 1
-            db.execute("UPDATE external_group_control SET last_checked_at=?,bot_status='unknown' WHERE chat_id=?", (now(), cid))
-            log.warning("External group membership check failed; preserving record %s (%s): %s", title, cid, exc)
-        await asyncio.sleep(0.1)
     db.commit()
     return checked, removed, uncertain
 
@@ -2204,26 +2212,28 @@ async def group_link_directory_worker(app):
             raise
         except Exception:
             log.exception("Periodic group-link directory refresh failed")
-        await asyncio.sleep(600)
+        # Keep directory metadata fresh without serially waiting on every group.
+        await asyncio.sleep(300)
 
 
 async def refresh_group_link_directory(bot):
-    """Refresh all currently tracked internal and external groups without dropping records on API errors."""
+    """Refresh tracked groups concurrently; temporary Telegram failures never erase records."""
     rows = db.execute("""SELECT e.chat_id FROM external_group_control e
         WHERE COALESCE(e.is_member,1)=1 AND e.enabled=1
         ORDER BY e.is_external,e.title""").fetchall()
-    # Also include tracked groups if legacy metadata is incomplete.
     known = {int(r[0]) for r in rows}
-    for (cid,) in db.execute("SELECT chat_id FROM watched_groups").fetchall():
-        if int(cid) not in known:
-            known.add(int(cid))
-    updated = failed = 0
-    for cid in sorted(known):
-        if await sync_group_link_record(bot, cid):
-            updated += 1
-        else:
-            failed += 1
-        await asyncio.sleep(0.08)
+    known.update(int(cid) for (cid,) in db.execute("SELECT chat_id FROM watched_groups").fetchall())
+    semaphore = asyncio.Semaphore(8)
+    async def _sync(cid):
+        async with semaphore:
+            try:
+                return bool(await sync_group_link_record(bot, cid))
+            except Exception:
+                log.exception("Directory refresh failed for chat_id=%s", cid)
+                return False
+    results = await asyncio.gather(*(_sync(cid) for cid in sorted(known)), return_exceptions=True)
+    updated = sum(result is True for result in results)
+    failed = len(results) - updated
     return updated, failed
 
 
@@ -3405,26 +3415,35 @@ async def get_verified_active_watched_groups(bot, limit=None):
     except Exception as exc:
         log.warning("Could not verify bot identity for active-group list: %s", exc)
         return []
+    semaphore = asyncio.Semaphore(8)
+    async def _check(cid, title):
+        async with semaphore:
+            try:
+                member = await bot.get_chat_member(chat_id=int(cid), user_id=bot_id)
+                status = getattr(member, "status", "")
+                return int(cid), title, status, None
+            except Exception as exc:
+                return int(cid), title, "", exc
+    checked = await asyncio.gather(*(_check(cid, title) for cid, title in rows), return_exceptions=True)
     active = []
-    for cid, title in rows:
-        try:
-            member = await bot.get_chat_member(chat_id=int(cid), user_id=bot_id)
-            status = getattr(member, "status", "")
-            if status in ("left", "kicked"):
-                archive_watched_group(int(cid), "telegram_membership_left_or_kicked")
-                db.execute("DELETE FROM watched_groups WHERE chat_id=?", (int(cid),))
-                db.execute("UPDATE external_group_control SET enabled=0,is_member=0,bot_status='left',last_checked_at=?,updated_at=? WHERE chat_id=?", (now(), now(), int(cid)))
-                db.commit()
-                continue
-            if status in ("member", "administrator", "creator", "restricted"):
-                active.append((int(cid), title))
-        except Exception as exc:
-            # Unknown/transient API errors must not delete configuration, but unverified
-            # groups are omitted from this particular selection list.
+    for result in checked:
+        if isinstance(result, BaseException):
+            continue
+        cid, title, status, exc = result
+        if exc is not None:
+            # Temporary failures are not treated as departure; omit from this selection.
             log.debug("Could not verify membership in group %s; omitted from active list: %s", cid, exc)
             continue
-        if limit and len(active) >= limit:
-            break
+        if status in ("left", "kicked"):
+            archive_watched_group(cid, "telegram_membership_left_or_kicked")
+            db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
+            db.execute("UPDATE external_group_control SET enabled=0,is_member=0,bot_status='left',last_checked_at=?,updated_at=? WHERE chat_id=?", (now(), now(), cid))
+            db.commit()
+            continue
+        if status in ("member", "administrator", "creator", "restricted"):
+            active.append((cid, title))
+            if limit and len(active) >= limit:
+                break
     return active
 
 
@@ -18537,13 +18556,13 @@ async def active_group_refresh_worker(app):
                         log.warning("Could not verify group %s; preserving its records: %s", cid, exc)
                 except Exception as exc:
                     log.warning("Temporary group refresh failure; preserving %s (%s): %s", title, cid, exc)
-                await asyncio.sleep(0.2)
-            await asyncio.sleep(600)
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(300)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Active group refresh worker failed")
-            await asyncio.sleep(120)
+            await asyncio.sleep(60)
 
 
 async def group_greeting_worker(app):
