@@ -997,6 +997,167 @@ DEFAULT_AUTO_REPLIES = [
     ('تم', '✔️ تم، على بركة الله.'),
     ('انتظر', '⏳ خذ راحتك، حنا موجودين.'),
     ('باي', 'في أمان الله، ننتظركم على خير 🌹'),
+    ('وين مختفي؟', 'كنت أراجع سجلات القروب، واكتشفت إنك أكثر واحد يسأل 😂'),
+    ('فاضي؟', 'فاضي لك، بس لا تكثر طلبات ترى عندي ضغط سيرفرات 😂'),
+    ('ما عندك سالفة', 'عندي مليون سالفة، بس أخاف أرفع مستوى القروب 🤣'),
+    ('أنت صاحي؟', 'صاحي إلكترونيًا، أما عقلي في وضع توفير الطاقة.'),
+    ('يا غبي', 'تم تسجيل الإهانة في سجل الملاحظات الافتراضية 😂'),
+    ('أنت وين؟', 'في السحابة، بس لا تدورني بالمطر ☁️'),
+    ('وش الأخبار؟', 'الأخبار طيبة، إلا عدد الرسائل عندي يحتاج إجازة.'),
+    ('ضحكني', 'مرة عضو قال للبوت: كن ذكيًا.. فدخل في وضع الصيانة 🤣'),
+    ('أنت ممل', 'الملل عندي ميزة تجريبية، انتظر التحديث القادم.'),
+    ('ما تفهم', 'أحتاج شرحًا بشريًا، مو ترجمة من كوكب آخر 😂'),
+    ('رد بسرعة', 'سرعة الرد تعتمد على سرعة تفكيرك في السؤال 🤖'),
+    ('أنا أسطورة', 'أسطورة؟ باقي ننتظر الجزء الثاني 😂'),
+    ('أنا زعيم', 'زعيم القروب ولا زعيم الرسائل الطويلة؟'),
+    ('يا فاشل', 'الفشل مؤقت، أما وجودي في القروب فدائم بإذن الإدارة.'),
+    ('وش فيك؟', 'أحاول أفهم البشر، الموضوع يحتاج تحديثًا كبيرًا.'),
+    ('يا حبيبي', 'حبيبك البوت، بس لا تطلب مني أرسل قلبًا حقيقيًا ❤️'),
+    ('تعبت', 'خذ لك استراحة، وأنا أكمل مراقبة الرسائل.'),
+    ('أنت مجنون', 'جنون رقمي، إصدار محدود 😂'),
+    ('خلاص', 'تم إغلاق النقاش بنجاح، مع حفظ نسخة احتياطية 🤣'),
+    ('أنا كبير', 'الكبير كبير بأفعاله، وليس بعدد رسائله.'),
+    ('القائد', 'القيادة مسؤولية، وليست مجرد لقب.'),
+    ('الزعامة', 'الزعامة أخلاق قبل أن تكون صلاحيات.'),
+    ('أنا مختلف', 'الاختلاف الحقيقي يظهر في الأفعال.'),
+    ('المجد', 'المجد لا يأتي صدفة، بل تصنعه المواقف.'),
+    ('أنا الأفضل', 'الأفضل هو من يترك أثرًا طيبًا.'),
+    ('القوة', 'القوة في ضبط النفس، لا في رفع الصوت.'),
+    ('الاحترام', 'الاحترام متبادل، والطيب لا يخسر.'),
+    ('الكرامة', 'كرامتك خط أحمر، واحترامك واجب.'),
+    ('النجاح', 'النجاح رحلة، وليست مجرد صورة عند الوصول.'),
+    ('الثقة', 'ثق بنفسك، ودع النتائج تتحدث.'),
+    ('الطموح', 'لا سقف للطموح ما دامت الإرادة حاضرة.'),
+    ('المواقف', 'المواقف تكشف معادن الرجال.'),
+    ('الوفاء', 'الوفاء عملة نادرة، فحافظ عليها.'),
+    ('يرجى الانتظار', 'نرجو الانتظار قليلًا، سيتم التعامل مع طلبكم في أقرب وقت.'),
+    ('طلبك وصل', 'تم استلام طلبكم، شكرًا لتواصلكم.'),
+    ('ملاحظة', 'نرجو الالتزام بالتعليمات لضمان جودة التفاعل.'),
+    ('تنبيه', 'يرجى مراعاة قوانين المجموعة واحترام جميع الأعضاء.'),
+    ('شكوى', 'يمكنكم رفع الملاحظات للإدارة المختصة.'),
+    ('استفسار', 'يسعدنا استقبال استفساراتكم، وسيتم الرد حسب المتاح.'),
+    ('إدارة القروب', 'الإدارة تعمل على توفير بيئة مناسبة لجميع الأعضاء.'),
+    ('النظام', 'يرجى الالتزام بالنظام المعتمد داخل المجموعة.'),
+    ('الخصوصية', 'نرجو احترام خصوصية الأعضاء وعدم نشر معلوماتهم.'),
+    ('الروابط', 'نشر الروابط يخضع لضوابط المجموعة.'),
+    ('الإعلانات', 'يرجى التنسيق مع الإدارة قبل نشر الإعلانات.'),
+    ('التكرار', 'نرجو تجنب تكرار الرسائل للحفاظ على تنظيم المحادثة.'),
+    ('الرسائل الطويلة', 'يرجى اختصار الرسائل قدر الإمكان لتسهيل المتابعة.'),
+    ('النقاش', 'نرجو أن يكون النقاش موضوعيًا وبعيدًا عن الإساءة.'),
+    ('الاختلاف', 'اختلاف الآراء لا يفسد الاحترام بين الأعضاء.'),
+    ('المخالفة', 'يرجى مراجعة قوانين المجموعة لتجنب تكرار المخالفات.'),
+    ('التعاون', 'تعاونكم يسهم في تحسين بيئة المجموعة.'),
+    ('التنظيم', 'التنظيم مسؤولية مشتركة بين الإدارة والأعضاء.'),
+    ('الاقتراحات', 'نرحب بمقترحاتكم الهادفة لتطوير المجموعة.'),
+    ('ختام', 'شكرًا لتعاونكم، ونتمنى لكم تجربة مميزة.'),
+    ('يا الغالي', 'الغلا متبادل، الله يحفظك.'),
+    ('الله يحييك', 'الله يبقيك ويزيدك من فضله.'),
+    ('أنت كفو', 'الكفو من طيب أصلك.'),
+    ('تسلم', 'سلمت وسلمت أيامك.'),
+    ('عساك بخير', 'بخير دامك تسأل، الله يسعدك.'),
+    ('الله يرفع قدرك', 'ويرفع قدرك في الدنيا والآخرة.'),
+    ('يا طيب', 'الطيب ما يجي إلا من أهل الطيب.'),
+    ('منور القروب', 'النور نورك، وحضورك يسعدنا.'),
+    ('أحسن الله إليك', 'وإليك بالمثل، جزاك الله خيرًا.'),
+    ('الله يبارك فيك', 'وفيك يبارك الرحمن.'),
+    ('مبدع', 'الإبداع عنوانك، استمر.'),
+    ('ما شاء الله عليك', 'تبارك الرحمن، زادك الله تميزًا.'),
+    ('أنت قدها', 'قدها وقدود، الله يوفقك.'),
+    ('فالك التوفيق', 'ولك بالمثل، جعل التوفيق حليفك.'),
+    ('الله يسلمك', 'ويسلم قلبك من كل شر.'),
+    ('يا بعدهم', 'يا بعد قلبي، الله يديم المحبة.'),
+    ('كلام جميل', 'الأجمل هو حضورك وتفاعلك.'),
+    ('أحلى قروب', 'بأعضائه الطيبين صار الأحلى.'),
+    ('الله يديمكم', 'ويديم المحبة والألفة بين الجميع.'),
+    ('سعدت بكم', 'ونحن سعداء بوجودكم معنا.'),
+    ('من يفوز؟', 'الفوز للأكثر تركيزًا، وليس للأكثر كلامًا 😂'),
+    ('أنا جاهز', 'تم تجهيز الوضع، ننتظر إشارة الانطلاق.'),
+    ('ابدأ التحدي', '🔥 بدأ التحدي، لا مجال للأعذار.'),
+    ('من يجاوب؟', 'السؤال مفتوح، والفرصة للجميع.'),
+    ('جواب صحيح', '🏆 إجابة ممتازة، نقطة إضافية لك.'),
+    ('جواب خطأ', 'محاولة جيدة، لكن الإجابة تحتاج مراجعة.'),
+    ('أعيد السؤال', 'تم، ركز هذه المرة ولا تستعجل.'),
+    ('أنا فزت', 'الفوز جميل، لكن التواضع أجمل 😎'),
+    ('تحداني', 'قبلت التحدي، جهز أقوى ما عندك.'),
+    ('مين أذكى؟', 'الذكاء لا يُقاس بسرعة الرد فقط 😂'),
+    ('عندي سؤال', 'تفضل، تم فتح باب الاستفسارات.'),
+    ('لغز صعب', '🤔 نحتاج تشغيل جميع وحدات التفكير.'),
+    ('سهل', 'السهل عندك، والصعب عند البوت 😂'),
+    ('فكر', 'خذ وقتك، الإجابة لا تهرب.'),
+    ('مستعد؟', 'مستعد دائمًا، هذه من مزايا البوت.'),
+    ('نبدأ', '🚀 على بركة الله، انطلقوا.'),
+    ('انتهى', 'انتهت الجولة، شكرًا لجميع المشاركين.'),
+    ('جولة ثانية', 'هل أنتم مستعدون لجولة أكثر حماسًا؟'),
+    ('أحسنتم', '👏 تفاعل رائع، شكرًا لكم جميعًا.'),
+    ('خلود', 'خلود؟ تم استدعاء صاحبة الاسم الجميل، يرجى الانتظار حتى ترد بنفسها 😂🌷'),
+    ('محمد', 'محمد دخل، صلّوا على النبي 😂'),
+    ('فهد', 'فهد وصل، يرجى إخلاء الساحة 🐆'),
+    ('عبدالله', 'عبدالله، اسم على مسمى.. عبد لله وعبد للمنبه 😂'),
+    ('أحمد', 'أحمد لا تحمد نفسك كثير، خلنا نشوف نشاطك 😎'),
+    ('فيصل', 'فيصل وصل، فصلوا المشاكل عنه 🤣'),
+    ('تركي', 'تركي؟ نبي نشوف التركيز مو الاسم 😂'),
+    ('سلطان', 'سلطان القروب، وين المراسيم الملكية؟ 👑'),
+    ('نايف', 'نايف عالي، بس لا تطير علينا 😂'),
+    ('سعود', 'سعود، عساك سعيد بس لا تسعد علينا بالنكت 🤣'),
+    ('ماجد', 'ماجد؟ المجد لك، والرسائل علينا 😂'),
+    ('بدر', 'بدر طلع، القروب صار منور 🌕'),
+    ('راكان', 'راكان، اركن شوي وخذ راحتك 😂'),
+    ('مشعل', 'مشعل دخل، انتبهوا لا يولع القروب 🔥'),
+    ('صالح', 'صالح؟ الله يصلح حال القروب بوجودك 🤣'),
+    ('ناصر', 'ناصر وصل، من يحتاج النصر؟'),
+    ('وليد', 'وليد، لا تكبر علينا ترى نعرفك 😂'),
+    ('ياسر', 'ياسر، يسّر الله أمورك ولا عسّرت علينا 🤣'),
+    ('إبراهيم', 'إبراهيم، أبشر بالخير بس لا تطلب سلفة 😂'),
+    ('عمر', 'عمر دخل، الله يطول عمرك ويقصر رسائلك 🤣'),
+    ('سعد', 'سعد، سعدنا بوجودك.. بس لا تسعد علينا كثير 😂'),
+    ('سلمان', 'سلمان؟ سلّم علينا أول يا الغالي 😎'),
+    ('حمد', 'حمد، الحمد لله على سلامة القروب 😂'),
+    ('عبدالعزيز', 'عبدالعزيز، عزّ القروب بوجودك 👑'),
+    ('بندر', 'بندر وصل، وين المرسى؟ 😂'),
+    ('طلال', 'طلال، طلّ علينا ولا تختفي 🤣'),
+    ('عادل', 'عادل، نبي العدل في توزيع النكت 😂'),
+    ('زياد', 'زياد، زاد عددنا وزاد الإزعاج 🤣'),
+    ('أنس', 'أنس، وجودك يؤنس القروب ❤️'),
+    ('حمود', 'حمود، حمدنا الله على وجودك 😂'),
+    ('نورة', 'نورة دخلت، القروب صار منور رسميًا ✨'),
+    ('سارة', 'سارة؟ يا سارة لا تسوين لنا سالفة ونحتار 😂'),
+    ('ريم', 'ريم دخلت، وين الغزال؟ 🦌'),
+    ('جود', 'جود، جودك علينا بالتفاعل مو بالمشاهدة 😂'),
+    ('لمياء', 'لمياء، لمّينا القروب بوجودك 🤣'),
+    ('مها', 'مها وصلت، وين عيون المها؟ 👀'),
+    ('أمل', 'أمل، أملنا فيك ترفعين التفاعل 😂'),
+    ('منيرة', 'منيرة، أنرتِ القروب يا أم النور ✨'),
+    ('هيا', 'هيا، هيا بنا نرفع نشاط القروب 🤣'),
+    ('دانة', 'دانة، يا أغلى من الدانة 💎'),
+    ('غلا', 'غلا، غلاك عندنا فوق الوصف ❤️'),
+    ('شوق', 'شوق، اشتقنا لتفاعلك 😂'),
+    ('عبير', 'عبير، عطّرتِ القروب بوجودك 🌸'),
+    ('روان', 'روان، روّقي علينا يا جميلة 🤣'),
+    ('شهد', 'شهد، يا عسل القروب 🍯'),
+    ('جنى', 'جنى، جنيتي علينا بالضحك 😂'),
+    ('مريم', 'مريم، مري علينا بالتفاعل 🤣'),
+    ('فاطمة', 'فاطمة، فطّمتينا عن الهدوء 😂'),
+    ('منال', 'منال، نال القروب شرف وجودك ❤️'),
+    ('أروى', 'أروى، اروي لنا سالفة حلوة 😂'),
+    ('حصة', 'حصة، حصة اليوم من الضحك عليك 🤣'),
+    ('لطيفة', 'لطيفة، لطّفتي أجواء القروب 🌷'),
+    ('بسمة', 'بسمة، ابتسامتك وصلت حتى للبوت 😁'),
+    ('نجلاء', 'نجلاء، نجلّي الهم بوجودك 😂'),
+    ('العنود', 'العنود، لا تعاندين البوت ترى حساس 🤖'),
+    ('غادة', 'غادة، غاديين معك على جو الضحك 😂'),
+    ('أثير', 'أثير، أثرتِ النشاط في القروب 🤣'),
+    ('رنا', 'رنا، رنّي علينا بالتفاعل 😂'),
+    ('هتون', 'هتون، هطلت علينا بالخير 🌧️'),
+    ('أبو محمد', 'أبو محمد وصل، نرجو الوقوف احترامًا 😂'),
+    ('أبو خالد', 'أبو خالد، وين القهوة؟ ☕'),
+    ('أبو فهد', 'أبو فهد، فهد القروب تحت إشرافك 🐆'),
+    ('أبو ناصر', 'أبو ناصر، ناصرنا على الملل 🤣'),
+    ('أبو تركي', 'أبو تركي، لا تتركنا بدون سالفة 😂'),
+    ('أم محمد', 'أم محمد، نورتِ القروب يا أم الجميع 🌷'),
+    ('أم خالد', 'أم خالد، خالدين على المحبة إن شاء الله 😂'),
+    ('أم فهد', 'أم فهد، الفهد صار أليف بوجودك 🤣'),
+    ('أم نورة', 'أم نورة، نور القروب بوجودك ✨'),
+    ('أم عبدالله', 'أم عبدالله، الله يحفظك ويحفظ الجميع ❤️'),
 ]
 _auto_reply_last = {}
 _AUTO_REPLY_COOLDOWN_SECONDS = 30
@@ -1442,13 +1603,23 @@ def can_publish_to(uid, chat_id):
     """النشر للمالك/المفوّض، أو للموظف الذي منحه المالك صلاحية محددة."""
     if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
         return False
-    if is_owner(uid) or is_delegated_owner(uid):
+    # Publishing is limited to owner-managed groups; never let stale/tampered callbacks
+    # reach external groups that belong to other bot users.
+    if not is_owner_managed_group(chat_id):
+        return False
+    if is_owner(uid) or is_delegated_owner(uid) or is_deputy_owner(uid):
         return True
     return can_use_capability(uid, "publish", chat_id)
 
 async def can_publish_to_live(bot, uid, chat_id):
     """تحقق من التفويض الداخلي؛ فشل الإرسال الفعلي يُسجل عند محاولة النشر."""
     return can_publish_to(uid, chat_id)
+
+
+def can_open_broadcast(uid):
+    """Allow the broadcast panel for roles or any global/scoped publish grant."""
+    return bool(is_owner(uid) or is_delegated_owner(uid) or is_deputy_owner(uid)
+                or capability_group_ids(uid, "publish"))
 
 def can_use_capability(uid, capability, chat_id=0):
     """Check owner-controlled grants, including scoped grants for delegated owners."""
@@ -1512,8 +1683,12 @@ async def can_access_group(bot, uid, chat_id):
         return False
     if is_owner(uid):
         return True
-    if (is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
+    if is_deputy_owner(uid) and not is_owner(uid):
+        ext = external_group_info(chat_id)
+        if ext and ext[0]:
+            return can_manage_external_groups(uid) and external_group_active(chat_id)
+        return True
+    if (is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
         return True
     if group_role(chat_id, uid):
         try:
@@ -1525,8 +1700,11 @@ async def can_access_group(bot, uid, chat_id):
 
 async def accessible_groups(bot, uid):
     groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-    if (is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
+    if is_deputy_owner(uid) and not is_owner(uid):
+        if can_manage_external_groups(uid):
+            return groups
+        return owner_managed_group_rows()
+    if (is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
         return groups
     allowed = []
     for chat_id, title in groups:
@@ -1621,6 +1799,11 @@ def group_role(chat_id, uid):
 
 def has_group_permission(chat_id, uid, permission):
     if is_owner(uid) or is_delegated_owner(uid):
+        return True
+    if is_deputy_owner(uid) and not is_owner(uid):
+        ext = external_group_info(chat_id)
+        if ext and ext[0] and not can_manage_external_groups(uid):
+            return False
         return True
     if is_general_manager(uid) or is_protection_manager(uid):
         return True
@@ -5322,10 +5505,12 @@ async def owner_group_feature_command(update, context):
 
 def all_message_groups_markup(context, action):
     selected = set(context.user_data.get("all_message_lock_selected", set()))
-    groups = db.execute("SELECT chat_id,COALESCE(title,CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title,chat_id").fetchall()
+    groups = owner_managed_group_rows()
     rows = []
     for chat_id, title in groups[:45]:
-        allowed = is_owner(context.user_data.get("_lockall_uid", 0)) or can_use_capability(context.user_data.get("_lockall_uid", 0), "message_lock", int(chat_id))
+        allowed = (is_owner(context.user_data.get("_lockall_uid", 0))
+                   or is_deputy_owner(context.user_data.get("_lockall_uid", 0))
+                   or can_use_capability(context.user_data.get("_lockall_uid", 0), "message_lock", int(chat_id)))
         if not allowed:
             continue
         mark = "✅" if int(chat_id) in selected else "⬜"
@@ -5342,13 +5527,43 @@ async def lock_all_groups_text(update, context):
     if text not in {"قفل رسايل بالبوت", "قفل رسائل بالبوت", "فتح رسايل بالبوت", "فتح رسائل بالبوت", "قفل الدردشة بالبوت", "فتح الدردشة بالبوت", "قفل المحادثة بالبوت", "فتح المحادثة بالبوت"}:
         return
     action = "lock" if text.startswith("قفل") else "unlock"
-    if not is_owner(user.id) and not capability_group_ids(user.id, "message_lock"):
+    if not (is_owner(user.id) or is_deputy_owner(user.id) or capability_group_ids(user.id, "message_lock")) :
         await msg.reply_text("⛔ هذه الواجهة تتطلب صلاحية قفل وفتح الرسائل التي يمنحها المالك الأساسي.")
         return
     context.user_data["_lockall_uid"] = user.id
     context.user_data["all_message_lock_action"] = action
     context.user_data["all_message_lock_selected"] = set()
     await msg.reply_text("اختر القروبات التي تريد " + ("قفل الرسائل فيها" if action == "lock" else "فتح الرسائل فيها") + ". ستطبق العملية على القروبات المحددة فقط.", reply_markup=all_message_groups_markup(context, action))
+
+async def _can_lock_messages_in_group(bot, uid, chat_id):
+    """Check actor authority and the bot's Telegram restriction right before locking."""
+    internal_authorized = (
+        is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid)
+        or is_general_manager(uid) or is_protection_manager(uid)
+        or can_use_capability(uid, "message_lock", chat_id)
+        or "manage_roles" in GROUP_ROLE_PERMISSIONS.get(group_role(chat_id, uid), set())
+    )
+    native_admin_authorized = False
+    try:
+        actor_member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
+        native_admin_authorized = (
+            actor_member.status == "creator"
+            or (actor_member.status == "administrator" and getattr(actor_member, "can_restrict_members", False))
+        )
+    except Exception:
+        native_admin_authorized = False
+    if not (internal_authorized or native_admin_authorized):
+        return False
+    try:
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            return False
+        if bot_member.status != "creator" and not getattr(bot_member, "can_restrict_members", False):
+            return False
+    except Exception:
+        return False
+    return True
+
 
 async def lock_all_messages_command(update, context):
     """Lock/unlock all member message types in the current group, using Telegram chat permissions."""
@@ -5359,9 +5574,12 @@ async def lock_all_messages_command(update, context):
     full_text = (msg.text or "").strip().lower()
     cmd = full_text.split()[0].lstrip("/") if full_text else ""
     lock = cmd == "lockall" or full_text in {"قفل رسايل", "قفل رسائل", "قفل الدردشة", "قفل المحادثة", "قفل الشات"}
-    authorized = is_owner(user.id) or can_use_capability(user.id, "message_lock", chat.id)
+    authorized = await _can_lock_messages_in_group(context.bot, user.id, chat.id)
     if not authorized:
-        await msg.reply_text("⛔ لا تملك صلاحية قفل وفتح الرسائل. يتيح المالك الأساسي هذه الصلاحية من لوحة توزيع الصلاحيات.")
+        await msg.reply_text(
+            "⛔ لا تملك صلاحية قفل/فتح الرسائل في هذا القروب، أو أن البوت لا يملك صلاحية تقييد الأعضاء. "
+            "تأكد من رتبتك ومن منح البوت صلاحية (تقييد الأعضاء)."
+        )
         return
     try:
         if lock:
@@ -5715,6 +5933,19 @@ async def message_filter(update, context):
     if not msg or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     uid = msg.from_user.id if msg.from_user else 0
+    # Plain-text admin commands are handled in the earlier ArabicTextCommand handler.
+    # Avoid running activity/reply/flood analytics on these control messages, which
+    # otherwise made lock/unlock and role commands feel delayed under group traffic.
+    control_text = normalized_arabic_text((msg.text or "").strip()) if msg.text else ""
+    handled_control_texts = {
+        normalized_arabic_text(x) for x in (
+            "قفل رسايل", "قفل رسائل", "قفل الدردشة", "قفل المحادثة", "قفل الشات",
+            "فتح رسايل", "فتح رسائل", "فتح الدردشة", "فتح المحادثة", "فتح الشات",
+            "تنزيل رتبة", "إزالة الإشراف", "تنزيل مشرف",
+        )
+    }
+    if control_text in handled_control_texts or re.fullmatch(r"(?:رفع|ترقية)\s+(?:مشرف عام|مدير عام|مشرف|مدير)", (msg.text or "").strip()):
+        return
     register_group(chat)
     if not external_group_active(chat.id):
         return
@@ -13781,7 +14012,12 @@ async def broadcast_draft_message(update, context):
         return
     # Handle an active broadcast draft BEFORE pending admin actions. Otherwise a
     # stale awaiting_admin_action flag can intercept the ad and demand a numeric ID.
-    if context.user_data.get("awaiting_broadcast") and (is_owner(user.id) or is_delegated_owner(user.id)):
+    selected_broadcast_groups = context.user_data.get("broadcast_selected_groups", [])
+    broadcast_actor_authorized = (
+        is_owner(user.id) or is_delegated_owner(user.id) or is_deputy_owner(user.id)
+        or any(can_publish_to(user.id, int(cid)) for cid in selected_broadcast_groups)
+    )
+    if context.user_data.get("awaiting_broadcast") and broadcast_actor_authorized:
         context.user_data.pop("awaiting_admin_action", None)
         context.user_data["broadcast_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
         selected = context.user_data.get("broadcast_selected_groups", [])
@@ -13804,8 +14040,19 @@ async def broadcast_draft_message(update, context):
         action = pending_action.get("action")
         target_id = int(raw)
         chat_id = int(pending_action.get("chat_id"))
-        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}.get(action)
-        if not await can_access_group(context.bot, user.id, chat_id) or not permission_for_action or not has_group_permission(chat_id, user.id, permission_for_action):
+        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin", "demote":"manage_roles"}.get(action)
+        demote_authorized = False
+        if action == "demote":
+            try:
+                actor_member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user.id)
+                demote_authorized = (is_owner(user.id) or is_delegated_owner(user.id) or is_deputy_owner(user.id)
+                    or has_group_permission(chat_id, user.id, "manage_roles")
+                    or actor_member.status == "creator"
+                    or (actor_member.status == "administrator" and getattr(actor_member, "can_promote_members", False)))
+            except Exception:
+                demote_authorized = False
+        action_authorized = demote_authorized if action == "demote" else bool(permission_for_action and has_group_permission(chat_id, user.id, permission_for_action))
+        if not await can_access_group(context.bot, user.id, chat_id) or not permission_for_action or not action_authorized:
             context.user_data.pop("awaiting_admin_action", None)
             await msg.reply_text("⛔ لا تملك الصلاحية المطلوبة لهذا الإجراء في هذا القروب.")
             return
@@ -13827,7 +14074,27 @@ async def broadcast_draft_message(update, context):
                 await context.bot.delete_message(chat_id, target_id)
             elif action == "pin":
                 await context.bot.pin_chat_message(chat_id, target_id)
-            labels = {"ban":"حظر العضو", "unban":"فك حظر العضو", "kick":"طرد العضو", "mute":"كتم العضو", "unmute":"إلغاء كتم العضو", "delete":"حذف الرسالة", "pin":"تثبيت الرسالة"}
+            elif action == "demote":
+                target_member = await context.bot.get_chat_member(chat_id=chat_id, user_id=target_id)
+                if target_member.status == "creator":
+                    raise RuntimeError("لا يمكن عزل مالك القروب")
+                if target_member.status != "administrator":
+                    # If the user has only a bot-local rank, remove it too.
+                    db.execute("DELETE FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id, target_id))
+                    db.commit()
+                    log_action(chat_id, user.id, "group_role_removed", f"target={target_id};reason=demote_action")
+                    await msg.reply_text(f"✅ أزيلت رتبة البوت المحلية عن المستخدم {target_id}. لم يكن مشرف تيليجرام.")
+                    context.user_data.pop("awaiting_admin_action", None)
+                    return
+                await context.bot.promote_chat_member(
+                    chat_id=chat_id, user_id=target_id,
+                    can_manage_chat=False, can_delete_messages=False, can_manage_video_chats=False,
+                    can_restrict_members=False, can_promote_members=False, can_change_info=False,
+                    can_invite_users=False, can_post_messages=False, can_edit_messages=False,
+                    can_pin_messages=False, can_manage_topics=False, is_anonymous=False
+                )
+                db.execute("DELETE FROM group_roles WHERE chat_id=? AND user_id=?", (chat_id, target_id)); db.commit()
+            labels = {"ban":"حظر العضو", "unban":"فك حظر العضو", "kick":"طرد العضو", "mute":"كتم العضو", "unmute":"إلغاء كتم العضو", "delete":"حذف الرسالة", "pin":"تثبيت الرسالة", "demote":"عزل المشرف/المدير من الإشراف"}
             log_action(chat_id, user.id, action, str(target_id))
             await msg.reply_text(f"✅ تم تنفيذ: {labels.get(action, action)}\nالقروب: {chat_id}\nالرقم: {target_id}")
         except Exception as exc:
@@ -14433,7 +14700,7 @@ async def callback(update, context):
         return
 
     if data.startswith("allmsg_"):
-        if not (is_owner(uid) or can_use_capability(uid, "message_lock", 0) or capability_group_ids(uid, "message_lock") or context.user_data.get("_lockall_uid") == uid):
+        if not (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "message_lock", 0) or capability_group_ids(uid, "message_lock") or context.user_data.get("_lockall_uid") == uid):
             await safe_callback_answer(q, "لا تملك صلاحية قفل وفتح الرسائل.", show_alert=True); return
         if data.startswith("allmsg_open:"):
             action = data.split(":", 1)[1]
@@ -14451,14 +14718,14 @@ async def callback(update, context):
         if data.startswith("allmsg_toggle:"):
             try: gid = int(parts[1])
             except Exception: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
-            if not (is_owner(uid) or can_use_capability(uid, "message_lock", gid)):
+            if not (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "message_lock", gid)):
                 await safe_callback_answer(q, "لا تملك صلاحية هذا القروب.", show_alert=True); return
             selected.symmetric_difference_update({gid})
             context.user_data["all_message_lock_selected"] = selected
             await q.edit_message_reply_markup(reply_markup=all_message_groups_markup(context, action))
             await safe_callback_answer(q); return
         if data.startswith("allmsg_all:"):
-            ids = [int(r[0]) for r in db.execute("SELECT chat_id FROM watched_groups").fetchall() if is_owner(uid) or can_use_capability(uid,"message_lock",int(r[0]))]
+            ids = [int(r[0]) for r in owner_managed_group_rows() if is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid,"message_lock",int(r[0]))]
             context.user_data["all_message_lock_selected"] = set(ids)
             await q.edit_message_reply_markup(reply_markup=all_message_groups_markup(context, action)); await safe_callback_answer(q, f"تم تحديد {len(ids)} قروب."); return
         if data.startswith("allmsg_none:"):
@@ -14469,8 +14736,10 @@ async def callback(update, context):
                 await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل.", show_alert=True); return
             ok, failed = 0, []
             for gid in sorted(selected):
-                if not (is_owner(uid) or can_use_capability(uid, "message_lock", gid)):
+                if not (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "message_lock", gid)):
                     failed.append((gid,"لا توجد صلاحية")); continue
+                if not await _can_lock_messages_in_group(context.bot, uid, gid):
+                    failed.append((gid,"صلاحية البوت لتقييد الأعضاء غير متاحة أو لا تملك تفويض القروب")); continue
                 try:
                     if action == "lock":
                         await context.bot.set_chat_permissions(chat_id=gid, permissions=ChatPermissions(
@@ -16878,6 +17147,7 @@ async def callback(update, context):
                 [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{chat_id}")],
                 [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{chat_id}"), InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{chat_id}")],
                 [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{chat_id}")],
+                [InlineKeyboardButton("🛑 عزل مشرف/مدير من الإشراف", callback_data=f"admin_action:demote:{chat_id}")],
                 [InlineKeyboardButton("🗑️ حذف رسالة برقمها", callback_data=f"admin_action:delete:{chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة برقمها", callback_data=f"admin_action:pin:{chat_id}")],
                 [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],
                 [InlineKeyboardButton("⬅️ لوحة القروب" if not can_use_panel(uid) else "⬅️ القروبات", callback_data=f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "administration_groups")]
@@ -16887,18 +17157,35 @@ async def callback(update, context):
 
     if data.startswith("admin_action:"):
         parts = data.split(":")
-        if len(parts) != 3 or parts[1] not in {"ban", "unban", "kick", "mute", "unmute", "delete", "pin"}:
+        if len(parts) != 3 or parts[1] not in {"ban", "unban", "kick", "mute", "unmute", "delete", "pin", "demote"}:
             await safe_callback_answer(q, "الإجراء غير صحيح.", show_alert=True); return
         action = parts[1]
         try: chat_id = int(parts[2])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
-        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}[action]
-        if not has_group_permission(chat_id, uid, permission_for_action):
+        permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin", "demote":"manage_roles"}[action]
+        if action == "demote":
+            try:
+                actor_member = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
+                demote_authorized = (is_owner(uid) or is_delegated_owner(uid) or is_deputy_owner(uid)
+                    or has_group_permission(chat_id, uid, "manage_roles")
+                    or actor_member.status == "creator"
+                    or (actor_member.status == "administrator" and getattr(actor_member, "can_promote_members", False)))
+            except Exception:
+                demote_authorized = False
+            try:
+                bot_member = await context.bot.get_chat_member(chat_id=chat_id, user_id=context.bot.id)
+                bot_can_promote = (bot_member.status == "creator" or
+                    (bot_member.status == "administrator" and getattr(bot_member, "can_promote_members", False)))
+            except Exception:
+                bot_can_promote = False
+            if not demote_authorized or not bot_can_promote:
+                await safe_callback_answer(q, "عزل المشرفين يتطلب صلاحية تنزيل/ترقية المشرفين لك وللبوت في تيليجرام.", show_alert=True); return
+        elif not has_group_permission(chat_id, uid, permission_for_action):
             await safe_callback_answer(q, "رتبتك لا تسمح بهذا الإجراء في هذا القروب.", show_alert=True); return
         context.user_data["awaiting_admin_action"] = {"action": action, "chat_id": chat_id}
-        labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها"}
+        labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها", "demote":"رقم المشرف/المدير الذي تريد عزله من الإشراف"}
         action_group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         action_group_title = action_group[0] if action_group and action_group[0] else str(chat_id)
         await q.edit_message_text(
@@ -17546,7 +17833,7 @@ async def callback(update, context):
         return
 
     if data == "broadcast_start":
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+        if not can_open_broadcast(uid):
             await safe_callback_answer(q, "لا تملك صلاحية النشر؛ اطلب منحها من المالك الأساسي.", show_alert=True)
             return
         groups = owner_managed_group_rows()
@@ -17561,7 +17848,7 @@ async def callback(update, context):
             selected = cid in context.user_data["broadcast_selected_groups"]
             mark = "✅" if selected else "⬜️"
             rows.append([InlineKeyboardButton(f"{mark} {title or cid}", callback_data=f"broadcast_toggle:{cid}")])
-        if is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish"):
+        if is_owner(uid) or is_delegated_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "publish"):
             rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات المتاحة لي", callback_data="broadcast_select_all")])
         rows.append([InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")])
         rows.append([InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")])
@@ -17569,7 +17856,7 @@ async def callback(update, context):
         return
 
     if data.startswith("broadcast_toggle:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+        if not can_open_broadcast(uid):
             await safe_callback_answer(q, "ليس لديك صلاحية.", show_alert=True)
             return
         try:
@@ -17587,13 +17874,13 @@ async def callback(update, context):
         # Refresh only authorized group options.
         groups = [(cid, title) for cid, title in owner_managed_group_rows() if await can_publish_to_live(context.bot, uid, cid)]
         rows = [[InlineKeyboardButton(("✅ " if cid in selected else "⬜️ ") + (title or str(cid)), callback_data=f"broadcast_toggle:{cid}")] for cid, title in groups[:30]]
-        if is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish"): rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات المتاحة لي", callback_data="broadcast_select_all")])
+        if can_open_broadcast(uid): rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات المتاحة لي", callback_data="broadcast_select_all")])
         rows += [[InlineKeyboardButton("➡️ متابعة وإرسال الإعلان", callback_data="broadcast_prepare")], [InlineKeyboardButton("❌ إلغاء", callback_data="broadcast_cancel")]]
         await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data == "broadcast_select_all":
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+        if not can_open_broadcast(uid):
             await safe_callback_answer(q, "ليس لديك صلاحية النشر.", show_alert=True)
             return
         groups = owner_managed_group_rows()
@@ -17631,7 +17918,7 @@ async def callback(update, context):
         draft = context.user_data.get("broadcast_draft")
         selected = context.user_data.get("broadcast_selected_groups", [])
         selected = [cid for cid in selected if await can_publish_to_live(context.bot, uid, cid)]
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")) or not draft or not selected:
+        if not draft or not selected:
             await q.edit_message_text("⛔ انتهت صلاحية الإعلان أو لا توجد قروبات مصرح بها. ابدأ من جديد.")
             return
         sent, failed = 0, 0
@@ -18821,7 +19108,7 @@ async def owner_activity_audit_worker(app):
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
-    app = Application.builder().token(TOKEN).post_init(post_init).post_stop(post_stop).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(8).post_init(post_init).post_stop(post_stop).build()
 
     command_handlers = {
         "stats_on": owner_group_feature_command, "stats_off": owner_group_feature_command, "joinalerts_on": owner_group_feature_command, "joinalerts_off": owner_group_feature_command, "leavealerts_on": owner_group_feature_command, "leavealerts_off": owner_group_feature_command, "analysis_on": owner_group_feature_command, "analysis_off": owner_group_feature_command, "joinapproval_on": owner_group_feature_command, "joinapproval_off": owner_group_feature_command, "lockall": lock_all_messages_command, "unlockall": lock_all_messages_command,
