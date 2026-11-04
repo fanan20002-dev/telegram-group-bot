@@ -814,6 +814,15 @@ db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
     PRIMARY KEY(chat_id,invite_link)
 )""")
 db.execute("DELETE FROM motivation_groups WHERE chat_id NOT IN (SELECT w.chat_id FROM watched_groups w JOIN external_group_control e ON e.chat_id=w.chat_id WHERE e.is_external=0)")
+# Mandatory approval-first entry: enable it for every currently active registered group,
+# both owner-managed/internal and external groups where the bot is still present.
+# Historical/inactive groups are not altered.
+db.execute("""INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at)
+    SELECT chat_id,1,? FROM watched_groups WHERE 1
+    ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at""", (datetime.now(timezone.utc).isoformat(),))
+db.execute("""INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at)
+    SELECT chat_id,1,? FROM external_group_control WHERE COALESCE(enabled,0)=1 AND COALESCE(is_member,0)=1
+    ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at""", (datetime.now(timezone.utc).isoformat(),))
 db.commit()
 
 def global_join_approval_enabled():
@@ -1661,6 +1670,8 @@ def register_group(chat, actor=None):
         db.execute("""INSERT OR IGNORE INTO external_group_capabilities
             (chat_id,capability,enabled,granted_by,granted_at) VALUES(?,?,?,?,?)""",
             (chat.id, _cap, _enabled, OWNER_ID, now()))
+    # New group registrations begin with approval-required entry by default.
+    db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,1,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at", (int(chat.id), now()))
     db.commit()
     ensure_settings(chat.id)
     ensure_auto_replies(chat.id)
@@ -6002,8 +6013,23 @@ async def chat_join_request_handler(update, context):
             f"اسم المستخدم: @{user.username or 'غير متوفر'}\nالمعرّف: {user.id}\n"
             + (f"⚠️ تنبيه: لهذا العضو سجل سابق: {prior[1] or prior[0]}. فك الحظر وحده لا يُعد موافقة على العودة.\n" if restricted else "")
             + "اختر الموافقة أو الرفض. لا يُقبل الطلب إلا من مسؤول مخوّل.")
-    # Join requests are intentionally routed only to the primary owner and deputy owners.
-    await notify_owner_and_deputies(context, text, reply_markup=keyboard)
+    # Route approvals by group ownership:
+    # - Bot-owned/internal groups: primary bot owner and deputy owners.
+    # - External groups: the Telegram creator of that group only.
+    ext_info = external_group_info(chat.id)
+    is_external = bool(ext_info and int(ext_info[0] or 0) == 1)
+    if is_external:
+        try:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            creator = next((admin.user for admin in admins if getattr(admin, "status", "") == "creator"), None)
+            if creator:
+                await context.bot.send_message(chat_id=creator.id, text=text, reply_markup=keyboard)
+            else:
+                log.warning("External join request has no identifiable creator chat=%s user=%s", chat.id, user.id)
+        except Exception as exc:
+            log.warning("Could not route external join request to group creator chat=%s: %s", chat.id, exc)
+    else:
+        await notify_owner_and_deputies(context, text, reply_markup=keyboard)
 
 
 async def my_chat_member_handler(update, context):
@@ -14259,6 +14285,9 @@ async def callback(update, context):
         if (feature == "join_approval_enabled" and global_join_approval_enabled()
                 and is_owner_managed_group(chat_id)):
             await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لقروبات المالك فقط. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب المالك منفردًا.", show_alert=True); return
+        if feature == "join_approval_enabled":
+            await safe_callback_answer(q, "🔐 اشتراط الموافقة على الانضمام إلزامي للقروبات المسجلة، ولا يمكن إيقافه من هذه اللوحة.", show_alert=True)
+            return
         new_state = not group_feature_enabled(chat_id, feature)
         set_group_feature(chat_id, feature, new_state)
         if feature == "join_approval_enabled" and not new_state:
@@ -14338,8 +14367,19 @@ async def callback(update, context):
     if data.startswith("joinreq_approve:") or data.startswith("joinreq_deny:"):
         try: action, chat_raw, user_raw = data.split(":", 2); chat_id, target_id = int(chat_raw), int(user_raw)
         except ValueError: await safe_callback_answer(q, "بيانات الطلب غير صحيحة.", show_alert=True); return
-        if not (is_owner(uid) or is_deputy_owner(uid)):
-            await safe_callback_answer(q, "الموافقة على طلبات الدخول للمالك الأساسي ونائب المالك فقط.", show_alert=True); return
+        ext_info = external_group_info(chat_id)
+        is_external_request_group = bool(ext_info and int(ext_info[0] or 0) == 1)
+        if is_external_request_group:
+            try:
+                member_status = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
+                authorized_approver = getattr(member_status, "status", "") == "creator"
+            except Exception as exc:
+                log.warning("Could not verify external group creator uid=%s chat=%s: %s", uid, chat_id, exc)
+                authorized_approver = False
+            if not authorized_approver:
+                await safe_callback_answer(q, "طلبات القروبات الخارجية يوافق عليها مالك القروب نفسه فقط.", show_alert=True); return
+        elif not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "طلبات قروبات المالك الأساسي يوافق عليها المالك الأساسي أو نائبه فقط.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
         if not reqrow or reqrow[0] not in ("pending", "approved"):
             await safe_callback_answer(q, "الطلب لم يعد معلقًا.", show_alert=True); return
