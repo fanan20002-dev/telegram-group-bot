@@ -18606,7 +18606,7 @@ async def active_group_refresh_worker(app):
 
 
 async def group_greeting_worker(app):
-    """Send one public greeting per active group at 07:00 and 20:00 Riyadh time."""
+    """Legacy greeting sender; intentionally not started (scheduled greetings disabled)."""
     tz = ZoneInfo("Asia/Riyadh")
     messages = {
         "morning": "🌅 صباح الخير والسعادة على جميع أعضاء القروب\n\n☀️ أسعد الله صباحكم بكل خير، وكتب لكم يومًا مليئًا بالتوفيق والإنجاز والراحة.\n\n🤍 جعل الله صباحكم بداية لكل خير، ورزقكم من واسع فضله.\n\nمع تحيات بوت حماية ومساعدة القروبات 🤖",
@@ -18724,7 +18724,7 @@ async def post_init(app):
         (group_analysis_report_worker, "group-analysis-report-worker"),
         (weekly_security_review_worker, "weekly-security-review-worker"),
         (motivation_daily_worker, "motivation-daily-worker"),
-        (group_greeting_worker, "group-greeting-worker"),
+        # Disabled per owner request: stop scheduled morning/evening group greetings.
         (ensure_global_join_approval_links_worker, "global-join-approval-links-worker"),
     ]
     # Application is a library object: do not assign undocumented private attributes.
