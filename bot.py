@@ -913,6 +913,7 @@ DEFAULT_AUTO_REPLIES = [
 ]
 _auto_reply_last = {}
 _AUTO_REPLY_COOLDOWN_SECONDS = 30
+MEMBER_POINTS_COOLDOWN = 600  # 10 minutes between automatic member-point awards
 
 def split_mentions_for_telegram(mentions, header="#all\n", max_chars=3900):
     """Split HTML mention strings into Telegram-safe messages without splitting a mention."""
@@ -5822,7 +5823,7 @@ async def message_filter(update, context):
     # Smart member summon: only explicit summon words trigger a mass mention, with per-group cooldown.
     if msg.from_user and not msg.from_user.is_bot and msg.text:
         summon_text = normalized_arabic_text(msg.text)
-        summon_requested = bool(re.search(r"(?<!\w)(?:تاك|تاق|منشن|استدعاء)(?!\w)", summon_text))
+        summon_requested = bool(re.search(r"(?:^|\s)(?:تاك|تاق|منشن|استدعاء)(?=$|\s|[^\w])", summon_text))
         if summon_requested:
             last_tag = float(context.chat_data.get("last_auto_mass_tag", 0) or 0)
             authorized_tag = is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "tag", chat.id)
