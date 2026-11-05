@@ -5692,6 +5692,26 @@ async def give_member_points_cmd(update, context):
     total=db.execute("SELECT points FROM member_reputation WHERE chat_id=? AND user_id=?",(chat.id,target_id)).fetchone()[0]
     await msg.reply_text(f"✅ تم تعديل نقاط العضو {target_id} بمقدار {amount:+d}.\n⭐ الرصيد الحالي: {total}\n🏷️ اللقب الحالي: {member_title_for(chat.id,total)}")
 
+def ensure_member_title_rules(chat_id):
+    """Ensure the per-group member title rules table exists."""
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS member_title_rules("
+        "chat_id INTEGER NOT NULL, min_points INTEGER NOT NULL, title TEXT NOT NULL, "
+        "PRIMARY KEY(chat_id,min_points))"
+    )
+
+
+def member_title_for(chat_id, points):
+    """Return the highest configured title threshold met by the member."""
+    ensure_member_title_rules(chat_id)
+    row = db.execute(
+        "SELECT title FROM member_title_rules WHERE chat_id=? AND min_points<=? "
+        "ORDER BY min_points DESC LIMIT 1",
+        (chat_id, int(points)),
+    ).fetchone()
+    return row[0] if row else "عضو"
+
+
 async def set_member_title_cmd(update, context):
     msg=update.effective_message; user=update.effective_user; chat=update.effective_chat
     if not msg or not user or not chat:
@@ -5802,7 +5822,7 @@ async def message_filter(update, context):
     # Smart member summon: only explicit summon words trigger a mass mention, with per-group cooldown.
     if msg.from_user and not msg.from_user.is_bot and msg.text:
         summon_text = normalized_arabic_text(msg.text)
-        summon_requested = bool(re.search(r"(?:^|\s)(?:تاك|تاق|منشن|استدعاء)(?:$|\s)", summon_text))
+        summon_requested = bool(re.search(r"(?<!\w)(?:تاك|تاق|منشن|استدعاء)(?!\w)", summon_text))
         if summon_requested:
             last_tag = float(context.chat_data.get("last_auto_mass_tag", 0) or 0)
             authorized_tag = is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "tag", chat.id)
