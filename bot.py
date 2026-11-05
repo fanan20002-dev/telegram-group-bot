@@ -2300,6 +2300,10 @@ def external_group_manage_markup(chat_id):
     title, enabled, ai_enabled, added_by, added_name, added_username = row
     rows = [[InlineKeyboardButton(("⏸️ إيقاف البوت عن القروب" if enabled else "▶️ تفعيل البوت للقروب"),
                                   callback_data=f"external_toggle:{chat_id}")]]
+    auto_row = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (chat_id,)).fetchone()
+    auto_enabled = bool(auto_row and auto_row[0])
+    rows.append([InlineKeyboardButton(("💬 إيقاف الردود الآلية" if auto_enabled else "💬 تشغيل الردود الآلية"),
+                                      callback_data=f"external_autoreplies:{chat_id}")])
     rows.append([InlineKeyboardButton(("🧠 تعطيل الذكاء الاصطناعي" if ai_enabled else "🧠 منح الذكاء الاصطناعي"),
                                       callback_data=f"external_ai:{chat_id}")])
     for cap, label in EXTERNAL_CAPABILITY_LABELS.items():
@@ -15230,6 +15234,25 @@ async def callback(update, context):
         log_external_group_event(ext_chat_id, uid, "service_toggle", f"enabled={new_enabled}")
         await safe_callback_answer(q, "تم إيقاف خدمات البوت عن القروب." if not new_enabled else "تم تفعيل البوت للقروب.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
+    if data.startswith("external_autoreplies:"):
+        if not can_manage_external_groups(uid):
+            await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
+        try: ext_chat_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        ext_row = db.execute("SELECT is_external,enabled,is_member FROM external_group_control WHERE chat_id=?", (ext_chat_id,)).fetchone()
+        if not ext_row or not ext_row[0] or not ext_row[2]:
+            await safe_callback_answer(q, "القروب الخارجي غير نشط أو غير مسجل.", show_alert=True); return
+        ensure_auto_replies(ext_chat_id)
+        state = db.execute("SELECT enabled FROM auto_reply_settings WHERE chat_id=?", (ext_chat_id,)).fetchone()
+        new_enabled = 0 if state and state[0] else 1
+        db.execute("UPDATE auto_reply_settings SET enabled=? WHERE chat_id=?", (new_enabled, ext_chat_id))
+        db.commit()
+        log_action(ext_chat_id, uid, "external_auto_replies_toggle", f"enabled={new_enabled}")
+        log_external_group_event(ext_chat_id, uid, "auto_replies_toggle", f"enabled={new_enabled}")
+        await safe_callback_answer(q, "تم تشغيل الردود الآلية للقروب الخارجي." if new_enabled else "تم إيقاف الردود الآلية للقروب الخارجي.", show_alert=True)
+        await q.edit_message_text("🌐 إدارة القروب الخارجي", reply_markup=external_group_manage_markup(ext_chat_id)); return
+
     if data.startswith("external_ai:"):
         if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
