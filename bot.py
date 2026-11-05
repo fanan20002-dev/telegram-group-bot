@@ -880,8 +880,8 @@ async def create_managed_join_request_link(bot, chat_id):
     bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
     if getattr(bot_member, "status", "") != "administrator":
         raise RuntimeError("يجب رفع البوت إلى مشرف")
-    if not bool(getattr(bot_member, "can_invite_users", False)) or not bool(getattr(bot_member, "can_restrict_members", False)):
-        raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين وحظرهم")
+    if not bool(getattr(bot_member, "can_invite_users", False)):
+        raise RuntimeError("يجب منح البوت صلاحية دعوة المستخدمين لإنشاء رابط طلب الانضمام")
     old_links = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (chat_id,)).fetchall()
     for (old_link,) in old_links:
         try:
@@ -1428,9 +1428,9 @@ async def can_access_group(bot, uid, chat_id):
     if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
         return True
     # Deputy and capability-based staff access is scoped to explicit grants for this group.
-    if is_deputy_owner(uid) and any(
+    if (is_deputy_owner(uid) or db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? LIMIT 1", (uid,)).fetchone()) and any(
         can_use_capability(uid, cap, chat_id)
-        for cap in ("protection", "members", "settings", "stats", "welcome", "tag", "publish", "message_lock", "join_approval")
+        for cap in ("protection", "members", "settings", "stats", "welcome", "tag", "publish", "message_lock", "join_approval", "reentry", "mass_ban", "manage_staff")
     ):
         return True
     if group_role(chat_id, uid):
@@ -6022,14 +6022,17 @@ async def chat_join_request_handler(update, context):
     if not req or not req.chat or not req.from_user:
         return
     chat, user = req.chat, req.from_user
-    # Do not attribute group ownership/registration to the requesting member.
-    register_group(chat)
+    if getattr(chat, "type", "") not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+        return
+    # Group registration is not applicable to channels; their join-request updates
+    # are still routed and persisted using the channel's chat_id.
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        register_group(chat)
     prior = db.execute("SELECT status,reason FROM reentry_restrictions WHERE chat_id=? AND user_id=?", (chat.id, user.id)).fetchone()
-    approval_on = group_feature_enabled(chat.id, "join_approval_enabled")
+    approval_on = (chat.type == ChatType.CHANNEL) or group_feature_enabled(chat.id, "join_approval_enabled")
     restricted = bool(prior and prior[0] in ("pending", "blocked"))
-    if approval_on and not restricted:
-        # If a direct invite was rejected by the approval gate, lift only that Telegram ban
-        # so the person can submit a proper join request; no membership is granted here.
+    if approval_on and not restricted and chat.type != ChatType.CHANNEL:
+        # Lift only transient join-gate bans, never an explicit active re-entry restriction.
         try:
             await context.bot.unban_chat_member(chat_id=chat.id, user_id=user.id, only_if_banned=True)
         except Exception as exc:
@@ -6052,23 +6055,28 @@ async def chat_join_request_handler(update, context):
             f"اسم المستخدم: @{user.username or 'غير متوفر'}\nالمعرّف: {user.id}\n"
             + (f"⚠️ تنبيه: لهذا العضو سجل سابق: {prior[1] or prior[0]}. فك الحظر وحده لا يُعد موافقة على العودة.\n" if restricted else "")
             + "اختر الموافقة أو الرفض. لا يُقبل الطلب إلا من مسؤول مخوّل.")
-    # Route approvals by group ownership:
-    # - Bot-owned/internal groups: primary bot owner and deputy owners.
-    # - External groups: the Telegram creator of that group only.
+    # Route requests to the bot owner, destination creator, deputy owners for
+    # internal groups, and staff explicitly granted join_approval for this chat.
     ext_info = external_group_info(chat.id)
     is_external = bool(ext_info and int(ext_info[0] or 0) == 1)
-    if is_external:
+    recipients = {int(OWNER_ID)} if OWNER_ID else set()
+    if not is_external and chat.type != ChatType.CHANNEL:
+        recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        creator = next((admin.user for admin in admins if getattr(admin, "status", "") == "creator"), None)
+        if creator:
+            recipients.add(int(creator.id))
+    except Exception as exc:
+        log.info("Could not resolve join-request creator chat=%s: %s", chat.id, exc)
+    candidates = db.execute("SELECT DISTINCT user_id FROM staff_capabilities WHERE capability='join_approval'").fetchall()
+    recipients.update(int(row[0]) for row in candidates
+                      if can_use_capability(int(row[0]), "join_approval", int(chat.id)))
+    for recipient in recipients:
         try:
-            admins = await context.bot.get_chat_administrators(chat.id)
-            creator = next((admin.user for admin in admins if getattr(admin, "status", "") == "creator"), None)
-            if creator:
-                await context.bot.send_message(chat_id=creator.id, text=text, reply_markup=keyboard)
-            else:
-                log.warning("External join request has no identifiable creator chat=%s user=%s", chat.id, user.id)
+            await context.bot.send_message(chat_id=recipient, text=text, reply_markup=keyboard)
         except Exception as exc:
-            log.warning("Could not route external join request to group creator chat=%s: %s", chat.id, exc)
-    else:
-        await notify_owner_and_deputies(context, text, reply_markup=keyboard)
+            log.info("Could not send join-request notice recipient=%s chat=%s: %s", recipient, chat.id, exc)
 
 
 async def my_chat_member_handler(update, context):
@@ -14244,8 +14252,8 @@ async def callback(update, context):
                     failed.append(f"• {_title} ({_cid}): يجب رفع البوت إلى مشرف")
                     await asyncio.sleep(0.1)
                     continue
-                if not bool(getattr(_bot_member, "can_invite_users", False)) or not bool(getattr(_bot_member, "can_restrict_members", False)):
-                    failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين وحظرهم؛ القفل الكامل غير مضمون دون الصلاحيتين")
+                if not bool(getattr(_bot_member, "can_invite_users", False)):
+                    failed.append(f"• {_title} ({_cid}): امنح البوت صلاحية دعوة المستخدمين لإنشاء رابط طلب الانضمام")
                     await asyncio.sleep(0.1)
                     continue
                 # Revoke only active links previously created and tracked by this bot.
@@ -14407,18 +14415,25 @@ async def callback(update, context):
         try: action, chat_raw, user_raw = data.split(":", 2); chat_id, target_id = int(chat_raw), int(user_raw)
         except ValueError: await safe_callback_answer(q, "بيانات الطلب غير صحيحة.", show_alert=True); return
         ext_info = external_group_info(chat_id)
-        is_external_request_group = bool(ext_info and int(ext_info[0] or 0) == 1)
-        if is_external_request_group:
-            try:
-                member_status = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
-                authorized_approver = getattr(member_status, "status", "") == "creator"
-            except Exception as exc:
-                log.warning("Could not verify external group creator uid=%s chat=%s: %s", uid, chat_id, exc)
-                authorized_approver = False
-            if not authorized_approver:
-                await safe_callback_answer(q, "طلبات القروبات الخارجية يوافق عليها مالك القروب نفسه فقط.", show_alert=True); return
-        elif not (is_owner(uid) or is_deputy_owner(uid)):
-            await safe_callback_answer(q, "طلبات قروبات المالك الأساسي يوافق عليها المالك الأساسي أو نائبه فقط.", show_alert=True); return
+        try:
+            _target_chat = await context.bot.get_chat(chat_id=chat_id)
+            _target_is_channel = getattr(_target_chat, "type", "") == ChatType.CHANNEL
+        except Exception:
+            _target_is_channel = False
+        is_external_request_group = bool(ext_info and int(ext_info[0] or 0) == 1) or _target_is_channel
+        # Owner, destination creator, internal deputy, or a staff member with
+        # explicit global/group-scoped join_approval permission may decide.
+        authorized_approver = bool(is_owner(uid) or can_use_capability(uid, "join_approval", chat_id))
+        if not is_external_request_group and is_deputy_owner(uid):
+            authorized_approver = True
+        try:
+            member_status = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
+            if getattr(member_status, "status", "") == "creator":
+                authorized_approver = True
+        except Exception as exc:
+            log.debug("Could not verify creator status uid=%s chat=%s: %s", uid, chat_id, exc)
+        if not authorized_approver:
+            await safe_callback_answer(q, "لا تملك صلاحية قبول أو رفض طلبات الانضمام لهذا القروب.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
         if not reqrow or reqrow[0] not in ("pending", "approved"):
             await safe_callback_answer(q, "الطلب لم يعد معلقًا.", show_alert=True); return
@@ -15967,9 +15982,9 @@ async def callback(update, context):
             await safe_callback_answer(q, "بيانات القروب غير صحيحة.", show_alert=True)
             return
         if not (is_owner(uid) or is_delegated_owner(uid)
-                or (is_deputy_owner(uid) and await can_access_group(context.bot, uid, group_chat_id))
+                or await can_access_group(context.bot, uid, group_chat_id)
                 or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
-            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ونائب المالك المصرح له ومشرفي هذا القروب فقط.", show_alert=True)
+            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ونائب المالك والموظفين الممنوحين صلاحية القروب ومشرفيه فقط.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
             await safe_callback_answer(q, "القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
@@ -15984,7 +15999,9 @@ async def callback(update, context):
             "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
         }.get(action)
         # Deputy access is limited to the specific capability granted for this group.
-        if is_deputy_owner(uid) and not is_owner(uid) and required_cap and not can_use_capability(uid, required_cap, group_chat_id):
+        if (not is_owner(uid) and not is_delegated_owner(uid) and required_cap
+                and (is_deputy_owner(uid) or db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? LIMIT 1", (uid,)).fetchone())
+                and not can_use_capability(uid, required_cap, group_chat_id)):
             await safe_callback_answer(q, "صلاحية هذا القسم غير ممنوحة لك في هذا القروب.", show_alert=True); return
         if ext_info and ext_info[0] and not is_owner(uid):
             if required_cap and not external_group_cap_enabled(group_chat_id, required_cap):
