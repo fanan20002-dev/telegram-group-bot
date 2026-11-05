@@ -1425,8 +1425,13 @@ async def can_access_group(bot, uid, chat_id):
         return False
     if is_owner(uid):
         return True
-    if (is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
+    if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
+        return True
+    # Deputy and capability-based staff access is scoped to explicit grants for this group.
+    if is_deputy_owner(uid) and any(
+        can_use_capability(uid, cap, chat_id)
+        for cap in ("protection", "members", "settings", "stats", "welcome", "tag", "publish", "message_lock", "join_approval")
+    ):
         return True
     if group_role(chat_id, uid):
         try:
@@ -1471,9 +1476,7 @@ def can_manage_external_groups(uid):
 
 
 def can_manage_delegates(uid):
-    """المالك الأساسي أو المالك المفوّض الذي مُنح صلاحية إدارة المفوّضين صراحةً.
-    لا تسمح هذه الصلاحية بإدارة نواب المالك أو تغيير المالك الأساسي.
-    """
+    """المالك الأساسي أو المفوّض الممنوح صراحةً صلاحية إدارة المفوّضين."""
     if is_owner(uid):
         return True
     if not is_delegated_owner(uid):
@@ -1482,6 +1485,14 @@ def can_manage_delegates(uid):
         "SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='manage_delegates' AND chat_id=0",
         (uid,)
     ).fetchone())
+
+
+def can_manage_staff_permissions(uid):
+    """توزيع صلاحيات الطاقم للمالك الأساسي أو لمن مُنح capability manage_staff صراحةً."""
+    return is_owner(uid) or (
+        (is_delegated_owner(uid) or is_deputy_owner(uid))
+        and can_use_capability(uid, "manage_staff", 0)
+    )
 
 def is_general_manager(uid):
     # المالك المفوض يملك الإدارة التشغيلية في القروبات المسجلة، دون صلاحيات النظام العليا.
@@ -1501,7 +1512,7 @@ def is_manager(uid):
 def can_use_panel(uid):
     # صلاحيات المستخدمين الممنوحة من المالك تفتح لوحة محدودة بالميزات المصرح بها فقط.
     has_capability = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? LIMIT 1", (uid,)).fetchone())
-    return is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid) or has_capability
+    return is_owner(uid) or is_deputy_owner(uid) or is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid) or has_capability
 
 def can_manage_security(uid):
     return is_general_manager(uid) or is_protection_manager(uid)
@@ -1983,6 +1994,7 @@ STAFF_CAPABILITY_LABELS = {
     "external_groups": "🌐 إدارة القروبات الخارجية",
     "membership_notifications": "🔔 استقبال إشعارات دخول وخروج الأعضاء",
     "external_monitor": "👁️ الاطلاع على مركز مراقبة القروبات الخارجية (قراءة فقط)",
+    "manage_staff": "👥 إدارة الطاقم وتوزيع الصلاحيات",
 }
 
 
@@ -2327,6 +2339,32 @@ def massban_groups_markup(groups, selected):
 def panel_markup(uid):
     """واجهة مرتبة حسب الدور، مع الحفاظ على جميع أقسام الإدارة السابقة."""
     # يجمع نص الزر الأيقونة الوظيفية الجديدة مع مسمى القسم السابق حتى لا تضيع أي وظيفة.
+    if is_deputy_owner(uid) and not is_owner(uid) and not is_delegated_owner(uid):
+        deputy_rows = [
+            [InlineKeyboardButton("🛡️ الحماية", callback_data="security_groups"),
+             InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="administration_groups")],
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
+             InlineKeyboardButton("📋 السجلات", callback_data="logs")],
+        ]
+        for cap, label, callback in (
+            ("publish", "📣 النشر والإعلانات", "broadcast_start"),
+            ("welcome", "👋 الترحيب", "welcome"),
+            ("settings", "⚙️ إعدادات القروبات", "settings"),
+            ("tag", "📣 استدعاء التاق", "owner_tag_groups"),
+            ("mass_ban", "🚫 الحظر الجماعي", "massban_menu"),
+            ("message_lock", "🔒 قفل/فتح الرسائل", "allmsg_open:lock"),
+            ("join_approval", "🚪 إدارة طلبات الانضمام", "restricted_members"),
+            ("ai", "🧠 تقارير الذكاء الاصطناعي", "owner_ai_report"),
+            ("manage_staff", "👥 إدارة الطاقم والصلاحيات", "staff_permissions"),
+        ):
+            if can_use_capability(uid, cap, 0) or capability_group_ids(uid, cap):
+                deputy_rows.append([InlineKeyboardButton(label, callback_data=callback)])
+        if can_use_capability(uid, "external_groups", 0):
+            deputy_rows.append([InlineKeyboardButton("🌐 إدارة القروبات الخارجية", callback_data="external_groups")])
+        if can_use_capability(uid, "external_monitor", 0):
+            deputy_rows.append([InlineKeyboardButton("👁️ مراقبة القروبات الخارجية", callback_data="external_monitor_center")])
+        deputy_rows.append([InlineKeyboardButton("❌ إغلاق اللوحة", callback_data="home")])
+        return InlineKeyboardMarkup(deputy_rows)
     if is_delegated_owner(uid) and not is_owner(uid):
         delegated_rows = [
             [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
@@ -2337,7 +2375,8 @@ def panel_markup(uid):
             [InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups"), InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
             [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
             [InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center"), InlineKeyboardButton("📋 المهام والمناوبات", callback_data="staff_tasks")],
-            [InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="staff_permissions")],
+            *([[InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="staff_permissions")]]
+              if can_manage_staff_permissions(uid) else []),
             [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         ]
         if can_use_capability(uid, "mass_ban"):
@@ -14629,7 +14668,7 @@ async def callback(update, context):
         if not is_owner(uid): await safe_callback_answer(q, "منح الرتب العامة للمالك الأساسي فقط.", show_alert=True); return
         try: _, raw_target, role = data.split(":",2); target_uid=int(raw_target)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
-        if target_uid <= 0 or target_uid == OWNER_ID or role not in ("delegated","manager","protection"):
+        if target_uid <= 0 or target_uid == OWNER_ID or is_deputy_owner(target_uid) or role not in ("delegated","manager","protection"):
             await safe_callback_answer(q, "الرتبة أو المستخدم غير مسموح.", show_alert=True); return
         if role == "delegated":
             exists = db.execute("SELECT 1 FROM delegated_owners WHERE user_id=?", (target_uid,)).fetchone()
@@ -14723,7 +14762,7 @@ async def callback(update, context):
         if not is_owner(uid): await safe_callback_answer(q,"للمالك الأساسي فقط.",show_alert=True); return
         try: _,raw_target,raw_chat,role=data.split(":",3); target_uid=int(raw_target); chat_id=int(raw_chat)
         except ValueError: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if target_uid <= 0 or target_uid == OWNER_ID or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone() or role not in ("مشرف","مشرف عام","مدير","مدير عام","remove"):
+        if target_uid <= 0 or target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid) or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone() or role not in ("مشرف","مشرف عام","مدير","مدير عام","remove"):
             await safe_callback_answer(q,"القروب أو الرتبة غير صحيحة.",show_alert=True); return
         if role == "remove": db.execute("DELETE FROM group_roles WHERE chat_id=? AND user_id=?",(chat_id,target_uid)); action="تمت إزالة رتبة القروب"
         else: db.execute("INSERT OR REPLACE INTO group_roles(chat_id,user_id,role,granted_by,granted_at) VALUES(?,?,?,?,?)",(chat_id,target_uid,role,uid,now())); action=f"تم تعيين رتبة {role}"
@@ -15365,28 +15404,28 @@ async def callback(update, context):
         await q.edit_message_text(body[:3900], reply_markup=adhkar_markup()); return
 
     if data == "staff_permissions":
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "إدارة الطاقم للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "إدارة الطاقم للمالك الأساسي أو لمن مُنح صلاحيتها فقط.", show_alert=True); return
         context.user_data["awaiting_staff_permissions_id"] = True
         await q.message.reply_text("👥 أرسل رقم المستخدم الذي تريد ترقيته أو تعديل صلاحياته.\nيمكنك معرفة الرقم من أمر /id، وللإلغاء أرسل /cancel.")
         return
 
     if data.startswith("staffmanage:"):
-        if not (is_owner(uid) or is_delegated_owner(uid)):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "إدارة الطاقم تتطلب صلاحية مخصصة.", show_alert=True); return
         try: target_uid = int(data.split(":", 1)[1])
         except ValueError: await safe_callback_answer(q, "رقم مستخدم غير صحيح.", show_alert=True); return
-        if target_uid == OWNER_ID or is_delegated_owner(target_uid):
-            await safe_callback_answer(q, "لا يمكن تعديل صلاحيات المالكين من هذه اللوحة.", show_alert=True); return
+        if target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid):
+            await safe_callback_answer(q, "لا يمكن تعديل صلاحيات المالك أو المفوّض أو نائب المالك من هذه اللوحة.", show_alert=True); return
         await q.edit_message_text(f"👥 إدارة الطاقم\nالمستخدم: {user_display_name(target_uid)}\nالمعرّف: {target_uid}\n\nاختر الرتبة والصلاحيات. المدير العام يملك صلاحيات تشغيلية واسعة؛ أما الصلاحيات المنفردة فتمنح وصولًا محدودًا.", reply_markup=staff_permissions_markup(target_uid))
         return
 
     if data.startswith("staffrole:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "منح وسحب الرتب العامة يتطلب موافقة المالك الأساسي.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "منح الرتب العامة يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: _, target_raw, role = data.split(":", 2); target_uid = int(target_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
-        if target_uid == OWNER_ID or is_delegated_owner(target_uid) or role not in ("manager", "protection"):
+        if target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid) or role not in ("manager", "protection"):
             await safe_callback_answer(q, "لا يمكن تعديل هذا الحساب أو الرتبة.", show_alert=True); return
         table = "managers" if role == "manager" else "protection_managers"
         exists = db.execute(f"SELECT 1 FROM {table} WHERE user_id=?", (target_uid,)).fetchone()
@@ -15399,15 +15438,15 @@ async def callback(update, context):
         await q.edit_message_text(f"{action} للمستخدم {target_uid}.", reply_markup=staff_permissions_markup(target_uid)); return
 
     if data.startswith("staffcap:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "توزيع الصلاحيات يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: _, target_raw, cap = data.split(":", 2); target_uid = int(target_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         if target_uid == OWNER_ID or cap not in STAFF_CAPABILITY_LABELS:
             await safe_callback_answer(q, "حساب أو صلاحية غير مسموحة.", show_alert=True); return
         # Delegated owners may receive only explicitly approved delegated capabilities.
         # The membership-notification grant is intentionally separate from publishing.
-        if is_delegated_owner(target_uid) and cap not in {"message_lock", "membership_notifications"}:
+        if is_delegated_owner(target_uid) and cap not in {"message_lock", "membership_notifications", "manage_staff"}:
             await safe_callback_answer(q, "هذه الصلاحية غير متاحة للمالك المفوّض.", show_alert=True); return
         # The external monitoring center is a read-only privilege for deputy owners only.
         if cap == "external_monitor" and not is_deputy_owner(target_uid):
@@ -15428,8 +15467,8 @@ async def callback(update, context):
         await q.edit_message_text(f"{action} للمستخدم {target_uid}.", reply_markup=staff_permissions_markup(target_uid)); return
 
     if data.startswith("staffgroups:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "تحديد صلاحيات القروبات يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: target_uid = int(data.split(":", 1)[1])
         except ValueError: await safe_callback_answer(q, "رقم مستخدم غير صحيح.", show_alert=True); return
         groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title COLLATE NOCASE").fetchall()
@@ -15439,21 +15478,23 @@ async def callback(update, context):
         await q.edit_message_text(f"📍 اختر قروبًا لإدارة صلاحيات {target_uid}:", reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("staffgroup:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "تحديد صلاحيات القروب يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: _, target_raw, chat_raw = data.split(":", 2); target_uid = int(target_raw); chat_id = int(chat_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid):
+            await safe_callback_answer(q, "إدارة هذه الرتبة لا تشمل المالك أو المفوّض أو نائب المالك.", show_alert=True); return
         group = db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         if not group: await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         await q.edit_message_text(f"🔐 صلاحيات المستخدم {target_uid} في القروب {chat_id}\nاضغط على الصلاحية لتبديلها. إذا كانت الصلاحية عامة، فإن الضغط يسجل استثناءً لهذا القروب.", reply_markup=staff_group_capabilities_markup(target_uid, chat_id)); return
 
     if data.startswith("staffgrole:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "رفع الرتب من صلاحية المالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "رفع الرتب يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: _, target_raw, chat_raw, role = data.split(":", 3); target_uid = int(target_raw); chat_id = int(chat_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
-        if target_uid == OWNER_ID or is_delegated_owner(target_uid):
-            await safe_callback_answer(q, "لا يمكن تغيير رتبة المالك أو المالك المفوّض.", show_alert=True); return
+        if target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid):
+            await safe_callback_answer(q, "لا يمكن تغيير رتبة المالك أو المالك المفوّض أو نائب المالك.", show_alert=True); return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await safe_callback_answer(q, "القروب غير مسجل.", show_alert=True); return
         if role == "remove":
@@ -15469,12 +15510,14 @@ async def callback(update, context):
         await q.edit_message_text(f"{action}.\n\nالمستخدم: {target_uid}\nالقروب: {chat_id}", reply_markup=staff_group_capabilities_markup(target_uid, chat_id)); return
 
     if data.startswith("staffgcap:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذا الإجراء للمالك والمفوّض فقط.", show_alert=True); return
+        if not can_manage_staff_permissions(uid):
+            await safe_callback_answer(q, "توزيع صلاحيات القروب يتطلب صلاحية إدارة الطاقم.", show_alert=True); return
         try: _, target_raw, chat_raw, cap = data.split(":", 3); target_uid = int(target_raw); chat_id = int(chat_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
-        if cap not in STAFF_CAPABILITY_LABELS or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await safe_callback_answer(q, "قروب أو صلاحية غير صحيحة.", show_alert=True); return
+        if (target_uid == OWNER_ID or is_delegated_owner(target_uid) or is_deputy_owner(target_uid)
+                or cap not in STAFF_CAPABILITY_LABELS
+                or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()):
+            await safe_callback_answer(q, "قروب أو مستخدم أو صلاحية غير صحيحة.", show_alert=True); return
         global_grant = db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability=? AND chat_id=0", (target_uid, cap)).fetchone()
         local_grant = db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability=? AND chat_id=?", (target_uid, cap, chat_id)).fetchone()
         denied = db.execute("SELECT 1 FROM staff_capability_denials WHERE user_id=? AND capability=? AND chat_id=?", (target_uid, cap, chat_id)).fetchone()
@@ -15923,8 +15966,10 @@ async def callback(update, context):
         except (ValueError, TypeError):
             await safe_callback_answer(q, "بيانات القروب غير صحيحة.", show_alert=True)
             return
-        if not (is_owner(uid) or is_delegated_owner(uid) or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
-            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ومشرفي هذا القروب فقط.", show_alert=True)
+        if not (is_owner(uid) or is_delegated_owner(uid)
+                or (is_deputy_owner(uid) and await can_access_group(context.bot, uid, group_chat_id))
+                or await is_telegram_group_admin(context.bot, uid, group_chat_id)):
+            await safe_callback_answer(q, "هذه اللوحة متاحة للمالك والمفوّض ونائب المالك المصرح له ومشرفي هذا القروب فقط.", show_alert=True)
             return
         if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone():
             await safe_callback_answer(q, "القروب غير مسجل بعد. أرسل /start داخله أولًا.", show_alert=True)
@@ -15932,13 +15977,16 @@ async def callback(update, context):
         ext_info = external_group_info(group_chat_id)
         if ext_info and ext_info[0] and not is_owner(uid) and not ext_info[1]:
             await safe_callback_answer(q, "أوقف المالك الأساسي خدمات البوت عن هذا القروب.", show_alert=True); return
+        required_cap = {
+            "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
+            "group_panel_admin": "members", "group_panel_roles": "members",
+            "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
+            "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
+        }.get(action)
+        # Deputy access is limited to the specific capability granted for this group.
+        if is_deputy_owner(uid) and not is_owner(uid) and required_cap and not can_use_capability(uid, required_cap, group_chat_id):
+            await safe_callback_answer(q, "صلاحية هذا القسم غير ممنوحة لك في هذا القروب.", show_alert=True); return
         if ext_info and ext_info[0] and not is_owner(uid):
-            required_cap = {
-                "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
-                "group_panel_admin": "members", "group_panel_roles": "members",
-                "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
-                "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
-            }.get(action)
             if required_cap and not external_group_cap_enabled(group_chat_id, required_cap):
                 await safe_callback_answer(q, "هذه الخدمة غير مفعّلة لهذا القروب من المالك الأساسي.", show_alert=True); return
         if action == "group_panel_bulkdelete":
