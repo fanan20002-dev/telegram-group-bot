@@ -14358,7 +14358,7 @@ async def motivation_daily_worker(app):
             await asyncio.sleep(60)
 
 
-async def callback(update, context):
+async def _callback_impl(update, context):
     q = update.callback_query
     await safe_callback_answer(q)
     uid = q.from_user.id
@@ -17630,6 +17630,10 @@ async def callback(update, context):
         row=db.execute("SELECT chat_id,kind,answer,completed,created_at FROM game_rounds WHERE token=?",(token,)).fetchone()
         if not row: await safe_callback_answer(q, "انتهت الجولة أو غير موجودة.",show_alert=True); return
         chat_id,kind,correct,completed,created_at=row
+        if not q.message or q.message.chat.id != chat_id:
+            await safe_callback_answer(q, "هذه الجولة تخص قروبًا آخر.", show_alert=True); return
+        if kind not in ("speed", "scramble"):
+            await safe_callback_answer(q, "نوع الجولة غير صالح.", show_alert=True); return
         if completed: await safe_callback_answer(q, "سبق أن فاز عضو بهذه الجولة.",show_alert=True); return
         if answer != correct: await safe_callback_answer(q, "ليست الإجابة الصحيحة، حاول مجددًا.",show_alert=True); return
         if (datetime.now(timezone.utc)-datetime.fromisoformat(created_at)).total_seconds()>180: await safe_callback_answer(q, "انتهى وقت الجولة.",show_alert=True); return
@@ -17737,7 +17741,11 @@ async def callback(update, context):
         winner=symbol if any(all(board[i]==symbol for i in line) for line in wins_x) else None
         draw=not winner and " " not in board
         if winner or draw:
-            db.execute("UPDATE game_xo SET board=?,status='done' WHERE token=?",(board,token))
+            changed = db.execute("UPDATE game_xo SET board=?,status='done' WHERE token=? AND status='playing' AND board=? AND turn=?", (board, token, row[3], turn)).rowcount
+            if changed != 1:
+                db.rollback()
+                await safe_callback_answer(q, "تم تسجيل حركة أخرى بالتزامن؛ حدّث اللوحة وحاول مجددًا.", show_alert=True)
+                return
             if winner:
                 winner_id=px if winner=="X" else po; name=q.from_user.full_name or str(uid)
                 db.execute("INSERT OR IGNORE INTO game_scores(chat_id,user_id,display_name) VALUES(?,?,?)",(chat_id,winner_id,name))
@@ -17745,7 +17753,12 @@ async def callback(update, context):
                 text=f"🏆 فاز اللاعب {'❌' if winner=='X' else '⭕'}! حصل على 3 نقاط ⭐\n❌ {px} ضد ⭕ {po}"
             else: text=f"🤝 تعادل!\n❌ {px} ضد ⭕ {po}"
         else:
-            next_turn="O" if turn=="X" else "X"; db.execute("UPDATE game_xo SET board=?,turn=? WHERE token=?",(board,next_turn))
+            next_turn="O" if turn=="X" else "X"
+            changed = db.execute("UPDATE game_xo SET board=?,turn=? WHERE token=? AND status='playing' AND board=? AND turn=?", (board, next_turn, token, row[3], turn)).rowcount
+            if changed != 1:
+                db.rollback()
+                await safe_callback_answer(q, "تم تسجيل حركة أخرى بالتزامن؛ حدّث اللوحة وحاول مجددًا.", show_alert=True)
+                return
             text=f"⭕ إكس أو — ❌ {px} ضد ⭕ {po}\nالدور: {'❌ اللاعب الأول' if next_turn=='X' else '⭕ اللاعب الثاني'}"
         db.commit()
         try: await q.edit_message_text(text,reply_markup=None if winner or draw else game_board_markup(token,board))
@@ -19020,6 +19033,21 @@ async def group_greeting_worker(app):
         except Exception:
             log.exception("Group greeting worker failed")
             await asyncio.sleep(60)
+
+
+async def callback(update, context):
+    """Instrument callback latency while preserving the existing dispatcher contract."""
+    started = time.perf_counter()
+    q = update.callback_query
+    callback_data = (q.data or "") if q else ""
+    try:
+        return await _callback_impl(update, context)
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= 500:
+            log.warning("CALLBACK_SLOW elapsed_ms=%.1f data=%s user_id=%s", elapsed_ms, callback_data[:100], q.from_user.id if q else 0)
+        else:
+            log.debug("CALLBACK_LATENCY elapsed_ms=%.1f data=%s", elapsed_ms, callback_data[:100])
 
 
 async def ensure_global_join_approval_links_worker(app):
