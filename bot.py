@@ -4070,6 +4070,7 @@ async def start(update, context):
             "✅",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛡️", callback_data=f"group_panel_home:{chat.id}")],
+                [InlineKeyboardButton("🎮", callback_data=f"member_games:{chat.id}")],
                 [InlineKeyboardButton("🕹️", callback_data="public:back")],
             ]),
         )
@@ -16697,6 +16698,10 @@ async def callback(update, context):
         persistent_buttons = [InlineKeyboardButton(meta["title"], callback_data=f"persistent_game:{key}:{chat_id}") for key, meta in PERSISTENT_GAMES.items()]
         rows.extend([persistent_buttons[i:i+2] for i in range(0, len(persistent_buttons), 2)])
         rows.append([InlineKeyboardButton("⬅️ مركز الأعضاء", callback_data="public:back")])
+        await q.edit_message_text(
+            "🎮 لوحة ألعاب الأعضاء\\n\\nاختر لعبة وشارك في التحدي. نقاطك تُحفظ في سجل القروب.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
         return
 
     if data == "public:commands":
@@ -16755,6 +16760,7 @@ async def callback(update, context):
         if settings.get("public_activity", 1): buttons.append(InlineKeyboardButton("🏆 لوحة نشاط الأعضاء", callback_data="public:activity"))
         rows = [buttons[i:i+2] for i in range(0, len(buttons), 2) if buttons[i:i+2]]
         if settings.get("public_protection", 1): rows.append([InlineKeyboardButton("🛡️ مركز الحماية", callback_data="public:protection")])
+        rows.append([InlineKeyboardButton("🎮 ألعاب القروب", callback_data=f"member_games:{q.message.chat.id}")])
         await q.edit_message_text("🤖 مركز المساعدة\n\n📚 دليل البوت • 🏆 نشاط الأعضاء • 🛡️ معلومات الحماية\n🎮 يمكن المشاركة في الألعاب المتاحة داخل القروب.\n\n🔐 أدوات الإدارة الخاصة لا تظهر هنا، ولا تتاح إلا للحسابات المصرّح لها.", reply_markup=InlineKeyboardMarkup(rows) if rows else None)
         return
     if data == "public:protection":
@@ -17200,6 +17206,10 @@ async def callback(update, context):
         if is_owner(uid) or is_delegated_owner(uid) or is_general_manager(uid):
             rows.append([InlineKeyboardButton(("🟢 إيقاف الألعاب" if cfg[0] else "🔴 تشغيل الألعاب"), callback_data=f"game_toggle:{chat_id}"), InlineKeyboardButton(("🟢 إيقاف تحدي الخاسر" if cfg[1] else "🔴 تشغيل تحدي الخاسر"), callback_data=f"game_challenge_toggle:{chat_id}")])
         rows.append([InlineKeyboardButton("⬅️ القروبات", callback_data="games")])
+        await q.edit_message_text(
+            f"🎮 إدارة ألعاب القروب — {title}\\n\\nاختر لعبة أو عدّل إعداداتها.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
         return
 
     if data.startswith("game_feature_toggle:"):
