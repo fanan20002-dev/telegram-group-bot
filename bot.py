@@ -3590,16 +3590,35 @@ _UNIVERSITY_AUTO_TERMS = (
 
 def _looks_like_university_question(text, message, bot_username=""):
     value = (text or "").strip().lower()
-    if len(value) < 5 or len(value) > 2500:
+    if len(value) < 4 or len(value) > 2500:
         return False
-    if bot_username and (f"@{bot_username.lower()}" in value):
+    # Explicit mention or a reply to the bot should be treated as an intentional request.
+    if bot_username and f"@{bot_username.lower()}" in value:
         return True
-    if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None) and getattr(message.reply_to_message.from_user, "is_bot", False):
+    replied = getattr(message, "reply_to_message", None)
+    replied_user = getattr(replied, "from_user", None) if replied else None
+    if replied_user and getattr(replied_user, "is_bot", False):
         return True
-    # Avoid sending ordinary chat to the model: require a university term and question-like wording.
-    has_topic = any(term in value for term in _UNIVERSITY_AUTO_TERMS)
-    has_question = any(mark in value for mark in ("?", "؟")) or any(word in value for word in ("متى", "كيف", "وين", "أين", "هل", "وش", "ماهو", "ما هي", "كم", "ليش", "لماذا", "طريقة", "اشرح", "متى", "اقدر", "أقدر"))
-    return has_topic and has_question
+
+    # Accept natural/colloquial question phrasing, while still requiring study-related context.
+    topic_terms = _UNIVERSITY_AUTO_TERMS + (
+        "مستوى", "المستوى", "ترم", "ترمات", "الفصل", "الفصول", "رسوم", "السداد", "دفع",
+        "مناقشة", "مناقشات", "الحضور", "تسجيل شعب", "رقم crn", "crn", "الانسحاب",
+        "التأجيل", "تأجيل", "الاعتذار", "خارطة", "الخارطة", "مركز اختبار", "مراكز الاختبار",
+        "تدريب", "التدريب", "موعد", "الموعد", "مادة", "المادة", "مواد", "مقررنا", "مقرري",
+        "الدرجات", "الدرجة", "الرسوم", "الواجب", "الكويز", "الاختبار", "الاختبارات",
+    )
+    question_phrases = (
+        "متى", "كيف", "وين", "أين", "هل", "وش", "ايش", "إيش", "ماهو", "ما هي", "ماهي",
+        "كم", "ليش", "لماذا", "طريقة", "اشرح", "اقدر", "أقدر", "ابغى", "أبغى", "ابي",
+        "أبي", "ممكن", "لو سمحت", "عندي سؤال", "استفسار", "ساعدني", "وش اسوي", "كيف اسوي",
+        "كيف أ", "هل فيه", "هل يوجد", "متى ينزل", "متى يفتح", "ما اقدر", "ما أقدر",
+    )
+    has_topic = any(term in value for term in topic_terms)
+    has_question = any(mark in value for mark in ("?", "؟")) or any(phrase in value for phrase in question_phrases)
+    # A study-topic message can also be phrased as a short statement/request without a question mark.
+    has_request_shape = any(phrase in value for phrase in ("احتاج", "أحتاج", "عندي مشكلة", "ما فهمت", "وضح", "توضيح", "حل", "مساعدة"))
+    return has_topic and (has_question or has_request_shape)
 
 
 async def ai_auto_group_reply(update, context):
