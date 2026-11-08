@@ -369,6 +369,11 @@ db.execute("""CREATE TABLE IF NOT EXISTS group_link_directory(
 db.execute("CREATE INDEX IF NOT EXISTS idx_group_link_directory_type ON group_link_directory(group_type,title)")
 db.commit()
 
+db.execute("""CREATE TABLE IF NOT EXISTS internal_group_capabilities(
+    chat_id INTEGER NOT NULL, capability TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+    updated_by INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(chat_id, capability)
+)""")
 db.execute("""CREATE TABLE IF NOT EXISTS external_group_capabilities(
     chat_id INTEGER NOT NULL, capability TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
     granted_by INTEGER NOT NULL DEFAULT 0, granted_at TEXT NOT NULL,
@@ -1770,11 +1775,15 @@ def external_group_active(chat_id):
 
 
 def external_group_cap_enabled(chat_id, capability):
+    """Resolve per-group feature switches for external and owner-managed groups.
+    Missing internal capability rows preserve legacy behavior (enabled by default).
+    """
     row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
-    if not row or not row[0]:
-        return True
-    cap = db.execute("SELECT enabled FROM external_group_capabilities WHERE chat_id=? AND capability=?", (chat_id, capability)).fetchone()
-    return bool(cap and cap[0])
+    if row and row[0]:
+        cap = db.execute("SELECT enabled FROM external_group_capabilities WHERE chat_id=? AND capability=?", (chat_id, capability)).fetchone()
+        return bool(cap and cap[0])
+    cap = db.execute("SELECT enabled FROM internal_group_capabilities WHERE chat_id=? AND capability=?", (chat_id, capability)).fetchone()
+    return bool(cap[0]) if cap else True
 
 
 def record_member_violation(chat_id, user, reason, abusive=False):
@@ -2382,6 +2391,56 @@ def external_group_manage_markup(chat_id, uid=None):
     return InlineKeyboardMarkup(rows)
 
 
+def internal_groups_controls_markup():
+    groups = owner_managed_group_rows()
+    rows = []
+    # Feature-wide bulk controls for every owner-managed/internal group.
+    for cap, label in EXTERNAL_CAPABILITY_LABELS.items():
+        if cap == "ai":
+            rows.append([
+                InlineKeyboardButton("🧠 تشغيل الذكاء للكل", callback_data="internal_cap_all:ai:1"),
+                InlineKeyboardButton("🧠 إيقاف الذكاء للكل", callback_data="internal_cap_all:ai:0"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(f"▶️ {label[:18]} للكل", callback_data=f"internal_cap_all:{cap}:1"),
+                InlineKeyboardButton(f"⏸️ {label[:18]} للكل", callback_data=f"internal_cap_all:{cap}:0"),
+            ])
+    rows.append([InlineKeyboardButton("🏠 اختر قروبًا لإدارة صلاحياته", callback_data="internal_group_list")])
+    rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def internal_group_list_markup():
+    rows = []
+    for cid, title in owner_managed_group_rows()[:80]:
+        enabled = db.execute("SELECT enabled FROM external_group_control WHERE chat_id=?", (int(cid),)).fetchone()
+        state = "🟢" if enabled and enabled[0] else "🔴"
+        rows.append([InlineKeyboardButton(f"{state} {str(title)[:45]}", callback_data=f"internal_group_manage:{int(cid)}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("لا توجد قروبات داخلية مسجلة", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ إدارة الصلاحيات الداخلية", callback_data="internal_groups_controls")])
+    return InlineKeyboardMarkup(rows)
+
+
+def internal_group_manage_markup(chat_id):
+    state = db.execute("SELECT enabled FROM external_group_control WHERE chat_id=? AND is_external=0", (int(chat_id),)).fetchone()
+    rows = [[InlineKeyboardButton(("⏸️ إيقاف البوت عن القروب" if state and state[0] else "▶️ تفعيل البوت للقروب"),
+                                  callback_data=f"internal_service_toggle:{int(chat_id)}")]]
+    ai_row = db.execute("SELECT enabled FROM ai_group_settings WHERE chat_id=?", (int(chat_id),)).fetchone()
+    ai_on = bool(ai_row and ai_row[0])
+    rows.append([InlineKeyboardButton(("🧠 إيقاف الذكاء الاصطناعي" if ai_on else "🧠 تشغيل الذكاء الاصطناعي"),
+                                      callback_data=f"internal_ai_toggle:{int(chat_id)}")])
+    for cap, label in EXTERNAL_CAPABILITY_LABELS.items():
+        if cap == "ai":
+            continue
+        row = db.execute("SELECT enabled FROM internal_group_capabilities WHERE chat_id=? AND capability=?", (int(chat_id), cap)).fetchone()
+        active = bool(row[0]) if row else True
+        rows.append([InlineKeyboardButton(("✅ " if active else "⬜ ") + label, callback_data=f"internal_cap_toggle:{int(chat_id)}:{cap}")])
+    rows.append([InlineKeyboardButton("⬅️ قائمة القروبات الداخلية", callback_data="internal_group_list")])
+    return InlineKeyboardMarkup(rows)
+
+
 def support_tickets_markup():
     rows = []
     tickets = db.execute("""SELECT id,group_title,requester_name,status FROM external_support_tickets
@@ -2519,6 +2578,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("🧠 تقرير تحليل القروبات", callback_data="owner_ai_report")],
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات والتحليل", callback_data="group_controls")],
         [InlineKeyboardButton("🎛️ تحكم جماعي بالإحصائيات والردود الآلية", callback_data="owner_global_controls")],
+        [InlineKeyboardButton("🏠 إدارة صلاحيات القروبات الداخلية", callback_data="internal_groups_controls")],
         [InlineKeyboardButton("🔒 قفل الدخول لقروبات المالك", callback_data="joinapproval_global_on"), InlineKeyboardButton("🔓 فتح الدخول لقروبات المالك", callback_data="joinapproval_global_off")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
@@ -3434,7 +3494,7 @@ async def openai_assistant_response(user_text, chat_title="المحادثة"):
                     "model": OPENAI_MODEL,
                     "messages": [
                         {"role": "system", "content": "أنت المساعد التنفيذي لبوت تيليجرام. أجب بالعربية بوضوح واختصار. يمكنك اقتراح خطوات، لكن لا تدّعِ أنك نفذت إجراءً إداريًا داخل تيليجرام ما لم تنفذه وظيفة برمجية فعلية. لا تطلب مفاتيح أو كلمات مرور."},
-                        {"role": "user", "content": f"السياق: {chat_title}\nالطلب: {prompt[:6000]}"}
+                        {"role": "user", "content": f"السياق: {chat_title}\nالطلب: {prompt[:26000]}"}
                     ],
                     "temperature": 0.3,
                     "max_tokens": 800
@@ -14951,6 +15011,94 @@ async def _callback_impl(update, context):
                 f"حالة وجود البوت: {'موجود' if is_member else 'غير موجود/غير مؤكد'}\nرتبة البوت: {html.escape(role)}\n"
                 f"خدمات البوت: {'مفعّلة' if enabled else 'متوقفة'}\nصلاحيات Telegram: {html.escape(rights_text)}\nآخر تحقق: {html.escape(checked or 'غير متاح')}\n\nآخر أحداث مسجلة:\n{html.escape(event_text)}")
         await q.edit_message_text(body, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 إعادة الفحص", callback_data=f"external_monitor_detail:{monitor_cid}")],[InlineKeyboardButton("⬅️ مركز المراقبة", callback_data="external_monitor_center")]])); return
+
+    # Owner-only management of all owner-managed/internal group feature switches.
+    if data == "internal_groups_controls":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه اللوحة للمالك الأساسي فقط.", show_alert=True); return
+        await q.edit_message_text(
+            "🏠 إدارة صلاحيات القروبات الداخلية\\n\\nيمكنك تشغيل أو إيقاف كل ميزة لجميع القروبات الداخلية، أو فتح قروب محدد لتخصيص صلاحياته.",
+            reply_markup=internal_groups_controls_markup()); return
+
+    if data == "internal_group_list":
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه اللوحة للمالك الأساسي فقط.", show_alert=True); return
+        await q.edit_message_text("🏠 اختر قروبًا داخليًا لتعديل صلاحياته:", reply_markup=internal_group_list_markup()); return
+
+    if data.startswith("internal_group_manage:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "هذه اللوحة للمالك الأساسي فقط.", show_alert=True); return
+        try: internal_cid = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if not is_owner_managed_group(internal_cid):
+            await safe_callback_answer(q, "هذا القروب ليس ضمن القروبات الداخلية المسجلة.", show_alert=True); return
+        title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (internal_cid,)).fetchone()
+        title = title_row[0] if title_row else str(internal_cid)
+        await q.edit_message_text(f"🏠 صلاحيات القروب الداخلي\\n{html.escape(title)}\\nID: {internal_cid}\\n\\nاضغط على الميزة لتبديلها.", parse_mode="HTML",
+                                  reply_markup=internal_group_manage_markup(internal_cid)); return
+
+    if data.startswith("internal_service_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "للـمالك الأساسي فقط.", show_alert=True); return
+        try: internal_cid = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        row = db.execute("SELECT enabled FROM external_group_control WHERE chat_id=? AND is_external=0", (internal_cid,)).fetchone()
+        if not row: await safe_callback_answer(q, "القروب الداخلي غير مسجل.", show_alert=True); return
+        enabled = 0 if row[0] else 1
+        db.execute("UPDATE external_group_control SET enabled=?,updated_at=? WHERE chat_id=?", (enabled,now(),internal_cid)); db.commit()
+        log_action(internal_cid, uid, "internal_group_service_toggle", f"enabled={enabled}")
+        await safe_callback_answer(q, "تم تشغيل البوت للقروب." if enabled else "تم إيقاف البوت عن القروب.")
+        await q.edit_message_text("🏠 إدارة القروب الداخلي", reply_markup=internal_group_manage_markup(internal_cid)); return
+
+    if data.startswith("internal_ai_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "للـمالك الأساسي فقط.", show_alert=True); return
+        try: internal_cid = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        if not is_owner_managed_group(internal_cid):
+            await safe_callback_answer(q, "القروب غير مسجل ضمن القروبات الداخلية.", show_alert=True); return
+        row = db.execute("SELECT enabled FROM ai_group_settings WHERE chat_id=?", (internal_cid,)).fetchone()
+        enabled = 0 if row and row[0] else 1
+        db.execute("INSERT INTO ai_group_settings(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                   (internal_cid,enabled,uid,now()))
+        db.commit(); log_action(internal_cid,uid,"internal_ai_toggle",f"enabled={enabled}")
+        await safe_callback_answer(q, "تم تشغيل الذكاء الاصطناعي." if enabled else "تم إيقاف الذكاء الاصطناعي.")
+        await q.edit_message_text("🏠 إدارة القروب الداخلي", reply_markup=internal_group_manage_markup(internal_cid)); return
+
+    if data.startswith("internal_cap_toggle:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "للـمالك الأساسي فقط.", show_alert=True); return
+        try: _, cid_raw, cap = data.split(":",2); internal_cid=int(cid_raw)
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if cap not in EXTERNAL_CAPABILITY_LABELS or cap == "ai" or not is_owner_managed_group(internal_cid):
+            await safe_callback_answer(q, "الصلاحية أو القروب غير صحيح.", show_alert=True); return
+        row = db.execute("SELECT enabled FROM internal_group_capabilities WHERE chat_id=? AND capability=?", (internal_cid,cap)).fetchone()
+        enabled = 0 if row and row[0] else 1
+        db.execute("INSERT INTO internal_group_capabilities(chat_id,capability,enabled,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                   (internal_cid,cap,enabled,uid,now()))
+        db.commit(); log_action(internal_cid,uid,"internal_capability_toggle",f"{cap}={enabled}")
+        await safe_callback_answer(q, "تم تحديث الصلاحية.")
+        await q.edit_message_text("🏠 إدارة القروب الداخلي", reply_markup=internal_group_manage_markup(internal_cid)); return
+
+    if data.startswith("internal_cap_all:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "للـمالك الأساسي فقط.", show_alert=True); return
+        try: _, cap, state_raw = data.split(":",2); enabled=int(state_raw)
+        except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
+        if cap not in EXTERNAL_CAPABILITY_LABELS or enabled not in (0,1):
+            await safe_callback_answer(q, "الصلاحية غير صحيحة.", show_alert=True); return
+        groups = [int(cid) for cid,_title in owner_managed_group_rows()]
+        if cap == "ai":
+            for internal_cid in groups:
+                db.execute("INSERT INTO ai_group_settings(chat_id,enabled,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                           (internal_cid,enabled,uid,now()))
+        else:
+            for internal_cid in groups:
+                db.execute("INSERT INTO internal_group_capabilities(chat_id,capability,enabled,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                           (internal_cid,cap,enabled,uid,now()))
+        db.commit(); log_action(0,uid,"internal_capability_bulk",f"{cap}={enabled}; groups={len(groups)}")
+        await safe_callback_answer(q, f"تم {'تشغيل' if enabled else 'إيقاف'} {EXTERNAL_CAPABILITY_LABELS[cap]} في {len(groups)} قروب داخلي.")
+        await q.edit_message_text("🏠 إدارة صلاحيات القروبات الداخلية", reply_markup=internal_groups_controls_markup()); return
 
     # Primary-owner-only unified permissions and group assignment workflow.
     if data == "unified_permissions":
