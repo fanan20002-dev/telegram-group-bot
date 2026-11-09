@@ -391,6 +391,13 @@ db.execute("""CREATE TABLE IF NOT EXISTS ai_auto_reply_cooldowns(
     PRIMARY KEY(chat_id,user_id)
 )""")
 db.commit()
+
+# Nabras daily introduction: one successful delivery per AI-enabled group per Riyadh day.
+db.execute("""CREATE TABLE IF NOT EXISTS nabras_intro_deliveries(
+    chat_id INTEGER NOT NULL, intro_date TEXT NOT NULL, sent_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id,intro_date)
+)""")
+db.commit()
 db.execute("""CREATE TABLE IF NOT EXISTS external_support_tickets(
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, group_title TEXT DEFAULT '',
     requester_id INTEGER NOT NULL, requester_name TEXT DEFAULT '', requester_username TEXT DEFAULT '',
@@ -3540,6 +3547,12 @@ async def ai_cmd(update, context):
             await msg.reply_text("اكتب سؤالك بعد الأمر، مثال:\n/ai اشرح لي مبادئ الإدارة")
             return
         await msg.reply_text("⏳ جاري إعداد الإجابة...")
+        if prompt:
+            live_calendar = await fetch_kfu_calendar_context() if _is_kfu_calendar_question(prompt) else None
+            prompt = ("أنت نَبْراس KFU. أجب عن استفسار جامعة الملك فيصل اعتمادًا على قاعدة المعرفة، ولا تخمّن.\n"
+                      + _KFU_AI_KNOWLEDGE[:52000] + "\n"
+                      + ("مقتطف التقويم الرسمي الحالي:\n" + live_calendar + "\n" if live_calendar else "")
+                      + "سؤال الطالب: " + prompt)
         answer = await openai_assistant_response(prompt, "الخاص")
         await msg.reply_text(answer or "⚠️ خدمة الذكاء الاصطناعي غير متاحة.")
         return
@@ -3572,6 +3585,15 @@ async def ai_cmd(update, context):
             await msg.reply_text("اكتب سؤالك بعد الأمر، مثال: /ai اشرح لي مبادئ الإدارة")
             return
         await msg.reply_text("⏳ جاري إعداد الإجابة...")
+        if _is_kfu_calendar_question(prompt):
+            live_calendar = await fetch_kfu_calendar_context()
+            if live_calendar:
+                prompt = ("قاعدة معلومات جامعة الملك فيصل:\n" + _KFU_AI_KNOWLEDGE[:52000]
+                          + "\nمقتطف التقويم الرسمي الذي جرى جلبه الآن:\n" + live_calendar
+                          + "\nأجب عن السؤال اعتمادًا على البيانات الصريحة فقط ولا تخمّن.\nالسؤال: " + prompt)
+        else:
+            prompt = ("قاعدة معلومات جامعة الملك فيصل:\n" + _KFU_AI_KNOWLEDGE[:52000]
+                      + "\nأجب اعتمادًا عليها عند انطباقها، ولا تخترع معلومات.\nالسؤال: " + prompt)
         answer = await openai_assistant_response(prompt, chat.title or "قروب تيليجرام")
         await msg.reply_text(answer or "⚠️ خدمة الذكاء الاصطناعي غير متاحة.")
         return
@@ -3602,6 +3624,9 @@ def _looks_like_university_question(text, message, bot_username=""):
 
     # Accept natural/colloquial question phrasing, while still requiring study-related context.
     topic_terms = _UNIVERSITY_AUTO_TERMS + (
+        "رقم جامعي", "الرقم الجامعي", "كلمة المرور", "الرقم السري", "البريد الجامعي", "الايميل الجامعي", "الإيميل الجامعي",
+        "شهادة الثانوية", "نتائجي", "توكلنا", "الدبلوم المشارك", "دبلوم مشارك", "دبلوم متوسط", "التجسير", "تغيير التخصص",
+        "الخدمات الطلابية", "تطبيق الخدمات", "مراكز الاختبار", "المراكز المتاحة", "الجامعة", "kfu",
         "مستوى", "المستوى", "ترم", "ترمات", "الفصل", "الفصول", "رسوم", "السداد", "دفع",
         "مناقشة", "مناقشات", "الحضور", "تسجيل شعب", "رقم crn", "crn", "الانسحاب",
         "التأجيل", "تأجيل", "الاعتذار", "خارطة", "الخارطة", "مركز اختبار", "مراكز الاختبار",
@@ -3619,6 +3644,196 @@ def _looks_like_university_question(text, message, bot_username=""):
     # A study-topic message can also be phrased as a short statement/request without a question mark.
     has_request_shape = any(phrase in value for phrase in ("احتاج", "أحتاج", "عندي مشكلة", "ما فهمت", "وضح", "توضيح", "حل", "مساعدة"))
     return has_topic and (has_question or has_request_shape)
+
+
+# إضافات قاعدة المعرفة التي زوّد بها المشرف في 9 نوفمبر 2026؛ تضاف ولا تستبدل المحتوى السابق.
+_KFU_AI_KNOWLEDGE += r"""
+
+------------------------------------------------------------------------
+
+## 22. الحساب الجامعي وكلمة المرور والتطبيق
+
+بعد تفعيل الرقم الجامعي يمكن للطالب محاولة استخراج كلمة مرور جديدة من رابط إعادة تعيين كلمة المرور الذي تعلنه الجامعة. إذا ظهرت رسالة «البيانات غير صالحة» فقد يكون التفعيل لم يصل بعد؛ يتم التحديث تدريجيًا ويمكن إعادة المحاولة لاحقًا.
+
+إذا ظهرت رسالة «كلمة المرور لا تتطابق مع سياسة الأمان»، راجع طريقة كتابة كلمة المرور ومتطلبات الأمان، ولا تستخدم أمثلة كلمات المرور المنشورة ككلمات مرور فعلية.
+
+تطبيق الخدمات الطلابية:
+- أجهزة Apple: https://apps.apple.com/sa/app/delit-services/id6670399673?l=ar
+- أجهزة Android: https://play.google.com/store/apps/details?id=sa.edu.kfu.studentservices
+
+البريد الجامعي وفق الصيغة التي زوّد بها المشرف: استبدال الأصفار بالرقم الجامعي ثم @student.kfu.edu.sa. لا تشارك كلمة المرور أو رمز التحقق مع أي شخص.
+
+## 23. شهادة الثانوية الأصلية
+
+يمكن طلب شهادة الثانوية أو بدل تالف/مفقود أو تعديل بيانات الشهادة أو معادلتها عبر منصة نتائجي التابعة لوزارة التعليم: https://exam.moe.gov.sa
+كما أُشير إلى إمكانية عرض الشهادة الرقمية من تطبيق توكلنا عبر الخدمات ثم وزارة التعليم ثم الشهادة الرقمية. قد تختلف الخدمات المتاحة بحسب حالة المستخدم.
+
+## 24. الأسئلة الشائعة للمستجدين
+
+- نظام الدراسة: المحاضرات أونلاين، والاختبارات حضورية في مراكز تحددها الجامعة.
+- السنة الدراسية وفق المعلومات المقدمة تتكون من فصلين، ولا يوجد فصل صيفي.
+- لا يوجد تسجيل حضور وغياب للمحاضرات المسجلة وفق النص المقدم؛ يستطيع الطالب مشاهدتها في الوقت المناسب.
+- الخارطة الأكاديمية تساعد على متابعة الواجبات والمناقشات والمحاضرات المسجلة والمباشرة، ولا يعني دخولها بحد ذاته وجود درجات إضافية.
+- اللقاءات المباشرة محاضرات تفاعلية، وتظهر أوقاتها في البلاك بورد. وقد ترفع مسجلة بعد انتهائها.
+- لا توجد اختبارات ميد وفق المعلومات المقدمة؛ توجد اختبارات نهائية.
+- جدول الاختبارات يعلن عادة قبل الاختبارات بنحو شهر وفق المعلومات المقدمة، ويجب اعتماد الإعلان الرسمي عند صدوره.
+- مصادر المذاكرة تشمل المحاضرات المسجلة والشرائح والملخصات وبنك الأسئلة، ولا يعتمد الطالب على بنك الأسئلة وحده.
+- المحاضرات المباشرة تكون غالبًا مساءً بعد الخامسة وفق المعلومات المقدمة، ويجب التحقق من جدول كل مقرر.
+- المحاضرات المسجلة الأسبوعية تنزل عادة صباح الأحد وفق المعلومات المقدمة، ويمكن مشاهدتها لاحقًا خلال المدة المحددة.
+- نمط الاختبار المذكور في المعلومات: اختيار من متعدد، 50 سؤالًا، و70 درجة. يجب مراجعة تعليمات المقرر والاختبار الحالية لاحتمال تغيرها.
+- مركز الاختبار تحدده الجامعة بحسب المدينة والمقاعد المتاحة، وتعلن المواقع قرب الاختبارات.
+- الجوال قد يكفي لبعض التخصصات، لكن تخصصات الحاسب وتقنية المعلومات قد تتطلب جهازًا مناسبًا؛ راجع متطلبات المقرر.
+- عدد مواد المستوى الأول المذكور خمسة مقررات بإجمالي 15 ساعة، وتُسجل تلقائيًا وفق المعلومات المقدمة؛ أما الفصول اللاحقة فقد يتطلب التسجيل فيها إجراءً من الطالب.
+
+## 25. الغياب عن الاختبارات النهائية
+
+وفق التعليمات التي أرسلها المشرف:
+- الغياب دون عذر مقبول قد يؤدي إلى الرسوب والتأثير في المعدل والسجل الأكاديمي، وقد يتطلب إعادة تسجيل المقرر وسداد رسومه.
+- يقدم العذر بعد الاختبارات من خلال أيقونة «التغيب عن الاختبار بعذر» في الخدمات الطلابية، ويرفق بصيغة PDF مع مستند مؤيد.
+- أمثلة الأعذار المذكورة: عذر طبي، وفاة قريب من الدرجة الأولى أو الثانية، أو ظرف عمل؛ والقبول يخضع للوائح الجامعة.
+- عند قبول العذر ذُكر خيار إعادة المقرر كاملًا أو إعادة الاختبار فقط بحسب حالة الأعمال الفصلية.
+- ورد في النص أن رسوم إعادة المقرر/الإجراء 500 ريال سواء قُبل العذر أو لم يقبل. لا تؤكد هذا المبلغ كرسوم حالية دون الرجوع إلى التقويم واللوائح الرسمية؛ فقد تتغير الرسوم والإجراءات.
+
+## 26. التقويم الزمني والروابط الرسمية
+
+رابط التقويم الزمني لجامعة الملك فيصل لعام 1448هـ:
+https://www.kfu.edu.sa/ar/Deans/E-Learning/Pages/Interactive_Calender.aspx
+تؤكد العمادة التقيد بالتواريخ المحددة في التقويم. عند السؤال عن موعد تسجيل أو اختبار أو حذف وإضافة أو اعتذار أو تخرج، يجب الرجوع إلى التقويم الرسمي الأحدث وعدم الاكتفاء بتاريخ قديم في قاعدة المعرفة.
+
+## 27. السداد والرسوم الدراسية
+
+طريقة السداد للمرشحين وفق التعليمات المرسلة:
+1. الدخول إلى بوابة القبول: https://services.kfu.edu.sa/Admission/e-learning-gate.aspx
+2. اختيار بوابة القبول للعام 1448هـ.
+3. برامج التعلم الإلكتروني والتعليم عن بعد.
+4. المدفوعات الإلكترونية.
+5. تسديد الفاتورة.
+
+تنبيه: لا تسدد الرسوم بوسيلة أخرى غير نظام المدفوعات الموضح في تعليمات الجامعة.
+
+الرسوم الواردة في النص المرسل: إجمالي تقريبي 9,500 ريال، ورسوم المستجدين 2,610 ريال (2,500 للمواد + 100 تسجيل + 10 إدارية)، وسعر الساعة 150 ريال، والمادة 500 ريال. كما ورد أن ضريبة القيمة المضافة تحتسب لغير السعوديين، وأن التخصصات تتضمن تطبيقًا ميدانيًا لمدة ستة أشهر في آخر فصل قبل التخرج. هذه أرقام تقريبية/منقولة من إعلان؛ عند السؤال عن الرسوم الحالية يجب التحقق من صفحة الجامعة والفاتورة الرسمية.
+
+## 28. التواصل الرسمي مع الجامعة
+
+وسائل التواصل الواردة في المعلومات المرسلة:
+- الخدمات الطلابية: 0135895664
+- الشؤون الأكاديمية: 0135898363
+- الشؤون المالية: 0135898361
+- الدعم الفني للبلاك بورد: 0135898360 أو 0135898370
+- الأرشيف والخريجين: 0135895688
+- الهاتف المجاني: 8003030308
+- البريد: del@kfu.edu.sa
+يُنصح بالتحقق من استمرار صلاحية الأرقام من موقع الجامعة عند الحاجة.
+
+## 29. مراكز الاختبارات المذكورة
+
+الأحساء، الجبيل، الخبر، الدمام، رأس تنورة، حفر الباطن، الخفجي، الظهران، الرياض، المجمعة، الدوادمي، الرس، الخرج، بريدة، الطائف، المدينة المنورة، جدة، مكة المكرمة، ينبع، حائل، عرعر، تبوك، أبها، خميس مشيط، بيشة، جازان، نجران، محايل عسير.
+هذه قائمة واردة في إعلان المشرف وليست ضمانًا لتوفر مركز في كل فترة؛ المركز المعتمد يظهر في خدمات الاختبارات أو إعلان الجامعة.
+
+## 30. تغيير رغبة القبول (التخصص)
+
+وفق الإعلان المرسل، يمكن للمستجدين تقديم طلب تغيير رغبة القبول عبر:
+1. الخدمات الإلكترونية: https://del-portal.kfu.edu.sa/
+2. خدمات الشؤون الأكاديمية.
+3. تغيير رغبة القبول.
+4. إرسال طلب تغيير رغبة القبول.
+5. اختيار التخصص ثم إرسال الطلب.
+توافر الأيقونة والمواعيد يخضعان لإعلان الجامعة.
+
+## 31. خدمات قروبات الابتكار وآلية العمل
+
+قروبات الابتكار تقدم المساعدة فيما يخص الدبلوم، والتسجيل، وشرح أيقونات وخدمات البوابة، وتوضيح إشعارات ورسائل الجامعة، والإجابة عن الاستفسارات الدراسية، ونشر المستجدات والإعلانات، وتنظيم المراجعات والكويزات، وتوفير ملفات وشروحات وملخصات، وقروبات متخصصة للمواد وشروحات مجانية من المشرفين.
+
+تنبيهات القروبات:
+- يمنع نشر إعلانات القروبات أو الأشخاص أو المكتبات والرسائل الدعائية دون إذن الإدارة.
+- الالتزام بالاحترام وعدم إزعاج الأعضاء أو المشرفين.
+- تحري المصداقية وعدم نقل الأخبار غير الصحيحة؛ يعتمد على المصادر الرسمية وإعلانات إدارة القروب.
+
+روابط مهمة:
+- الخدمات الطلابية: https://del-portal.kfu.edu.sa/
+- التقويم الزمني: https://www.kfu.edu.sa/ar/Deans/E-Learning/Pages/Interactive_Calender.aspx
+- البلاك بورد: https://bblms.kfu.edu.sa/webapps/login/
+- النظام الافتراضي: https://del-portal.kfu.edu.sa/vls/Login.aspx
+
+## 32. المزايا المذكورة للبريد الجامعي
+
+ورد في صورة إعلانية من قروبات الابتكار ذكر عروض أو مزايا للخدمات التالية عند استخدام البريد الجامعي: GitHub، Microsoft 365، LinkedIn Premium، Amazon Prime، YouTube Premium، Google Drive، Google One AI، Canva Pro، OneDrive، Quizlet Plus، Namecheap، وAdobe Creative Cloud.
+
+المدد والسعات والخصومات الواردة في الصورة أمثلة إعلانية وليست ضمانًا لاستحقاق كل طالب أو استمرار العرض. عند سؤال الطالب عن خدمة محددة، يشرح نبراس أن الأهلية وشروط التفعيل تختلف حسب الدولة والجامعة ومزود الخدمة، ويوجه الطالب إلى صفحة العرض الرسمية للمزود للتحقق قبل الاعتماد عليها أو إدخال بياناته.
+
+## 33. الدبلوم المشارك المهني
+
+وفق الضوابط والنص الذي أرسله المشرف:
+- الدبلوم المشارك المهني مدته سنة دراسية وفق التوضيح المرسل، ولا يعد تعليمًا عاليًا ولا يؤهل للتجسير بحسب ذلك التوضيح. كما ورد أن الترقية الوظيفية له أقل من الدبلوم المتوسط؛ يجب عدم تعميم الأثر الوظيفي دون الرجوع إلى جهة العمل واللوائح.
+- من يرغب في التخرج بدبلوم مشارك مهني يتقدم عبر الأيقونة بعد إكمال 30 ساعة وفق الإعلان المرسل.
+- من يرغب في إكمال السنتين (60 ساعة) لا يقدم طلب الدبلوم المشارك.
+- من شروط المنح اجتياز مقررات المستوى الأول في نظام الفصلين، والمستويات الأول والثاني والثالث في نظام الفصول الثلاثة، من برنامج الدبلوم المتوسط المهني المسجل به الطالب.
+- إذا تجاوز الطالب نقطة الخروج وسجل مقررات للفصل التالي ثم تقدم بطلب التخرج أثناء الفصل، ورد أن تخرجه يكون بنهاية الفصل الذي يلي نقطة التخرج، ويعامل الطالب الذي يدرس برسوم حسب لوائح وتقويم العمادة.
+- يجوز للحاصل على دبلوم مشارك مهني التقدم بطلب قبول جديد للحصول على دبلوم متوسط مهني. وتتم معادلة المقررات المشتركة فقط، سواء كان البرنامج نفسه والخطة نفسها، أو البرنامج نفسه بخطة مختلفة، أو برنامجًا مختلفًا، وفق الضوابط المذكورة.
+- لا تستنتج أن الدبلوم المشارك يتيح التجسير أو يعادل الدبلوم المتوسط. إذا سأل الطالب عن حالته، وجّهه إلى اللائحة الرسمية والكلية التطبيقية.
+
+## 34. اسم المساعد وتعريفه
+
+اسم المساعد: نَبْراس KFU.
+التعريف المعتمد حرفيًا: «أنا نَبْراس KFU مساعدك الأكاديمي الذكي المصمم لرد عن استفساراتك الدراسية بأسلوب واضح وسهل.»
+الجملة التعريفية للنشر: «أنا نَبْراس KFU، مساعدك الأكاديمي الذكي المصمم لرد عن استفساراتك الدراسية بأسلوب واضح وسهل.»
+لا تستخدم قبعة التخرج في هوية المساعد أو رسائل تعريفه؛ يمكن استخدام رموز النور أو الكتاب مثل ✨📘.
+
+------------------------------------------------------------------------
+
+## 35. قواعد دقة الإجابة والمصادر
+
+- ابدأ بقاعدة المعرفة هذه عند الإجابة عن أسئلة جامعة الملك فيصل.
+- للمواعيد المتغيرة، ارجع إلى التقويم الزمني الرسمي عند توفر الاتصال، واذكر تاريخ الاطلاع أو أن المعلومة من المصدر الرسمي.
+- لا تعتبر التواريخ أو الرسوم أو المراكز أو العروض القديمة حقيقة حالية دون تحقق.
+- إذا تعذر جلب التقويم، صرّح بتعذر الوصول وقدم الرابط الرسمي؛ لا تخمّن التاريخ.
+- لا تطلب الرقم السري أو رمز التحقق أو بيانات الدخول الحساسة، ولا تكرر أمثلة كلمات المرور كاقتراحات لإنشاء كلمة مرور.
+- ميّز بين المعلومة التي وردت من المشرف وبين ما تم التحقق منه من الموقع الرسمي.
+- لا تعرض كامل قاعدة المعرفة للعضو؛ أجب عن السؤال المحدد فقط.
+"""
+
+
+_KFU_CALENDAR_URL = "https://www.kfu.edu.sa/ar/Deans/E-Learning/Pages/Interactive_Calender.aspx"
+_KFU_CALENDAR_CACHE = {"text": "", "fetched_at": 0.0}
+
+async def fetch_kfu_calendar_context(force=False):
+    """Fetch the official KFU e-learning calendar page; cache successful text for 6 hours."""
+    cached = _KFU_CALENDAR_CACHE
+    if not force and cached["text"] and time.monotonic() - cached["fetched_at"] < 6 * 3600:
+        return cached["text"]
+    try:
+        async with httpx.AsyncClient(timeout=18.0, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0 (compatible; NabrasKFU/1.0)"}) as client:
+            response = await client.get(_KFU_CALENDAR_URL)
+            response.raise_for_status()
+            page = response.text[:1_500_000]
+        page = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", page)
+        page = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|td|h[1-6])>", "\n", page)
+        text_value = html.unescape(re.sub(r"<[^>]+>", " ", page))
+        text_value = re.sub(r"[\t\r ]+", " ", text_value)
+        text_value = re.sub(r"\n\s*\n+", "\n", text_value).strip()
+        # Keep only useful calendar-related fragments rather than sending the entire website.
+        lines = [line.strip() for line in text_value.splitlines() if line.strip()]
+        relevant = [line for line in lines if re.search(
+            r"144[0-9]|202[5-9]|التسجيل|الاختبار|الاختبارات|الحذف|الإضافة|الاعتذار|الانسحاب|التأجيل|بداية الدراسة|نهاية الدراسة|التقويم|إجازة|الفصل الدراسي",
+            line)]
+        extracted = "\n".join(relevant)[:12000]
+        if not extracted:
+            extracted = text_value[:8000]
+        if len(extracted.strip()) < 80:
+            raise ValueError("The calendar page returned insufficient readable text (possibly JavaScript-rendered).")
+        _KFU_CALENDAR_CACHE["text"] = extracted
+        _KFU_CALENDAR_CACHE["fetched_at"] = time.monotonic()
+        return extracted
+    except Exception as exc:
+        log.warning("Could not fetch official KFU calendar: %s", exc)
+        return None
+
+
+def _is_kfu_calendar_question(text):
+    value = (text or "").lower()
+    terms = ("متى", "موعد", "تاريخ", "التقويم", "الاختبارات", "اختبار", "التسجيل", "الحذف", "الإضافة", "الاعتذار", "الانسحاب", "التأجيل", "بداية الدراسة", "نهاية الدراسة", "التخرج")
+    return any(term in value for term in terms)
 
 
 async def ai_auto_group_reply(update, context):
@@ -3654,11 +3869,14 @@ async def ai_auto_group_reply(update, context):
             return
         db.execute("INSERT INTO ai_auto_reply_cooldowns(chat_id,user_id,last_reply_at) VALUES(?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET last_reply_at=excluded.last_reply_at", (chat.id, user.id, now_ts))
         db.execute("COMMIT")
-        prompt = ("أجب على سؤال العضو باعتباره استفسارًا جامعيًا. استخدم العربية وباختصار. "
-                  "استخدم قاعدة المعلومات الموثقة أدناه عند انطباقها، وحافظ على الأرقام والتواريخ والروابط كما وردت. "
-                  "لا تختلق مواعيد أو لوائح أو معلومات رسمية غير مؤكدة. إذا كانت الإجابة تعتمد على إعلان حديث أو بيانات غير متاحة، "
-                  "صرّح بذلك ووجّه العضو إلى الرابط الرسمي المناسب. لا تخرج عن موضوع الجامعة والدراسة.\\n"
-                  "قاعدة المعلومات المعتمدة:\\n" + _KFU_AI_KNOWLEDGE[:18000] + "\\nسؤال العضو: " + text[:2500])
+        live_calendar = await fetch_kfu_calendar_context() if _is_kfu_calendar_question(text) else None
+        prompt = ("أنت نَبْراس KFU، مساعد أكاديمي لجامعة الملك فيصل. أجب بالعربية وباختصار. "
+                  "استخدم قاعدة المعلومات الموثقة أدناه، وحافظ على الأرقام والروابط كما وردت. "
+                  "لا تختلق مواعيد أو لوائح. إذا وردت معلومات متعارضة، قدّم المصدر الرسمي الأحدث مع توضيح ذلك. "
+                  "إذا لم يتوفر نص التقويم الحي أو تعذر التحقق، لا تخمّن ووجّه الطالب إلى رابط التقويم الرسمي.\n"
+                  "قاعدة المعلومات المعتمدة:\n" + _KFU_AI_KNOWLEDGE[:52000] + "\n"
+                  + ("مقتطف جرى جلبه الآن من صفحة التقويم الرسمية (قد تكون الصفحة ديناميكية؛ اعتمد فقط على التواريخ الظاهرة صراحة):\n" + live_calendar + "\n" if live_calendar else "تعذر/لم يلزم جلب التقويم الحي؛ لا تدّعِ التحقق من موعد حديث.\n")
+                  + "سؤال العضو: " + text[:2500])
         answer = await openai_assistant_response(prompt, chat.title or "قروب جامعي")
         if answer:
             await message.reply_text(answer[:3900], reply_to_message_id=message.message_id)
@@ -3806,24 +4024,17 @@ async def aigroups_cmd(update, context):
             succeeded += 1
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (cid,)).fetchone()
             title = (title_row[0] if title_row else None) or str(cid)
-            welcome_result = "لم يُرسل ترحيب (تم إيقاف الذكاء)."
+            welcome_result = "لم يُرسل تعريف (تم إيقاف الذكاء)."
             if enable:
-                if not OPENAI_API_KEY:
-                    welcome_result = "تعذّر الترحيب: OPENAI_API_KEY غير مضبوط في Render."
-                else:
-                    welcome = await openai_assistant_response(
-                        f"اكتب رسالة ترحيب عربية قصيرة ولطيفة لأعضاء هذا القروب عند تفعيل المساعد الذكي. وضّح أن الذكاء الاصطناعي متاح للمساعدة والإجابة عن الأسئلة، ولا تدّعِ معرفة اسم مالك القروب. اجعلها مناسبة للنشر مباشرة، مع رموز تعبيرية قليلة.",
-                        f"رسالة ترحيب لقروب {title}"
-                    )
-                    if welcome and not welcome.startswith("⚠️"):
-                        try:
-                            await context.bot.send_message(chat_id=cid, text="🤖 تم تفعيل المساعد الذكي في هذا القروب!\n\n" + welcome[:3300])
-                            welcome_result = "تم إرسال ترحيب الذكاء الاصطناعي بنجاح."
-                        except Exception as exc:
-                            log.warning("AI welcome send failed for group %s: %s", cid, exc)
-                            welcome_result = "تعذّر إرسال الترحيب داخل القروب؛ تحقق من صلاحية البوت في إرسال الرسائل."
-                    else:
-                        welcome_result = "تعذّر إنشاء الترحيب عبر OpenAI؛ راجع إعدادات الخدمة وسجلات Render."
+                intro_message = ("✨ <b>نَبْراس KFU</b>\n"
+                                 "أنا نَبْراس KFU مساعدك الأكاديمي الذكي المصمم لرد عن استفساراتك الدراسية بأسلوب واضح وسهل.\n"
+                                 "📘 اسألني عن دراستك وخدمات جامعة الملك فيصل.")
+                try:
+                    await context.bot.send_message(chat_id=cid, text=intro_message, parse_mode="HTML", disable_web_page_preview=True)
+                    welcome_result = "تم إرسال تعريف نَبْراس KFU بنجاح."
+                except Exception as exc:
+                    log.warning("Nabras activation introduction failed for group %s: %s", cid, exc)
+                    welcome_result = "تعذّر إرسال تعريف نبراس؛ تحقق من صلاحية البوت في إرسال الرسائل."
             try:
                 await context.bot.send_message(chat_id=OWNER_ID, text=f"🤖 تحديث الذكاء الاصطناعي\nالقروب: {title}\nالمعرّف: {cid}\nالحالة: {'مفعّل' if enable else 'متوقف'}\nالنتيجة: {welcome_result}")
             except Exception as exc:
@@ -15455,7 +15666,7 @@ async def _callback_impl(update, context):
         buttons.append([InlineKeyboardButton("📍 إدارة صلاحيات قروب محدد", callback_data=f"staffgroups:{target_uid}")])
         buttons.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"deputy_manage:{target_uid}"),
                         InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")])
-        status = "\\n".join(
+        status = "\n".join(
             f"• {label}: {'ممنوحة' if cap in granted_caps else 'غير ممنوحة'}"
             for cap, label in STAFF_CAPABILITY_LABELS.items()
         )
@@ -15506,7 +15717,7 @@ async def _callback_impl(update, context):
         buttons.append([InlineKeyboardButton("📍 إدارة صلاحيات قروب محدد", callback_data=f"staffgroups:{target_uid}")])
         buttons.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"deputy_manage:{target_uid}"),
                         InlineKeyboardButton("⬅️ قائمة نواب المالك", callback_data="deputy_owner_manage")])
-        status = "\\n".join(
+        status = "\n".join(
             f"• {label}: {'ممنوحة' if item_cap in granted_caps else 'غير ممنوحة'}"
             for item_cap, label in STAFF_CAPABILITY_LABELS.items()
         )
@@ -19395,6 +19606,63 @@ async def friday_prayer_reminder_worker(app):
             await asyncio.sleep(60)
 
 
+async def nabras_daily_intro_worker(app):
+    """Publish Nabras' approved two-line introduction once daily at 22:00 Riyadh time
+    in every registered group where AI is currently enabled; never post in channels."""
+    while True:
+        try:
+            current = _riyadh_now()
+            target = current.replace(hour=22, minute=0, second=0, microsecond=0)
+            if target <= current:
+                target += timedelta(days=1)
+            await asyncio.sleep(max(5, (target - _riyadh_now()).total_seconds()))
+            day_key = _riyadh_now().date().isoformat()
+            rows = db.execute("""SELECT w.chat_id, COALESCE(NULLIF(w.title,''),CAST(w.chat_id AS TEXT))
+                FROM watched_groups w
+                LEFT JOIN ai_group_settings a ON a.chat_id=w.chat_id
+                LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
+                WHERE (COALESCE(a.enabled,0)=1 OR (COALESCE(e.is_external,0)=1 AND COALESCE(e.ai_enabled,0)=1))
+                  AND COALESCE(e.enabled,1)=1 AND COALESCE(e.is_member,1)=1
+                ORDER BY w.title""").fetchall()
+            intro = ("✨ <b>نَبْراس KFU</b>\n"
+                     "أنا نَبْراس KFU مساعدك الأكاديمي الذكي المصمم لرد عن استفساراتك الدراسية بأسلوب واضح وسهل.\n"
+                     "📘 اسألني عن دراستك وخدمات جامعة الملك فيصل.")
+            bot_user = await app.bot.get_me()
+            for chat_id, title in rows:
+                cid = int(chat_id)
+                if db.execute("SELECT 1 FROM nabras_intro_deliveries WHERE chat_id=? AND intro_date=?", (cid, day_key)).fetchone():
+                    continue
+                try:
+                    chat = await app.bot.get_chat(cid)
+                    if getattr(chat, "type", "") not in ("group", "supergroup"):
+                        continue
+                    member = await app.bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
+                    if getattr(member, "status", "") not in ("member", "administrator", "creator"):
+                        continue
+                    # Re-check enablement immediately before sending in case it was disabled after query.
+                    ext = external_group_info(cid)
+                    if ext and ext[0]:
+                        still_enabled = bool(ext[1] and ext[2] and external_group_cap_enabled(cid, "ai"))
+                    else:
+                        state = db.execute("SELECT enabled FROM ai_group_settings WHERE chat_id=?", (cid,)).fetchone()
+                        still_enabled = bool(state and state[0])
+                    if not still_enabled:
+                        continue
+                    await app.bot.send_message(chat_id=cid, text=intro, parse_mode="HTML", disable_web_page_preview=True)
+                    db.execute("INSERT OR IGNORE INTO nabras_intro_deliveries(chat_id,intro_date,sent_at) VALUES(?,?,?)", (cid, day_key, now()))
+                    db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.info("Nabras daily introduction skipped for group %s (%s): %s", cid, title, exc)
+                await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Nabras daily introduction worker failed")
+            await asyncio.sleep(60)
+
+
 async def post_init(app):
     """Start background workers on the running event loop and track them for clean shutdown."""
     worker_specs = [
@@ -19405,6 +19673,7 @@ async def post_init(app):
         (weekly_stats_worker, "weekly-group-stats-worker"),
         (daily_member_activity_worker, "daily-member-activity-worker"),
         (bot_advertisement_worker, "bot-advertisement-worker"),
+        (nabras_daily_intro_worker, "nabras-daily-intro-worker"),
         (owner_activity_audit_worker, "owner-activity-audit-worker"),
         (group_analysis_report_worker, "group-analysis-report-worker"),
         (weekly_security_review_worker, "weekly-security-review-worker"),
