@@ -3500,7 +3500,7 @@ async def openai_assistant_response(user_text, chat_title="المحادثة"):
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [
-                        {"role": "system", "content": "أنت المساعد التنفيذي لبوت تيليجرام. أجب بالعربية بوضوح واختصار. يمكنك اقتراح خطوات، لكن لا تدّعِ أنك نفذت إجراءً إداريًا داخل تيليجرام ما لم تنفذه وظيفة برمجية فعلية. لا تطلب مفاتيح أو كلمات مرور."},
+                        {"role": "system", "content": "أجب باللغة العربية فقط. التزم بالتعليمات المحددة في رسالة المستخدم، ولا تخترع معلومات. لا تطلب مفاتيح أو كلمات مرور أو رموز تحقق."},
                         {"role": "user", "content": f"السياق: {chat_title}\nالطلب: {prompt[:26000]}"}
                     ],
                     "temperature": 0.3,
@@ -3582,7 +3582,10 @@ async def ai_cmd(update, context):
                 return
         prompt = " ".join(context.args).strip()
         if not prompt:
-            await msg.reply_text("اكتب سؤالك بعد الأمر، مثال: /ai اشرح لي مبادئ الإدارة")
+            await msg.reply_text("اكتب سؤالك بعد الأمر، مثال: /ai كيف أسجل المقررات؟")
+            return
+        if not _looks_like_university_question(prompt, msg):
+            # In groups, Nabras is strictly academic and silently ignores unrelated topics.
             return
         await msg.reply_text("⏳ جاري إعداد الإجابة...")
         if _is_kfu_calendar_question(prompt):
@@ -3611,39 +3614,39 @@ _UNIVERSITY_AUTO_TERMS = (
 
 
 def _looks_like_university_question(text, message, bot_username=""):
+    """Only trigger for KFU/study questions; accept automatic detection or Nabras mention."""
     value = (text or "").strip().lower()
     if len(value) < 4 or len(value) > 2500:
         return False
-    # Explicit mention or a reply to the bot should be treated as an intentional request.
-    if bot_username and f"@{bot_username.lower()}" in value:
-        return True
-    replied = getattr(message, "reply_to_message", None)
-    replied_user = getattr(replied, "from_user", None) if replied else None
-    if replied_user and getattr(replied_user, "is_bot", False):
-        return True
 
-    # Accept natural/colloquial question phrasing, while still requiring study-related context.
+    # The explicit Nabras invocation is an additional trigger, not permission
+    # to answer unrelated topics: the message must still concern KFU/study.
+    explicit_nabras = any(token in value for token in ("نبراس", "نَبْراس", "نَبراس"))
+    if bot_username and f"@{bot_username.lower()}" in value:
+        explicit_nabras = True
+
     topic_terms = _UNIVERSITY_AUTO_TERMS + (
-        "رقم جامعي", "الرقم الجامعي", "كلمة المرور", "الرقم السري", "البريد الجامعي", "الايميل الجامعي", "الإيميل الجامعي",
-        "شهادة الثانوية", "نتائجي", "توكلنا", "الدبلوم المشارك", "دبلوم مشارك", "دبلوم متوسط", "التجسير", "تغيير التخصص",
-        "الخدمات الطلابية", "تطبيق الخدمات", "مراكز الاختبار", "المراكز المتاحة", "الجامعة", "kfu",
+        "رقم جامعي", "الرقم الجامعي", "كلمة المرور", "الرقم السري", "البريد الجامعي",
+        "الايميل الجامعي", "الإيميل الجامعي", "شهادة الثانوية", "نتائجي", "توكلنا",
+        "الدبلوم المشارك", "دبلوم مشارك", "دبلوم متوسط", "التجسير", "تغيير التخصص",
+        "الخدمات الطلابية", "تطبيق الخدمات", "مراكز الاختبار", "المراكز المتاحة", "kfu",
         "مستوى", "المستوى", "ترم", "ترمات", "الفصل", "الفصول", "رسوم", "السداد", "دفع",
-        "مناقشة", "مناقشات", "الحضور", "تسجيل شعب", "رقم crn", "crn", "الانسحاب",
-        "التأجيل", "تأجيل", "الاعتذار", "خارطة", "الخارطة", "مركز اختبار", "مراكز الاختبار",
-        "تدريب", "التدريب", "موعد", "الموعد", "مادة", "المادة", "مواد", "مقررنا", "مقرري",
-        "الدرجات", "الدرجة", "الرسوم", "الواجب", "الكويز", "الاختبار", "الاختبارات",
+        "مناقشة", "مناقشات", "الحضور", "تسجيل شعب", "رقم crn", "crn", "التأجيل",
+        "تأجيل", "الاعتذار", "خارطة", "الخارطة", "مركز اختبار", "تدريب", "التدريب",
+        "موعد", "الموعد", "مادة", "المادة", "مواد", "مقررنا", "مقرري", "الدرجات",
+        "الدرجة", "الواجب", "الكويز", "الاختبار", "الاختبارات", "البانر", "القبول"
     )
     question_phrases = (
         "متى", "كيف", "وين", "أين", "هل", "وش", "ايش", "إيش", "ماهو", "ما هي", "ماهي",
         "كم", "ليش", "لماذا", "طريقة", "اشرح", "اقدر", "أقدر", "ابغى", "أبغى", "ابي",
         "أبي", "ممكن", "لو سمحت", "عندي سؤال", "استفسار", "ساعدني", "وش اسوي", "كيف اسوي",
         "كيف أ", "هل فيه", "هل يوجد", "متى ينزل", "متى يفتح", "ما اقدر", "ما أقدر",
+        "احتاج", "أحتاج", "عندي مشكلة", "ما فهمت", "وضح", "توضيح", "حل", "مساعدة"
     )
     has_topic = any(term in value for term in topic_terms)
     has_question = any(mark in value for mark in ("?", "؟")) or any(phrase in value for phrase in question_phrases)
-    # A study-topic message can also be phrased as a short statement/request without a question mark.
-    has_request_shape = any(phrase in value for phrase in ("احتاج", "أحتاج", "عندي مشكلة", "ما فهمت", "وضح", "توضيح", "حل", "مساعدة"))
-    return has_topic and (has_question or has_request_shape)
+    # Both smart auto-detection and explicit "Nabras" invocation require a study topic.
+    return has_topic and has_question
 
 
 # إضافات قاعدة المعرفة التي زوّد بها المشرف في 9 نوفمبر 2026؛ تضاف ولا تستبدل المحتوى السابق.
@@ -3870,12 +3873,14 @@ async def ai_auto_group_reply(update, context):
         db.execute("INSERT INTO ai_auto_reply_cooldowns(chat_id,user_id,last_reply_at) VALUES(?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET last_reply_at=excluded.last_reply_at", (chat.id, user.id, now_ts))
         db.execute("COMMIT")
         live_calendar = await fetch_kfu_calendar_context() if _is_kfu_calendar_question(text) else None
-        prompt = ("أنت نَبْراس KFU، مساعد أكاديمي لجامعة الملك فيصل. أجب بالعربية وباختصار. "
-                  "استخدم قاعدة المعلومات الموثقة أدناه، وحافظ على الأرقام والروابط كما وردت. "
-                  "لا تختلق مواعيد أو لوائح. إذا وردت معلومات متعارضة، قدّم المصدر الرسمي الأحدث مع توضيح ذلك. "
-                  "إذا لم يتوفر نص التقويم الحي أو تعذر التحقق، لا تخمّن ووجّه الطالب إلى رابط التقويم الرسمي.\n"
-                  "قاعدة المعلومات المعتمدة:\n" + _KFU_AI_KNOWLEDGE[:52000] + "\n"
-                  + ("مقتطف جرى جلبه الآن من صفحة التقويم الرسمية (قد تكون الصفحة ديناميكية؛ اعتمد فقط على التواريخ الظاهرة صراحة):\n" + live_calendar + "\n" if live_calendar else "تعذر/لم يلزم جلب التقويم الحي؛ لا تدّعِ التحقق من موعد حديث.\n")
+        prompt = ("أنت نَبْراس KFU، مساعد أكاديمي لجامعة الملك فيصل داخل قروب طلابي. "
+                  "أجب باللغة العربية فقط، وبأسلوب مختصر وواضح. أجب فقط عن الاستفسارات المتعلقة بجامعة الملك فيصل والدراسة وخدماتها. "
+                  "إذا كان السؤال خارج هذا النطاق فلا تجب عنه إطلاقًا. "
+                  "اعتمد حصريًا على قاعدة معلومات الجامعة أدناه، ولا تستخدم معلومات عامة أو ملفات أو مصادر خارج القاعدة للإجابة. "
+                  "إذا لم تتضمن القاعدة إجابة مؤكدة، قل باختصار إن المعلومة غير متوفرة في قاعدة المعرفة ووجّه الطالب إلى المصدر الرسمي المناسب. "
+                  "لا تخمّن ولا تخترع مواعيد أو رسومًا أو لوائح، ولا تعرض معلومات القاعدة كاملة؛ أجب عن السؤال المحدد فقط.\n"
+                  "قاعدة معلومات جامعة الملك فيصل المعتمدة:\n" + _KFU_AI_KNOWLEDGE[:52000] + "\n"
+                  + ("مقتطف التقويم الرسمي الذي تم جلبه الآن؛ استخدم فقط المعلومات الصريحة الظاهرة فيه:\n" + live_calendar + "\n" if live_calendar else "لم يتم التحقق من التقويم الحي في هذا الطلب؛ لا تدّعِ التحقق من موعد حديث.\n")
                   + "سؤال العضو: " + text[:2500])
         answer = await openai_assistant_response(prompt, chat.title or "قروب جامعي")
         if answer:
