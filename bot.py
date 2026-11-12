@@ -182,6 +182,23 @@ db.execute("""CREATE TABLE IF NOT EXISTS linked_channels(
 )""")
 db.commit()
 
+# Unified campaigns for groups and linked channels. Additive: preserves legacy broadcast flows.
+db.execute("""CREATE TABLE IF NOT EXISTS publish_campaigns(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator_id INTEGER NOT NULL,
+    source_chat_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    targets_json TEXT NOT NULL,
+    scheduled_at TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL,
+    completed_at TEXT DEFAULT '',
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    result_text TEXT DEFAULT ''
+)""")
+db.commit()
+
 # Additive staff management system. Existing tables and data are retained.
 db.executescript("""
 CREATE TABLE IF NOT EXISTS staff_tasks(
@@ -2472,6 +2489,27 @@ def massban_groups_markup(groups, selected):
     return InlineKeyboardMarkup(rows)
 
 
+def campaign_targets_markup(available, selected):
+    """Compact mixed group/channel selector with explicit select-all and clear actions."""
+    selected_keys = {(x["kind"], int(x["id"])) for x in selected}
+    rows = []
+    for target in available[:80]:
+        key = (target["kind"], int(target["id"]))
+        mark = "✅" if key in selected_keys else "⬜"
+        prefix = "👥" if target["kind"] == "group" else "📡"
+        rows.append([InlineKeyboardButton(f"{mark} {prefix} {str(target.get('title') or target['id'])[:42]}",
+                                          callback_data=f"campaign_toggle:{target['kind']}:{target['id']}")])
+    group_count = sum(1 for x in available if x["kind"] == "group")
+    channel_count = sum(1 for x in available if x["kind"] == "channel")
+    rows.append([InlineKeyboardButton(f"👥 كل القروبات ({group_count})", callback_data="campaign_all_groups"),
+                 InlineKeyboardButton(f"📡 كل القنوات ({channel_count})", callback_data="campaign_all_channels")])
+    rows.append([InlineKeyboardButton(f"🌐 تحديد الكل ({len(available)})", callback_data="campaign_all_targets"),
+                 InlineKeyboardButton("🧹 إلغاء التحديد", callback_data="campaign_clear")])
+    rows.append([InlineKeyboardButton(f"➡️ متابعة ({len(selected_keys)})", callback_data="campaign_prepare")])
+    rows.append([InlineKeyboardButton("❌ إلغاء", callback_data="campaign_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def panel_markup(uid):
     """واجهة مرتبة حسب الدور، مع الحفاظ على جميع أقسام الإدارة السابقة."""
     # يجمع نص الزر الأيقونة الوظيفية الجديدة مع مسمى القسم السابق حتى لا تضيع أي وظيفة.
@@ -2483,7 +2521,7 @@ def panel_markup(uid):
              InlineKeyboardButton("📋 السجلات", callback_data="logs")],
         ]
         for cap, label, callback in (
-            ("publish", "📣 النشر والإعلانات", "broadcast_start"),
+            ("publish", "📣 النشر والإعلانات", "campaign_center"),
             ("welcome", "👋 الترحيب", "welcome"),
             ("settings", "⚙️ إعدادات القروبات", "settings"),
             ("tag", "📣 استدعاء التاق", "owner_tag_groups"),
@@ -2504,7 +2542,7 @@ def panel_markup(uid):
     if is_delegated_owner(uid) and not is_owner(uid):
         delegated_rows = [
             [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
-            [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
+            [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
             [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
             [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
@@ -2544,7 +2582,7 @@ def panel_markup(uid):
              InlineKeyboardButton("🩺 حالة البوت", callback_data="health")],
         ]
         if can_use_capability(uid, "publish"):
-            rows.append([InlineKeyboardButton("📣 النشر والإعلانات", callback_data="broadcast_start")])
+            rows.append([InlineKeyboardButton("📣 النشر والإعلانات", callback_data="campaign_center")])
         if can_use_capability(uid, "tag"):
             rows.append([InlineKeyboardButton("📣 استدعاء التاق", callback_data="owner_tag_groups")])
         if can_use_capability(uid, "mass_ban"):
@@ -2562,7 +2600,7 @@ def panel_markup(uid):
         if can_use_capability(uid, "protection"):
             rows.append([InlineKeyboardButton("⚡ أوامر الحماية للقروبات المصرح بها", callback_data="bulk_security")])
         if can_use_capability(uid, "publish"):
-            rows.append([InlineKeyboardButton("📣 النشر والإعلانات", callback_data="broadcast_start")])
+            rows.append([InlineKeyboardButton("📣 النشر والإعلانات", callback_data="campaign_center")])
         if can_use_capability(uid, "tag"):
             rows.append([InlineKeyboardButton("📣 استدعاء التاق", callback_data="owner_tag_groups")])
         if can_use_capability(uid, "stats"):
@@ -2590,7 +2628,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🌟 المحتوى التحفيزي اليومي", callback_data="motivation_home")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
-        [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="broadcast_start"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
+        [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
@@ -14477,6 +14515,72 @@ async def broadcast_draft_message(update, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 إدارة المالك المفوّض", callback_data="delegated_owner")]])
         )
         return
+    # Unified campaign composer: accepts text, photos, videos and documents.
+    if context.user_data.get("awaiting_campaign_content") and (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "publish")):
+        targets = context.user_data.get("campaign_selected_targets", [])
+        if not targets:
+            context.user_data.pop("awaiting_campaign_content", None)
+            await msg.reply_text("⛔ لا توجد جهات نشر محددة. ابدأ حملة جديدة من اللوحة.")
+            return
+        context.user_data["campaign_draft"] = {"chat_id": chat.id, "message_id": msg.message_id}
+        context.user_data.pop("awaiting_campaign_content", None)
+        groups_count = sum(1 for t in targets if t.get("kind") == "group")
+        channels_count = sum(1 for t in targets if t.get("kind") == "channel")
+        await msg.reply_text(
+            "👀 معاينة الحملة جاهزة\n"
+            f"القروبات: {groups_count} | القنوات: {channels_count}\n"
+            f"إجمالي الجهات: {len(targets)}\n\nاختر طريقة التنفيذ:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 نشر الآن", callback_data="campaign_publish_now")],
+                [InlineKeyboardButton("🗓️ جدولة الحملة", callback_data="campaign_schedule")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="campaign_cancel")],
+            ])
+        )
+        return
+    if context.user_data.get("awaiting_campaign_reschedule") and (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "publish")):
+        raw = (msg.text or "").strip()
+        campaign_id = int(context.user_data.get("awaiting_campaign_reschedule") or 0)
+        try:
+            scheduled = datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Riyadh"))
+            if scheduled <= datetime.now(ZoneInfo("Asia/Riyadh")):
+                raise ValueError("الموعد يجب أن يكون في المستقبل")
+        except Exception:
+            await msg.reply_text("صيغة الموعد غير صحيحة أو الموعد مضى. أرسل YYYY-MM-DD HH:MM بتوقيت السعودية.")
+            return
+        row = db.execute("SELECT creator_id,status FROM publish_campaigns WHERE id=?", (campaign_id,)).fetchone()
+        if not row or row[1] != "scheduled" or (not is_owner(user.id) and int(row[0]) != user.id):
+            context.user_data.pop("awaiting_campaign_reschedule", None)
+            await msg.reply_text("لا يمكن تعديل هذه الحملة؛ ربما نُشرت أو لا تملك صلاحية إدارتها.")
+            return
+        db.execute("UPDATE publish_campaigns SET scheduled_at=? WHERE id=? AND status='scheduled'",
+                   (scheduled.strftime("%Y-%m-%d %H:%M"), campaign_id))
+        db.commit()
+        context.user_data.pop("awaiting_campaign_reschedule", None)
+        await msg.reply_text(f"✅ تم تعديل موعد الحملة #{campaign_id} إلى {scheduled.strftime('%Y-%m-%d %H:%M')} بتوقيت السعودية.")
+        return
+    if context.user_data.get("awaiting_campaign_schedule") and (is_owner(user.id) or is_delegated_owner(user.id) or can_use_capability(user.id, "publish")):
+        raw = (msg.text or "").strip()
+        try:
+            scheduled = datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Riyadh"))
+            if scheduled <= datetime.now(ZoneInfo("Asia/Riyadh")):
+                raise ValueError("الموعد يجب أن يكون في المستقبل")
+        except Exception:
+            await msg.reply_text("صيغة الموعد غير صحيحة أو الموعد مضى. أرسل التاريخ والوقت هكذا:\n2026-11-20 21:30\nبتوقيت السعودية، أو أرسل /cancel للإلغاء.")
+            return
+        draft = context.user_data.get("campaign_draft")
+        targets = context.user_data.get("campaign_selected_targets", [])
+        if not draft or not targets:
+            context.user_data.pop("awaiting_campaign_schedule", None)
+            await msg.reply_text("انتهت صلاحية مسودة الحملة. ابدأ من جديد.")
+            return
+        cur = db.execute("INSERT INTO publish_campaigns(creator_id,source_chat_id,source_message_id,targets_json,scheduled_at,status,created_at) VALUES(?,?,?,?,?,'scheduled',?)",
+                         (user.id, draft["chat_id"], draft["message_id"], json.dumps(targets, ensure_ascii=False), scheduled.strftime("%Y-%m-%d %H:%M"), now()))
+        db.commit()
+        campaign_id = cur.lastrowid
+        for key in ("awaiting_campaign_schedule", "campaign_draft", "campaign_selected_targets"):
+            context.user_data.pop(key, None)
+        await msg.reply_text(f"✅ تمت جدولة الحملة رقم #{campaign_id}\nالموعد: {scheduled.strftime('%Y-%m-%d %H:%M')} بتوقيت السعودية.")
+        return
     # Handle an active broadcast draft BEFORE pending admin actions. Otherwise a
     # stale awaiting_admin_action flag can intercept the ad and demand a numeric ID.
     if context.user_data.get("awaiting_broadcast") and (is_owner(user.id) or is_delegated_owner(user.id)):
@@ -18505,6 +18609,132 @@ async def _callback_impl(update, context):
         ]))
         return
 
+    # Unified campaign center: one selector for owner-managed groups and linked channels.
+    if data in ("campaign_center", "broadcast_start"):
+        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+            await safe_callback_answer(q, "لا تملك صلاحية إدارة الحملات والنشر.", show_alert=True); return
+        groups = [(int(cid), title) for cid, title in owner_managed_group_rows() if await can_publish_to_live(context.bot, uid, int(cid))]
+        channels = db.execute("SELECT chat_id,title FROM linked_channels ORDER BY title").fetchall() if is_owner(uid) else []
+        context.user_data["campaign_available"] = ([{"kind":"group","id":cid,"title":title} for cid,title in groups] +
+                                                     [{"kind":"channel","id":int(cid),"title":title} for cid,title in channels])
+        context.user_data["campaign_selected_targets"] = []
+        if not context.user_data["campaign_available"]:
+            await q.edit_message_text("لا توجد قروبات أو قنوات متاحة للنشر وفق صلاحياتك.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+        await q.edit_message_text(
+            "📣 مركز الحملات والإعلانات\n\nاختر نوع الجهات ثم حدد الجهات المطلوبة. يمكنك اختيار قروبات وقنوات معاً أو تحديد الكل.",
+            reply_markup=campaign_targets_markup(context.user_data["campaign_available"], [])
+        ); return
+    if data.startswith("campaign_toggle:"):
+        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+            await safe_callback_answer(q,"لا تملك صلاحية النشر.",show_alert=True); return
+        try:
+            kind, raw_id = data.split(":",2)[1:]
+            target_id = int(raw_id)
+        except Exception:
+            await safe_callback_answer(q,"جهة نشر غير صالحة.",show_alert=True); return
+        available = context.user_data.get("campaign_available", [])
+        target = next((t for t in available if t["kind"] == kind and int(t["id"]) == target_id), None)
+        if not target:
+            await safe_callback_answer(q,"هذه الجهة غير متاحة في هذه الحملة.",show_alert=True); return
+        selected = context.user_data.setdefault("campaign_selected_targets", [])
+        key = (kind, target_id)
+        selected_keys = {(x["kind"],int(x["id"])) for x in selected}
+        if key in selected_keys:
+            selected[:] = [x for x in selected if (x["kind"],int(x["id"])) != key]
+        else:
+            selected.append({"kind":kind,"id":target_id})
+        await q.edit_message_reply_markup(reply_markup=campaign_targets_markup(available, selected)); return
+    if data in ("campaign_all_groups", "campaign_all_channels", "campaign_all_targets", "campaign_clear"):
+        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
+            await safe_callback_answer(q,"لا تملك صلاحية النشر.",show_alert=True); return
+        available = context.user_data.get("campaign_available", [])
+        if data == "campaign_all_groups": chosen = [t for t in available if t["kind"] == "group"]
+        elif data == "campaign_all_channels": chosen = [t for t in available if t["kind"] == "channel"]
+        elif data == "campaign_all_targets": chosen = list(available)
+        else: chosen = []
+        context.user_data["campaign_selected_targets"] = [{"kind":t["kind"],"id":int(t["id"])} for t in chosen]
+        await q.edit_message_reply_markup(reply_markup=campaign_targets_markup(available, context.user_data["campaign_selected_targets"])); return
+    if data == "campaign_prepare":
+        selected = context.user_data.get("campaign_selected_targets", [])
+        available_keys = {(t["kind"],int(t["id"])) for t in context.user_data.get("campaign_available", [])}
+        selected = [t for t in selected if (t.get("kind"),int(t.get("id",0))) in available_keys]
+        if not selected:
+            await safe_callback_answer(q,"حدد قروباً أو قناة واحدة على الأقل.",show_alert=True); return
+        # Recheck group authorization at the point content collection begins.
+        valid = []
+        for target in selected:
+            if target["kind"] == "group" and await can_publish_to_live(context.bot, uid, int(target["id"])):
+                valid.append(target)
+            elif target["kind"] == "channel" and is_owner(uid) and db.execute("SELECT 1 FROM linked_channels WHERE chat_id=?",(int(target["id"]),)).fetchone():
+                valid.append(target)
+        context.user_data["campaign_selected_targets"] = valid
+        if not valid:
+            await safe_callback_answer(q,"لم تعد لديك صلاحية لأي جهة محددة.",show_alert=True); return
+        context.user_data["awaiting_campaign_content"] = True
+        await q.edit_message_text(f"أرسل الإعلان الآن في الخاص (نص أو صورة أو فيديو أو ملف).\nعدد الجهات المحددة: {len(valid)}\nستظهر معاينة قبل النشر أو الجدولة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data="campaign_cancel")]])); return
+    if data == "campaign_publish_now":
+        draft = context.user_data.get("campaign_draft")
+        targets = context.user_data.get("campaign_selected_targets", [])
+        if not draft or not targets or not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid,"publish")):
+            await q.edit_message_text("انتهت صلاحية الحملة أو لا توجد صلاحية نشر. ابدأ من جديد."); return
+        sent = failed = 0
+        for target in targets:
+            try:
+                cid = int(target["id"])
+                if target["kind"] == "group":
+                    if not await can_publish_to_live(context.bot, uid, cid): raise PermissionError("لا توجد صلاحية نشر")
+                elif target["kind"] == "channel":
+                    if not is_owner(uid) or not db.execute("SELECT 1 FROM linked_channels WHERE chat_id=?",(cid,)).fetchone(): raise PermissionError("القناة غير مصرح بها")
+                else: raise ValueError("نوع جهة غير معروف")
+                await context.bot.copy_message(chat_id=cid, from_chat_id=draft["chat_id"], message_id=draft["message_id"]); sent += 1
+            except Exception as exc:
+                failed += 1; log.warning("Unified campaign immediate publish failed for %s: %s", target, exc)
+            await asyncio.sleep(0.08)
+        cur = db.execute("INSERT INTO publish_campaigns(creator_id,source_chat_id,source_message_id,targets_json,status,created_at,completed_at,success_count,failed_count,result_text) VALUES(?,?,?,?, 'completed',?,?,?,?,?)",
+                         (uid,draft["chat_id"],draft["message_id"],json.dumps(targets,ensure_ascii=False),now(),now(),sent,failed,f"نجح: {sent} | تعذر: {failed}"))
+        db.commit(); campaign_id = cur.lastrowid
+        for key in ("campaign_draft","campaign_selected_targets","campaign_available","awaiting_campaign_content"):
+            context.user_data.pop(key,None)
+        await q.edit_message_text(f"✅ اكتمل نشر الحملة #{campaign_id}\nنجح: {sent}\nتعذر: {failed}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 حملة جديدة",callback_data="campaign_center")],[InlineKeyboardButton("📋 سجل الحملات",callback_data="campaign_history")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+    if data == "campaign_schedule":
+        if not context.user_data.get("campaign_draft") or not context.user_data.get("campaign_selected_targets"):
+            await q.edit_message_text("انتهت صلاحية مسودة الحملة. ابدأ من جديد."); return
+        context.user_data["awaiting_campaign_schedule"] = True
+        await q.edit_message_text("🗓️ أرسل موعد النشر بتوقيت السعودية بهذه الصيغة:\nYYYY-MM-DD HH:MM\nمثال: 2026-11-20 21:30\nأرسل /cancel للإلغاء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data="campaign_cancel")]])); return
+    if data == "campaign_history":
+        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid,"publish")):
+            await safe_callback_answer(q,"لا تملك صلاحية عرض الحملات.",show_alert=True); return
+        if is_owner(uid): rows = db.execute("SELECT id,status,scheduled_at,success_count,failed_count FROM publish_campaigns ORDER BY id DESC LIMIT 15").fetchall()
+        else: rows = db.execute("SELECT id,status,scheduled_at,success_count,failed_count FROM publish_campaigns WHERE creator_id=? ORDER BY id DESC LIMIT 15",(uid,)).fetchall()
+        body = "📋 سجل الحملات\n\n" + ("\n".join(f"#{r[0]} — {r[1]} — {r[2] or 'فوري'} — نجاح {r[3]} / فشل {r[4]}" for r in rows) if rows else "لا توجد حملات مسجلة بعد.")
+        action_rows = []
+        for r in rows:
+            if r[1] == "scheduled":
+                action_rows.append([InlineKeyboardButton(f"🕒 تعديل موعد #{r[0]}",callback_data=f"campaign_reschedule:{r[0]}"),
+                                    InlineKeyboardButton(f"🗑️ إلغاء #{r[0]}",callback_data=f"campaign_delete:{r[0]}")])
+        action_rows += [[InlineKeyboardButton("📣 حملة جديدة",callback_data="campaign_center")], [InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]]
+        await q.edit_message_text(body, reply_markup=InlineKeyboardMarkup(action_rows)); return
+    if data.startswith("campaign_reschedule:"):
+        try: campaign_id = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q,"رقم الحملة غير صحيح.",show_alert=True); return
+        row = db.execute("SELECT creator_id,status FROM publish_campaigns WHERE id=?",(campaign_id,)).fetchone()
+        if not row or row[1] != "scheduled" or (not is_owner(uid) and int(row[0]) != uid):
+            await safe_callback_answer(q,"لا يمكنك تعديل هذه الحملة.",show_alert=True); return
+        context.user_data["awaiting_campaign_reschedule"] = campaign_id
+        await q.edit_message_text(f"🕒 أرسل الموعد الجديد للحملة #{campaign_id} بصيغة YYYY-MM-DD HH:MM بتوقيت السعودية.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ سجل الحملات",callback_data="campaign_history")]])); return
+    if data.startswith("campaign_delete:"):
+        try: campaign_id = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q,"رقم الحملة غير صحيح.",show_alert=True); return
+        row = db.execute("SELECT creator_id,status FROM publish_campaigns WHERE id=?",(campaign_id,)).fetchone()
+        if not row or row[1] != "scheduled" or (not is_owner(uid) and int(row[0]) != uid):
+            await safe_callback_answer(q,"لا يمكنك إلغاء هذه الحملة.",show_alert=True); return
+        db.execute("UPDATE publish_campaigns SET status='cancelled',completed_at=?,result_text='ألغيت قبل النشر' WHERE id=? AND status='scheduled'",(now(),campaign_id)); db.commit()
+        await q.edit_message_text(f"✅ تم إلغاء الحملة المجدولة #{campaign_id}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 سجل الحملات",callback_data="campaign_history")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+    if data == "campaign_cancel":
+        for key in ("awaiting_campaign_content","awaiting_campaign_schedule","campaign_draft","campaign_selected_targets","campaign_available"):
+            context.user_data.pop(key,None)
+        await q.edit_message_text("تم إلغاء تجهيز الحملة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 مركز الحملات والإعلانات",callback_data="campaign_center")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
+
     if data == "broadcast_start":
         if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "publish")):
             await safe_callback_answer(q, "لا تملك صلاحية النشر؛ اطلب منحها من المالك الأساسي.", show_alert=True)
@@ -18607,7 +18837,7 @@ async def _callback_impl(update, context):
         context.user_data.pop("broadcast_selected_groups", None)
         await q.edit_message_text(
             f"✅ انتهى النشر.\n\nوصل إلى: {sent} قروب\nتعذر النشر في: {failed} قروب\n\nملاحظة: يجب أن يكون البوت موجودًا في القروب ولديه صلاحية إرسال الرسائل.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إعلان آخر", callback_data="broadcast_start")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر إعلان آخر", callback_data="campaign_center")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])
         )
         return
 
@@ -19811,6 +20041,63 @@ async def nabras_daily_intro_worker(app):
             await asyncio.sleep(60)
 
 
+async def publish_campaigns_worker(app):
+    """Deliver due campaigns from persistent storage; safe across process restarts."""
+    while True:
+        try:
+            due = db.execute(
+                "SELECT id,creator_id,source_chat_id,source_message_id,targets_json FROM publish_campaigns "
+                "WHERE status='scheduled' AND scheduled_at<>'' AND scheduled_at<=? ORDER BY scheduled_at LIMIT 10",
+                (datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M"),)
+            ).fetchall()
+            for campaign_id, creator_id, source_chat_id, source_message_id, targets_json in due:
+                # Claim before sending to prevent duplicate delivery if two worker loops overlap.
+                cur = db.execute("UPDATE publish_campaigns SET status='sending' WHERE id=? AND status='scheduled'", (campaign_id,))
+                db.commit()
+                if not cur.rowcount:
+                    continue
+                try:
+                    targets = json.loads(targets_json or "[]")
+                except Exception:
+                    targets = []
+                sent = failed = 0
+                errors = []
+                for target in targets:
+                    kind, raw_id = target.get("kind"), target.get("id")
+                    try:
+                        chat_id = int(raw_id)
+                        if kind == "group":
+                            if not await can_publish_to_live(app.bot, creator_id, chat_id):
+                                raise PermissionError("انتهت صلاحية النشر في القروب")
+                        elif kind == "channel":
+                            if not is_owner(creator_id) or not db.execute("SELECT 1 FROM linked_channels WHERE chat_id=?", (chat_id,)).fetchone():
+                                raise PermissionError("القناة لم تعد مرتبطة أو لم تعد مصرحاً بها")
+                        else:
+                            raise ValueError("نوع جهة نشر غير صالح")
+                        await app.bot.copy_message(chat_id=chat_id, from_chat_id=int(source_chat_id), message_id=int(source_message_id))
+                        sent += 1
+                    except Exception as exc:
+                        failed += 1
+                        errors.append(f"{raw_id}: {str(exc)[:120]}")
+                        log.warning("Campaign %s delivery failed for %s: %s", campaign_id, raw_id, exc)
+                    await asyncio.sleep(0.08)
+                result = f"نجح: {sent}\nتعذر: {failed}"
+                if errors:
+                    result += "\n" + "\n".join(errors[:15])
+                db.execute("UPDATE publish_campaigns SET status='completed',completed_at=?,success_count=?,failed_count=?,result_text=? WHERE id=?",
+                           (now(), sent, failed, result[:3000], campaign_id))
+                db.commit()
+                try:
+                    await app.bot.send_message(int(creator_id), f"📣 اكتمل نشر الحملة #{campaign_id}\n{result}")
+                except Exception:
+                    log.info("Could not send campaign completion notice to creator %s", creator_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Campaign scheduler worker failed")
+        await asyncio.sleep(15)
+
+
 async def post_init(app):
     """Start background workers on the running event loop and track them for clean shutdown."""
     worker_specs = [
@@ -19827,6 +20114,7 @@ async def post_init(app):
         (weekly_security_review_worker, "weekly-security-review-worker"),
         (motivation_daily_worker, "motivation-daily-worker"),
         (friday_prayer_reminder_worker, "friday-prayer-reminder-worker"),
+        (publish_campaigns_worker, "publish-campaigns-worker"),
         # Disabled per owner request: stop scheduled morning/evening group greetings.
         (ensure_global_join_approval_links_worker, "global-join-approval-links-worker"),
     ]
