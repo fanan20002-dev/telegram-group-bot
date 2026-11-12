@@ -6301,12 +6301,13 @@ async def give_member_points_cmd(update, context):
     await msg.reply_text(f"✅ تم تعديل نقاط العضو {target_id} بمقدار {amount:+d}.\n⭐ الرصيد الحالي: {total}\n🏷️ اللقب الحالي: {member_title_for(chat.id,total)}")
 
 def ensure_member_title_rules(chat_id):
-    """Ensure the per-group member title rules table exists."""
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS member_title_rules("
-        "chat_id INTEGER NOT NULL, min_points INTEGER NOT NULL, title TEXT NOT NULL, "
-        "PRIMARY KEY(chat_id,min_points))"
-    )
+    """Compatibility shim: the rules table is created once during startup migrations.
+
+    This function is called on the message hot path; doing DDL here caused SQLite
+    schema checks on ordinary group messages. Keep the call sites intact while
+    avoiding repeated CREATE TABLE statements.
+    """
+    return None
 
 
 def member_title_for(chat_id, points):
