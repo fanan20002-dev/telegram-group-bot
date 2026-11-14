@@ -19417,8 +19417,31 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): return
 
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    """Bind Render's required HTTP port synchronously, then serve health checks in a daemon thread."""
+    raw_port = (os.environ.get("PORT") or "10000").strip()
+    try:
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            raise ValueError("PORT must be between 1 and 65535")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid Render PORT value: {raw_port!r}") from exc
+
+    class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    # Constructing the server binds the socket immediately. If binding fails,
+    # fail loudly before starting Telegram polling instead of silently losing
+    # Render's required open port in a background thread.
+    server = ReusableThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health-server",
+        daemon=True,
+    )
+    thread.start()
+    log.info("Render health server listening on 0.0.0.0:%s", port)
+    return server
 
 def _group_report_metrics(chat_id, title):
     """Build a privacy-minimized report from aggregates, protection settings and operational logs."""
@@ -20307,17 +20330,25 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    threading.Thread(target=start_health_server, daemon=True).start()
-    log.info("Bot started")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        timeout=30,
-        bootstrap_retries=-1,
-        read_timeout=45,
-        write_timeout=30,
-        connect_timeout=30,
-        pool_timeout=30,
-    )
+    health_server = start_health_server()
+    log.info("Bot startup continuing; HTTP health endpoint is available before Telegram polling")
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            timeout=30,
+            bootstrap_retries=-1,
+            read_timeout=45,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+        )
+    finally:
+        try:
+            health_server.shutdown()
+            health_server.server_close()
+            log.info("Render health server stopped")
+        except Exception:
+            log.exception("Error while stopping Render health server")
 
 if __name__ == "__main__":
     main()
