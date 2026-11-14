@@ -20338,14 +20338,12 @@ def main():
 
     log.info("Bot startup continuing; HTTP health endpoint is available before Telegram polling")
     try:
+        # Timeouts are configured on HTTPXRequest above. Keep run_polling()
+        # arguments limited to options supported by the installed PTB version.
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
             timeout=30,
             bootstrap_retries=-1,
-            read_timeout=45,
-            write_timeout=30,
-            connect_timeout=30,
-            pool_timeout=30,
         )
     finally:
         try:
