@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, ChatMemberHandler, ChatJoinRequestHandler
@@ -6962,6 +6963,37 @@ async def chat_member_handler(update, context):
         await sync_group_link_record(context.bot, chat_id, member_event=True)
     except Exception:
         log.exception("Group-link directory update failed for membership event chat=%s", chat_id)
+
+    # Always alert the primary owner and deputies when a member is kicked/banned,
+    # regardless of public leave-alert settings or who performed the action.
+    if member and not member.is_bot and old in ("member", "administrator", "restricted") and new == "kicked":
+        actor = getattr(cm, "from_user", None)
+        actor_name = getattr(actor, "full_name", None) or "غير معروف"
+        actor_id = int(getattr(actor, "id", 0) or 0)
+        actor_username = getattr(actor, "username", None)
+        actor_line = f"👮 منفّذ الطرد: {actor_name} (ID: {actor_id or 'غير متوفر'})"
+        if actor_username:
+            actor_line += f" — @{actor_username}"
+        notice = (
+            "🚨 إشعار طرد عضو من القروب\n"
+            f"👥 القروب: {cm.chat.title or chat_id}\n"
+            f"👤 العضو: {member.full_name or 'عضو'}\n"
+            f"🆔 معرّف العضو: {member.id}\n"
+            f"{actor_line}\n"
+            f"🕒 الوقت: {_riyadh_now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        recipients = {int(OWNER_ID)} if OWNER_ID else set()
+        try:
+            recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
+            for recipient in sorted(recipients):
+                try:
+                    await context.bot.send_message(chat_id=recipient, text=notice)
+                except Exception as exc:
+                    log.warning("Kick notification failed recipient=%s chat=%s member=%s: %s", recipient, chat_id, member.id, exc)
+            log.info("KICK_ALERT_PROCESSED chat_id=%s member_id=%s actor_id=%s recipients=%s", chat_id, member.id, actor_id, sorted(recipients))
+        except Exception:
+            log.exception("Kick alert construction failed chat_id=%s member_id=%s", chat_id, member.id)
+
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
         # The primary owner and every registered deputy are explicitly allowed to add
@@ -19698,7 +19730,11 @@ async def active_group_refresh_worker(app):
     await asyncio.sleep(30)
     while True:
         try:
-            bot_user = await app.bot.get_me()
+            # Application.initialize() has already called getMe before post_init.
+            # Reuse the cached bot id instead of making another network request every cycle.
+            bot_user_id = app.bot.id
+            if not bot_user_id:
+                raise RuntimeError("Telegram bot identity is unavailable after initialization")
             rows = db.execute("""SELECT chat_id, title, COALESCE(is_member,1), COALESCE(is_external,1)
                 FROM external_group_control
                 UNION
@@ -20208,7 +20244,32 @@ async def owner_activity_audit_worker(app):
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
-    app = Application.builder().token(TOKEN).post_init(post_init).post_stop(post_stop).build()
+    # Keep long polling in its own HTTP connection pool so background jobs and
+    # replies cannot starve getUpdates. Longer timeouts tolerate transient latency
+    # between Render and Telegram without dropping the polling loop.
+    telegram_request = HTTPXRequest(
+        connection_pool_size=64,
+        connect_timeout=20.0,
+        read_timeout=45.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+    polling_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=20.0,
+        read_timeout=65.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(telegram_request)
+        .get_updates_request(polling_request)
+        .post_init(post_init)
+        .post_stop(post_stop)
+        .build()
+    )
 
     command_handlers = {
         "stats_on": owner_group_feature_command, "stats_off": owner_group_feature_command, "joinalerts_on": owner_group_feature_command, "joinalerts_off": owner_group_feature_command, "leavealerts_on": owner_group_feature_command, "leavealerts_off": owner_group_feature_command, "analysis_on": owner_group_feature_command, "analysis_off": owner_group_feature_command, "joinapproval_on": owner_group_feature_command, "joinapproval_off": owner_group_feature_command, "lockall": lock_all_messages_command, "unlockall": lock_all_messages_command,
@@ -20282,8 +20343,18 @@ def main():
     app.add_error_handler(error_handler)
 
     threading.Thread(target=start_health_server, daemon=True).start()
-    log.info("Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Starting Telegram bot polling with dedicated long-polling transport")
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        read_timeout=65.0,
+        write_timeout=30.0,
+        connect_timeout=20.0,
+        pool_timeout=20.0,
+        bootstrap_retries=-1,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
 
 if __name__ == "__main__":
     main()
