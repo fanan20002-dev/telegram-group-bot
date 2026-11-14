@@ -881,6 +881,13 @@ if not db.execute("SELECT 1 FROM join_approval_open_migration WHERE id=1").fetch
     db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1", (datetime.now(timezone.utc).isoformat(),))
     db.execute("UPDATE group_feature_settings SET join_approval_enabled=0,updated_at=?", (datetime.now(timezone.utc).isoformat(),))
     db.execute("INSERT INTO join_approval_open_migration(id,applied_at) VALUES(1,?)", (datetime.now(timezone.utc).isoformat(),))
+# One-time repair for deployments that retained the old forced-approval state.
+# Only owner-managed groups are changed; external groups keep their own settings.
+db.execute("CREATE TABLE IF NOT EXISTS join_approval_open_migration_v2 (id INTEGER PRIMARY KEY CHECK(id=1), applied_at TEXT NOT NULL)")
+if not db.execute("SELECT 1 FROM join_approval_open_migration_v2 WHERE id=1").fetchone():
+    db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1", (datetime.now(timezone.utc).isoformat(),))
+    db.execute("UPDATE group_feature_settings SET join_approval_enabled=0,updated_at=? WHERE chat_id IN (SELECT w.chat_id FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id WHERE e.chat_id IS NULL OR COALESCE(e.is_external,0)=0)", (datetime.now(timezone.utc).isoformat(),))
+    db.execute("INSERT INTO join_approval_open_migration_v2(id,applied_at) VALUES(1,?)", (datetime.now(timezone.utc).isoformat(),))
 db.commit()
 
 def global_join_approval_enabled():
@@ -1515,7 +1522,9 @@ async def can_access_group(bot, uid, chat_id):
         return False
     if not is_owner(uid) and not external_group_active(chat_id):
         return False
-    if is_owner(uid):
+    if is_owner(uid) or is_deputy_owner(uid):
+        # The registered deputy has access to every registered group in the bot panel.
+        # Telegram's own administrator rights are still checked by each API action.
         return True
     if is_delegated_owner(uid) or is_general_manager(uid) or is_protection_manager(uid):
         return True
@@ -1535,8 +1544,7 @@ async def can_access_group(bot, uid, chat_id):
 
 async def accessible_groups(bot, uid):
     groups = db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
-    if (is_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)
-            or (is_deputy_owner(uid) and can_manage_external_groups(uid))):
+    if (is_owner(uid) or is_deputy_owner(uid) or is_general_manager(uid) or is_protection_manager(uid)):
         return groups
     allowed = []
     for chat_id, title in groups:
@@ -2531,6 +2539,7 @@ def panel_markup(uid):
         deputy_rows = [
             [InlineKeyboardButton("🛡️ الحماية", callback_data="security_groups"),
              InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="administration_groups")],
+            [InlineKeyboardButton("🚪 فتح/قفل إضافة الأعضاء", callback_data="group_controls")],
             [InlineKeyboardButton("📊 الإحصائيات", callback_data="statistics"),
              InlineKeyboardButton("📋 السجلات", callback_data="logs")],
         ]
@@ -5865,7 +5874,7 @@ def restricted_groups_markup(uid):
     groups = db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM watched_groups ORDER BY title,chat_id LIMIT 80").fetchall()
     rows = []
     for cid,title in groups:
-        if is_owner(uid) or can_use_capability(uid, "reentry", int(cid)) or can_use_capability(uid, "join_approval", int(cid)):
+        if is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "reentry", int(cid)) or can_use_capability(uid, "join_approval", int(cid)):
             pending = db.execute("SELECT COUNT(*) FROM reentry_restrictions WHERE chat_id=? AND status IN ('pending','blocked')", (cid,)).fetchone()[0]
             requests = db.execute("SELECT COUNT(*) FROM join_request_events WHERE chat_id=? AND status='pending'", (cid,)).fetchone()[0]
             rows.append([InlineKeyboardButton(f"🚫 {str(title)[:32]} · مطرودون {pending} · طلبات {requests}", callback_data=f"restricted_group:{int(cid)}")])
@@ -6915,11 +6924,12 @@ async def my_chat_member_handler(update, context):
 
 
 def is_authorized_manual_add(chat_id, member, actor):
-    """True only when the primary owner or a registered deputy directly added the member.
+    """Allow direct additions by the bot owner or any registered deputy in every group.
 
-    Joins through invite links (including approved join requests) must retain the
-    normal public join notice and welcome. Telegram reports the joining user as
-    from_user for ordinary self-joins; direct additions have a different actor.
+    This authorization is deliberately independent of watched_groups/external_group_control,
+    per-group join approval, and previous join-request/re-entry records. Telegram's own
+    permission checks still apply: the actor must be allowed by Telegram to invite users.
+    A self-join is never treated as an authorized manual addition.
     """
     if not member or not actor:
         return False
@@ -6927,19 +6937,14 @@ def is_authorized_manual_add(chat_id, member, actor):
     member_id = int(getattr(member, "id", 0) or 0)
     if not actor_id or actor_id == member_id:
         return False
-    if not (is_owner(actor_id) or is_deputy_owner(actor_id)):
-        return False
-    # A previously approved link request is a link-based entry, not a manual add.
     try:
-        approved = db.execute(
-            "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?",
-            (int(chat_id), member_id),
-        ).fetchone()
-        if approved and approved[0] in ("approved", "joined"):
-            return False
+        authorized = bool(is_owner(actor_id) or is_deputy_owner(actor_id))
     except Exception:
-        log.exception("Could not classify approved join request chat_id=%s user_id=%s", chat_id, member_id)
-    return True
+        log.exception("Could not verify owner/deputy actor=%s chat=%s", actor_id, chat_id)
+        return False
+    if authorized:
+        log.info("OWNER_DEPUTY_ADD_AUTHORIZED chat_id=%s actor_id=%s member_id=%s", chat_id, actor_id, member_id)
+    return authorized
 
 
 async def chat_member_handler(update, context):
@@ -6959,8 +6964,10 @@ async def chat_member_handler(update, context):
         log.exception("Group-link directory update failed for membership event chat=%s", chat_id)
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
         # Telegram identifies the actor who added the user in chat_member.from_user.
-        # The primary owner and registered deputy owners are explicitly allowed to add
-        # members directly, including members with older re-entry/global-ban records.
+        # The primary owner and every registered deputy are explicitly allowed to add
+        # members in ALL registered/observed groups, including external groups and
+        # members with older approval/re-entry/global-ban records. Telegram invite rights
+        # remain authoritative; the bot cannot override a Telegram API denial.
         # Telegram's ChatMemberUpdated.from_user is the authoritative actor for an
         # actual membership transition. Do not use Message.from_user for enforcement:
         # service messages can omit or misrepresent the actor on some update paths.
@@ -15135,14 +15142,14 @@ async def _callback_impl(update, context):
         return
 
     if data == "group_controls":
-        if not is_owner(uid):
-            await safe_callback_answer(q, "إعدادات التحليل والإشعارات العامة للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "إعدادات القروبات متاحة للمالك الأساسي ونائب المالك.", show_alert=True); return
         await q.edit_message_text("⚙️ تحكم الإحصائيات والإشعارات والتحليل\nاختر القروب لتعديل إعداداته بشكل مستقل. إيقاف التحليل لا يعطل الحماية أو تسجيل أحداث الدخول والخروج.", reply_markup=group_controls_list_markup())
         return
 
     if data.startswith("gctrl_group:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذه الإعدادات للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "هذه الإعدادات متاحة للمالك الأساسي ونائب المالك.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
         row = db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -15151,19 +15158,21 @@ async def _callback_impl(update, context):
         await q.edit_message_text(f"⚙️ إعدادات القروب: {title or chat_id}\n\nالأزرار تعرض الحالة الحالية. اختر أي إعداد لتشغيله أو إيقافه.", reply_markup=group_controls_markup(chat_id)); return
 
     if data.startswith("gctrl_toggle:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "هذه الإعدادات للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "هذه الإعدادات متاحة للمالك الأساسي ونائب المالك.", show_alert=True); return
         try: _, chat_raw, feature = data.split(":", 2); chat_id = int(chat_raw)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         allowed_features = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
         if feature not in allowed_features or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
             await safe_callback_answer(q, "الإعداد غير صالح.", show_alert=True); return
+        # The deputy may open/close the join gate. Other global group settings remain
+        # restricted to the primary owner. Opening the gate is never blocked by a
+        # stale legacy 'mandatory approval' condition.
+        if feature != "join_approval_enabled" and not is_owner(uid):
+            await safe_callback_answer(q, "هذا الإعداد للمالك الأساسي فقط.", show_alert=True); return
         if (feature == "join_approval_enabled" and global_join_approval_enabled()
                 and is_owner_managed_group(chat_id)):
-            await safe_callback_answer(q, "قفل الدخول المركزي مفعّل لقروبات المالك فقط. أوقفه من الزر الرئيسي أولًا إذا أردت تعديل قروب المالك منفردًا.", show_alert=True); return
-        if feature == "join_approval_enabled":
-            await safe_callback_answer(q, "🔐 اشتراط الموافقة على الانضمام إلزامي للقروبات المسجلة، ولا يمكن إيقافه من هذه اللوحة.", show_alert=True)
-            return
+            await safe_callback_answer(q, "أوقف قفل الدخول المركزي أولًا من لوحة التحكم.", show_alert=True); return
         new_state = not group_feature_enabled(chat_id, feature)
         set_group_feature(chat_id, feature, new_state)
         if feature == "join_approval_enabled" and not new_state:
@@ -15187,8 +15196,8 @@ async def _callback_impl(update, context):
         await q.edit_message_text(f"تم {'تشغيل' if new_state else 'إيقاف'} الإعداد بنجاح.{note}", reply_markup=group_controls_markup(chat_id)); return
 
     if data.startswith("gctrl_link:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "إنشاء روابط الدعوة للمالك الأساسي فقط.", show_alert=True); return
+        if not (is_owner(uid) or is_deputy_owner(uid)):
+            await safe_callback_answer(q, "إنشاء روابط طلب الانضمام متاح للمالك ونائبه.", show_alert=True); return
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
         if not group_feature_enabled(chat_id, "join_approval_enabled"):
@@ -15203,14 +15212,14 @@ async def _callback_impl(update, context):
         return
 
     if data == "restricted_members":
-        if not (is_owner(uid) or capability_group_ids(uid, "reentry") or capability_group_ids(uid, "join_approval")):
+        if not (is_owner(uid) or is_deputy_owner(uid) or capability_group_ids(uid, "reentry") or capability_group_ids(uid, "join_approval")):
             await safe_callback_answer(q, "تحتاج إلى صلاحية مراجعة المطرودين أو طلبات الانضمام.", show_alert=True); return
         await q.edit_message_text("🚫 المحظورون والمرفوضون وطلبات العودة\nاختر قروبًا لمراجعة سجلات الطرد وطلبات الانضمام. يعتمد التعرف على العضو على Telegram ID الثابت.", reply_markup=restricted_groups_markup(uid)); return
 
     if data.startswith("restricted_group:"):
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
-        if not (is_owner(uid) or can_use_capability(uid, "reentry", chat_id) or can_use_capability(uid, "join_approval", chat_id)):
+        if not (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id) or can_use_capability(uid, "join_approval", chat_id)):
             await safe_callback_answer(q, "لا تملك صلاحية مراجعة هذا القروب.", show_alert=True); return
         title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
         title = title_row[0] if title_row else str(chat_id)
@@ -15225,7 +15234,7 @@ async def _callback_impl(update, context):
         lines += ["", "طلبات الانضمام الأخيرة:"]
         for user_id,name,username,status,requested in requests:
             lines.append(f"• {name or user_id} — ID {user_id} — {status}")
-            if status == "pending" and (is_owner(uid) or can_use_capability(uid, "join_approval", chat_id) or can_use_capability(uid, "reentry", chat_id)):
+            if status == "pending" and (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "join_approval", chat_id) or can_use_capability(uid, "reentry", chat_id)):
                 rows.append([InlineKeyboardButton(f"✅ قبول {str(name or user_id)[:20]}", callback_data=f"joinreq_approve:{chat_id}:{user_id}"), InlineKeyboardButton("❌ رفض", callback_data=f"joinreq_deny:{chat_id}:{user_id}")])
         if not bans and not requests: lines.append("لا توجد سجلات مسجلة لهذا القروب حتى الآن.")
         rows.append([InlineKeyboardButton("⬅️ القروبات", callback_data="restricted_members"), InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
@@ -17847,7 +17856,7 @@ async def _callback_impl(update, context):
         return
 
     if data in ("administration", "administration_groups"):
-        if not (is_owner(uid) or is_general_manager(uid) or is_delegated_owner(uid)):
+        if not (is_owner(uid) or is_deputy_owner(uid) or is_general_manager(uid) or is_delegated_owner(uid)):
             await q.edit_message_text("⛔ ليس لديك صلاحية الإدارة."); return
         groups = await accessible_groups(context.bot, uid)
         rows = [[InlineKeyboardButton(f"🔨 {title or cid}", callback_data=f"admin_group:{cid}")] for cid,title in groups[:30]]
