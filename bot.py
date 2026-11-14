@@ -873,15 +873,14 @@ db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
     PRIMARY KEY(chat_id,invite_link)
 )""")
 db.execute("DELETE FROM motivation_groups WHERE chat_id NOT IN (SELECT w.chat_id FROM watched_groups w JOIN external_group_control e ON e.chat_id=w.chat_id WHERE e.is_external=0)")
-# Mandatory approval-first entry: enable it for every currently active registered group,
-# both owner-managed/internal and external groups where the bot is still present.
-# Historical/inactive groups are not altered.
-db.execute("""INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at)
-    SELECT chat_id,1,? FROM watched_groups WHERE 1
-    ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at""", (datetime.now(timezone.utc).isoformat(),))
-db.execute("""INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at)
-    SELECT chat_id,1,? FROM external_group_control WHERE COALESCE(enabled,0)=1 AND COALESCE(is_member,0)=1
-    ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at""", (datetime.now(timezone.utc).isoformat(),))
+# One-time migration: open entry in every already-registered group.  The old build
+# forced approval on at every startup, which blocked normal additions.  A marker
+# prevents this migration from overwriting future owner-selected per-group settings.
+db.execute("CREATE TABLE IF NOT EXISTS join_approval_open_migration (id INTEGER PRIMARY KEY CHECK(id=1), applied_at TEXT NOT NULL)")
+if not db.execute("SELECT 1 FROM join_approval_open_migration WHERE id=1").fetchone():
+    db.execute("UPDATE global_join_approval_settings SET enabled=0,updated_at=?,updated_by=0 WHERE id=1", (datetime.now(timezone.utc).isoformat(),))
+    db.execute("UPDATE group_feature_settings SET join_approval_enabled=0,updated_at=?", (datetime.now(timezone.utc).isoformat(),))
+    db.execute("INSERT INTO join_approval_open_migration(id,applied_at) VALUES(1,?)", (datetime.now(timezone.utc).isoformat(),))
 db.commit()
 
 def global_join_approval_enabled():
@@ -948,10 +947,9 @@ def group_feature_enabled(chat_id, feature):
     row = db.execute(f"SELECT {feature} FROM group_feature_settings WHERE chat_id=?", (chat_id,)).fetchone()
     if row:
         return bool(row[0])
-    # Mandatory join approval is the default for ALL managed/internal and external groups.
-    # Explicit per-group settings can still be stored for UI/state, but missing settings
-    # must never silently allow auto-approval.
-    return True if feature == "join_approval_enabled" else True
+    # Open entry is the default. Approval is enabled only when the owner explicitly
+    # turns it on for a group.
+    return False if feature == "join_approval_enabled" else True
 
 def set_group_feature(chat_id, feature, enabled):
     allowed = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
@@ -1775,8 +1773,8 @@ def register_group(chat, actor=None):
         db.execute("""INSERT OR IGNORE INTO external_group_capabilities
             (chat_id,capability,enabled,granted_by,granted_at) VALUES(?,?,?,?,?)""",
             (chat.id, _cap, _enabled, OWNER_ID, now()))
-    # New group registrations begin with approval-required entry by default.
-    db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,1,?) ON CONFLICT(chat_id) DO UPDATE SET join_approval_enabled=1,updated_at=excluded.updated_at", (int(chat.id), now()))
+    # Newly registered groups are open for entry by default.
+    db.execute("INSERT INTO group_feature_settings(chat_id,join_approval_enabled,updated_at) VALUES(?,0,?) ON CONFLICT(chat_id) DO NOTHING", (int(chat.id), now()))
     db.commit()
     ensure_settings(chat.id)
     ensure_auto_replies(chat.id)
@@ -6783,23 +6781,11 @@ async def chat_join_request_handler(update, context):
             f"اسم المستخدم: @{user.username or 'غير متوفر'}\nالمعرّف: {user.id}\n"
             + (f"⚠️ تنبيه: لهذا العضو سجل سابق: {prior[1] or prior[0]}. فك الحظر وحده لا يُعد موافقة على العودة.\n" if restricted else "")
             + "اختر الموافقة أو الرفض. لا يُقبل الطلب إلا من مسؤول مخوّل.")
-    # Route requests to the bot owner, destination creator, deputy owners for
-    # internal groups, and staff explicitly granted join_approval for this chat.
-    ext_info = external_group_info(chat.id)
-    is_external = bool(ext_info and int(ext_info[0] or 0) == 1)
+    # Join-request decisions are routed only to the primary owner and registered
+    # deputies, consistently across every group (including external groups).
     recipients = {int(OWNER_ID)} if OWNER_ID else set()
-    if not is_external and chat.type != ChatType.CHANNEL:
+    if chat.type != ChatType.CHANNEL:
         recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
-    try:
-        admins = await context.bot.get_chat_administrators(chat.id)
-        creator = next((admin.user for admin in admins if getattr(admin, "status", "") == "creator"), None)
-        if creator:
-            recipients.add(int(creator.id))
-    except Exception as exc:
-        log.info("Could not resolve join-request creator chat=%s: %s", chat.id, exc)
-    candidates = db.execute("SELECT DISTINCT user_id FROM staff_capabilities WHERE capability='join_approval'").fetchall()
-    recipients.update(int(row[0]) for row in candidates
-                      if can_use_capability(int(row[0]), "join_approval", int(chat.id)))
     for recipient in recipients:
         try:
             await context.bot.send_message(chat_id=recipient, text=text, reply_markup=keyboard)
@@ -6929,7 +6915,7 @@ async def my_chat_member_handler(update, context):
 
 
 def is_authorized_manual_add(chat_id, member, actor):
-    """True only when primary owner, deputy, or delegated owner directly added the member.
+    """True only when the primary owner or a registered deputy directly added the member.
 
     Joins through invite links (including approved join requests) must retain the
     normal public join notice and welcome. Telegram reports the joining user as
@@ -6941,7 +6927,7 @@ def is_authorized_manual_add(chat_id, member, actor):
     member_id = int(getattr(member, "id", 0) or 0)
     if not actor_id or actor_id == member_id:
         return False
-    if not (is_owner(actor_id) or is_deputy_owner(actor_id) or is_delegated_owner(actor_id)):
+    if not (is_owner(actor_id) or is_deputy_owner(actor_id)):
         return False
     # A previously approved link request is a link-based entry, not a manual add.
     try:
@@ -15264,17 +15250,9 @@ async def _callback_impl(update, context):
         except Exception:
             _target_is_channel = False
         is_external_request_group = bool(ext_info and int(ext_info[0] or 0) == 1) or _target_is_channel
-        # Owner, destination creator, internal deputy, or a staff member with
-        # explicit global/group-scoped join_approval permission may decide.
-        authorized_approver = bool(is_owner(uid) or can_use_capability(uid, "join_approval", chat_id))
-        if not is_external_request_group and is_deputy_owner(uid):
-            authorized_approver = True
-        try:
-            member_status = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
-            if getattr(member_status, "status", "") == "creator":
-                authorized_approver = True
-        except Exception as exc:
-            log.debug("Could not verify creator status uid=%s chat=%s: %s", uid, chat_id, exc)
+        # Only the primary owner and registered deputies may accept or reject.
+        # Telegram group creators and delegated staff do not gain this bot-level role.
+        authorized_approver = bool(is_owner(uid) or is_deputy_owner(uid))
         if not authorized_approver:
             await safe_callback_answer(q, "لا تملك صلاحية قبول أو رفض طلبات الانضمام لهذا القروب.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
@@ -17443,18 +17421,8 @@ async def _callback_impl(update, context):
         except ValueError:
             await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
             return
-        # Public games may run in any registered, active group (including external groups).
-        # Keep owner-managed and external group classification unchanged.
-        group_registered = db.execute(
-            """SELECT 1 FROM watched_groups WHERE chat_id=?
-               UNION ALL
-               SELECT 1 FROM external_group_control
-               WHERE chat_id=? AND COALESCE(enabled,0)=1 AND COALESCE(is_member,1)=1
-               LIMIT 1""",
-            (chat_id, chat_id),
-        ).fetchone()
-        if not group_registered:
-            await safe_callback_answer(q, "هذا القروب غير مسجل أو أن البوت غير نشط فيه.", show_alert=True)
+        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
+            await safe_callback_answer(q, "هذا القروب غير مسجل.", show_alert=True)
             return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         db.commit()
@@ -18024,15 +17992,7 @@ async def _callback_impl(update, context):
             "case": ("🕵️ ملف القضية", "حل لغز اليوم واختر الإجابة الصحيحة."),
             "season": ("🏆 موسم التحديات", "أنجز مهمة اليوم وواصل سلسلة إنجازاتك.")
         }
-        group_registered = db.execute(
-            """SELECT 1 FROM watched_groups WHERE chat_id=?
-               UNION ALL
-               SELECT 1 FROM external_group_control
-               WHERE chat_id=? AND COALESCE(enabled,0)=1 AND COALESCE(is_member,1)=1
-               LIMIT 1""",
-            (chat_id, chat_id),
-        ).fetchone()
-        if game_key not in game_names or not group_registered:
+        if game_key not in game_names or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone():
             await safe_callback_answer(q, "اللعبة أو القروب غير متاح.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
