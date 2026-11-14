@@ -17443,8 +17443,18 @@ async def _callback_impl(update, context):
         except ValueError:
             await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True)
             return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone():
-            await safe_callback_answer(q, "هذا القروب غير مسجل.", show_alert=True)
+        # Public games may run in any registered, active group (including external groups).
+        # Keep owner-managed and external group classification unchanged.
+        group_registered = db.execute(
+            """SELECT 1 FROM watched_groups WHERE chat_id=?
+               UNION ALL
+               SELECT 1 FROM external_group_control
+               WHERE chat_id=? AND COALESCE(enabled,0)=1 AND COALESCE(is_member,1)=1
+               LIMIT 1""",
+            (chat_id, chat_id),
+        ).fetchone()
+        if not group_registered:
+            await safe_callback_answer(q, "هذا القروب غير مسجل أو أن البوت غير نشط فيه.", show_alert=True)
             return
         db.execute("INSERT OR IGNORE INTO game_config(chat_id,enabled,challenge_enabled) VALUES(?,1,1)", (chat_id,))
         db.commit()
@@ -18014,7 +18024,15 @@ async def _callback_impl(update, context):
             "case": ("🕵️ ملف القضية", "حل لغز اليوم واختر الإجابة الصحيحة."),
             "season": ("🏆 موسم التحديات", "أنجز مهمة اليوم وواصل سلسلة إنجازاتك.")
         }
-        if game_key not in game_names or not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?",(chat_id,)).fetchone():
+        group_registered = db.execute(
+            """SELECT 1 FROM watched_groups WHERE chat_id=?
+               UNION ALL
+               SELECT 1 FROM external_group_control
+               WHERE chat_id=? AND COALESCE(enabled,0)=1 AND COALESCE(is_member,1)=1
+               LIMIT 1""",
+            (chat_id, chat_id),
+        ).fetchone()
+        if game_key not in game_names or not group_registered:
             await safe_callback_answer(q, "اللعبة أو القروب غير متاح.", show_alert=True); return
         cfg=db.execute("SELECT enabled FROM game_config WHERE chat_id=?",(chat_id,)).fetchone()
         flag=db.execute("SELECT enabled FROM persistent_game_flags WHERE chat_id=? AND game_key=?",(chat_id,game_key)).fetchone()
