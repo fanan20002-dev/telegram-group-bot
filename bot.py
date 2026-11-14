@@ -19373,8 +19373,15 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         from urllib.parse import urlparse
         path = urlparse(self.path).path
-        if path == "/health":
-            raw=b"Telegram bot is running."; self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(raw); return
+        if path in ("/", "/health"):
+            raw=b"Telegram bot is running."
+            self.send_response(200)
+            self.send_header("Content-Type","text/plain; charset=utf-8")
+            self.send_header("Cache-Control","no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         self.send_error(404)
     def do_POST(self):
         from urllib.parse import urlparse
@@ -19434,13 +19441,25 @@ def start_health_server():
     # fail loudly before starting Telegram polling instead of silently losing
     # Render's required open port in a background thread.
     server = ReusableThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    server.timeout = 5
     thread = threading.Thread(
         target=server.serve_forever,
+        kwargs={"poll_interval": 0.5},
         name="render-health-server",
         daemon=True,
     )
     thread.start()
-    log.info("Render health server listening on 0.0.0.0:%s", port)
+    if not thread.is_alive():
+        server.server_close()
+        raise RuntimeError("Render health server thread failed to start")
+    # Keep an explicit reference for the lifetime of the application and log
+    # the actual bound address/port so Render startup diagnostics are unambiguous.
+    server._health_thread = thread
+    log.info(
+        "RENDER_PORT_READY host=%s port=%s health_paths=/,/health",
+        server.server_address[0],
+        server.server_address[1],
+    )
     return server
 
 def _group_report_metrics(chat_id, title):
