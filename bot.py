@@ -19373,15 +19373,8 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         from urllib.parse import urlparse
         path = urlparse(self.path).path
-        if path in ("/", "/health"):
-            raw=b"Telegram bot is running."
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain; charset=utf-8")
-            self.send_header("Cache-Control","no-store")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-            return
+        if path == "/health":
+            raw=b"Telegram bot is running."; self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(raw); return
         self.send_error(404)
     def do_POST(self):
         from urllib.parse import urlparse
@@ -19441,25 +19434,13 @@ def start_health_server():
     # fail loudly before starting Telegram polling instead of silently losing
     # Render's required open port in a background thread.
     server = ReusableThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    server.timeout = 5
     thread = threading.Thread(
         target=server.serve_forever,
-        kwargs={"poll_interval": 0.5},
         name="render-health-server",
         daemon=True,
     )
     thread.start()
-    if not thread.is_alive():
-        server.server_close()
-        raise RuntimeError("Render health server thread failed to start")
-    # Keep an explicit reference for the lifetime of the application and log
-    # the actual bound address/port so Render startup diagnostics are unambiguous.
-    server._health_thread = thread
-    log.info(
-        "RENDER_PORT_READY host=%s port=%s health_paths=/,/health",
-        server.server_address[0],
-        server.server_address[1],
-    )
+    log.info("Render health server listening on 0.0.0.0:%s", port)
     return server
 
 def _group_report_metrics(chat_id, title):
@@ -20249,7 +20230,13 @@ async def owner_activity_audit_worker(app):
             await asyncio.sleep(10)
 
 def main():
+    # Open Render's required HTTP port immediately, before Telegram setup and
+    # handler registration, so Render can detect the service during startup.
+    health_server = start_health_server()
+    log.info("RENDER_PORT_READY host=0.0.0.0 port=%s", health_server.server_address[1])
     if not TOKEN:
+        health_server.shutdown()
+        health_server.server_close()
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
     # Render/Telegram may have transient slow connections during startup.
     # Use explicit HTTP timeouts for both normal Bot API calls and long polling,
@@ -20349,7 +20336,6 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    health_server = start_health_server()
     log.info("Bot startup continuing; HTTP health endpoint is available before Telegram polling")
     try:
         app.run_polling(
