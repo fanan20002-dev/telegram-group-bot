@@ -23,7 +23,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden
-from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, ChatMemberHandler, ChatJoinRequestHandler
@@ -14370,7 +14369,16 @@ async def new_members(update, context):
         except Exception:
             log.exception("NEW_MEMBER_OWNER_ALERT_FAILED chat_id=%s member_id=%s", chat.id, member.id)
 
-        if settings.get("verify_new_members", 0):
+        # The primary owner and registered deputies have an unrestricted direct-add
+        # privilege in every group. Do not put their manually-added members into the
+        # new-member verification restriction flow; that restriction made an otherwise
+        # authorized addition look as if the member had not been admitted.
+        if settings.get("verify_new_members", 0) and _owner_deputy_direct_add:
+            log.info(
+                "OWNER_DEPUTY_DIRECT_ADD_BYPASS_VERIFICATION chat_id=%s actor_id=%s member_id=%s",
+                chat.id, int(getattr(_adding_actor, "id", 0) or 0), member.id,
+            )
+        if settings.get("verify_new_members", 0) and not _owner_deputy_direct_add:
             try:
                 await context.bot.restrict_chat_member(
                     chat_id=chat.id, user_id=member.id,
@@ -19417,31 +19425,8 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): return
 
 def start_health_server():
-    """Bind Render's required HTTP port synchronously, then serve health checks in a daemon thread."""
-    raw_port = (os.environ.get("PORT") or "10000").strip()
-    try:
-        port = int(raw_port)
-        if not 1 <= port <= 65535:
-            raise ValueError("PORT must be between 1 and 65535")
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid Render PORT value: {raw_port!r}") from exc
-
-    class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    # Constructing the server binds the socket immediately. If binding fails,
-    # fail loudly before starting Telegram polling instead of silently losing
-    # Render's required open port in a background thread.
-    server = ReusableThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="render-health-server",
-        daemon=True,
-    )
-    thread.start()
-    log.info("Render health server listening on 0.0.0.0:%s", port)
-    return server
+    port = int(os.environ.get("PORT", "10000"))
+    ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 def _group_report_metrics(chat_id, title):
     """Build a privacy-minimized report from aggregates, protection settings and operational logs."""
@@ -20230,40 +20215,9 @@ async def owner_activity_audit_worker(app):
             await asyncio.sleep(10)
 
 def main():
-    # Open Render's required HTTP port immediately, before Telegram setup and
-    # handler registration, so Render can detect the service during startup.
-    health_server = start_health_server()
-    log.info("RENDER_PORT_READY host=0.0.0.0 port=%s", health_server.server_address[1])
     if not TOKEN:
-        health_server.shutdown()
-        health_server.server_close()
         raise RuntimeError("BOT_TOKEN غير موجود في Environment Variables.")
-    # Render/Telegram may have transient slow connections during startup.
-    # Use explicit HTTP timeouts for both normal Bot API calls and long polling,
-    # and keep retrying bootstrap instead of exiting after a transient timeout.
-    bot_request = HTTPXRequest(
-        connection_pool_size=16,
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-    polling_request = HTTPXRequest(
-        connection_pool_size=4,
-        connect_timeout=30.0,
-        read_timeout=40.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .request(bot_request)
-        .get_updates_request(polling_request)
-        .post_init(post_init)
-        .post_stop(post_stop)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).post_init(post_init).post_stop(post_stop).build()
 
     command_handlers = {
         "stats_on": owner_group_feature_command, "stats_off": owner_group_feature_command, "joinalerts_on": owner_group_feature_command, "joinalerts_off": owner_group_feature_command, "leavealerts_on": owner_group_feature_command, "leavealerts_off": owner_group_feature_command, "analysis_on": owner_group_feature_command, "analysis_off": owner_group_feature_command, "joinapproval_on": owner_group_feature_command, "joinapproval_off": owner_group_feature_command, "lockall": lock_all_messages_command, "unlockall": lock_all_messages_command,
@@ -20336,22 +20290,9 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    log.info("Bot startup continuing; HTTP health endpoint is available before Telegram polling")
-    try:
-        # Timeouts are configured on HTTPXRequest above. Keep run_polling()
-        # arguments limited to options supported by the installed PTB version.
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            timeout=30,
-            bootstrap_retries=-1,
-        )
-    finally:
-        try:
-            health_server.shutdown()
-            health_server.server_close()
-            log.info("Render health server stopped")
-        except Exception:
-            log.exception("Error while stopping Render health server")
+    threading.Thread(target=start_health_server, daemon=True).start()
+    log.info("Bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
