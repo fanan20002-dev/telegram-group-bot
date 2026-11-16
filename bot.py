@@ -942,6 +942,23 @@ def owner_managed_group_rows():
         ORDER BY w.title, w.chat_id""").fetchall()
 
 
+def tag_target_group_rows(uid):
+    """Return active registered groups that this user may tag, with a reliable title fallback."""
+    internal = owner_managed_group_rows() if (is_owner(uid) or is_deputy_owner(uid)) else []
+    rows = {int(cid): (int(cid), title or str(cid)) for cid, title in internal}
+    external_rows = db.execute("""SELECT e.chat_id,
+            COALESCE(NULLIF(e.title,''), NULLIF(w.title,''), CAST(e.chat_id AS TEXT))
+        FROM external_group_control e
+        LEFT JOIN watched_groups w ON w.chat_id=e.chat_id
+        WHERE e.is_external=1 AND e.enabled=1 AND COALESCE(e.is_member,1)=1
+        ORDER BY e.title COLLATE NOCASE""").fetchall()
+    for cid, title in external_rows:
+        cid = int(cid)
+        if external_group_cap_enabled(cid, "tag") and (is_owner(uid) or can_use_capability(uid, "tag", cid)):
+            rows[cid] = (cid, title or str(cid))
+    return sorted(rows.values(), key=lambda item: str(item[1]).casefold())
+
+
 def group_feature_enabled(chat_id, feature):
     allowed = {"stats_enabled", "join_notices_enabled", "leave_notices_enabled", "analysis_enabled", "join_approval_enabled"}
     if feature not in allowed:
@@ -1754,13 +1771,13 @@ def register_group(chat, actor=None):
     # Refresh descriptive fields, but never change ownership classification from a
     # normal message/member update. Only the periodic Telegram creator check may do that.
     db.execute("""UPDATE external_group_control SET
-        title=?,
+        title=CASE WHEN ?<>'' THEN ? ELSE title END,
         added_by=CASE WHEN COALESCE(added_by,0)=0 AND ?<>0 THEN ? ELSE added_by END,
         added_by_name=CASE WHEN COALESCE(added_by_name,'')='' THEN ? ELSE added_by_name END,
         added_by_username=CASE WHEN COALESCE(added_by_username,'')='' THEN ? ELSE added_by_username END,
         is_member=1, updated_at=?
         WHERE chat_id=?""",
-        (chat.title or "", actor_id, actor_id, actor_name, actor_username, now(), chat.id))
+        (chat.title or "", chat.title or "", actor_id, actor_id, actor_name, actor_username, now(), chat.id))
 
     # Only a group already verified as created by OWNER_ID belongs in watched_groups.
     classification = db.execute(
@@ -16837,7 +16854,7 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q, "لا تملك صلاحية استدعاء التاق؛ اطلب منحها من المالك الأساسي.", show_alert=True)
             return
         allowed_tag_ids = capability_group_ids(uid, "tag")
-        groups = [(int(cid), title) for cid, title in owner_managed_group_rows() if int(cid) in allowed_tag_ids]
+        groups = tag_target_group_rows(uid)
         if data == "owner_tag_groups":
             context.user_data["owner_tag_selected"] = []
             rows = [[InlineKeyboardButton(f"⬜ {title or cid}", callback_data=f"owner_tag_toggle:{cid}")] for cid, title in groups[:50]]
