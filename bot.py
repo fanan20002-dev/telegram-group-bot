@@ -5764,7 +5764,7 @@ async def music_search_group_handler(update, context):
     if not match:
         return
     query = match.group(1).strip()
-    query = re.sub(r"^(?:أغنية|اغنية|الأغنية|الاغنية|قصيدة|شيلة|أنشودة|انشودة)\\s+", "", query, flags=re.I).strip()
+    query = re.sub(r"^(?:أغنية|اغنية|الأغنية|الاغنية|قصيدة|شيلة|أنشودة|انشودة)\s+", "", query, flags=re.I).strip()
     if len(query) < 2 or len(query) > 100:
         await message.reply_text("🎵 اكتب اسم الأغنية أو القصيدة بعد كلمة بحث، مثال: بحث رايح")
         return
@@ -6083,37 +6083,72 @@ async def lock_all_groups_text(update, context):
     await msg.reply_text("اختر القروبات التي تريد " + ("قفل الرسائل فيها" if action == "lock" else "فتح الرسائل فيها") + ". ستطبق العملية على القروبات المحددة فقط.", reply_markup=all_message_groups_markup(context, action))
 
 async def lock_all_messages_command(update, context):
-    """Lock/unlock all member message types in the current group, using Telegram chat permissions."""
+    """Lock/unlock member messages in this group for authorized management roles."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not chat or not user or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        if msg: await msg.reply_text("استخدم هذا الأمر داخل القروب.")
+        if msg:
+            await msg.reply_text("استخدم هذا الأمر داخل القروب.")
         return
+
     full_text = (msg.text or "").strip().lower()
+    lock_phrases = {"قفل رسايل", "قفل رسائل", "قفل الدردشة", "قفل المحادثة", "قفل الشات"}
+    unlock_phrases = {"فتح رسايل", "فتح رسائل", "فتح الدردشة", "فتح المحادثة", "فتح الشات"}
     cmd = full_text.split()[0].lstrip("/") if full_text else ""
-    lock = cmd == "lockall" or full_text in {"قفل رسايل", "قفل رسائل", "قفل الدردشة", "قفل المحادثة", "قفل الشات"}
-    authorized = is_owner(user.id) or can_use_capability(user.id, "message_lock", chat.id)
-    if not authorized:
-        await msg.reply_text("⛔ لا تملك صلاحية قفل وفتح الرسائل. يتيح المالك الأساسي هذه الصلاحية من لوحة توزيع الصلاحيات.")
+    lock = cmd == "lockall" or full_text in lock_phrases
+    unlock = cmd == "unlockall" or full_text in unlock_phrases
+    if not (lock or unlock):
+        await msg.reply_text("استخدم: قفل الدردشة أو فتح الدردشة.")
         return
+
+    # Main owner, deputy, delegated owner, bot managers/supervisors, granted
+    # message-lock staff, and Telegram group administrators may operate this.
+    authorized = (
+        is_owner(user.id)
+        or is_deputy_owner(user.id)
+        or is_delegated_owner(user.id)
+        or is_general_manager(user.id)
+        or is_protection_manager(user.id)
+        or can_use_capability(user.id, "message_lock", chat.id)
+        or bool(group_role(chat.id, user.id))
+    )
+    if not authorized:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+            authorized = member.status in ("creator", "administrator")
+        except Exception:
+            authorized = False
+    if not authorized:
+        await msg.reply_text("⛔ هذه العملية للمالك أو النائب أو المدراء والمشرفين المخوّلين فقط.")
+        return
+
     try:
         if lock:
-            permissions = ChatPermissions(can_send_messages=False, can_send_audios=False, can_send_documents=False,
-                can_send_photos=False, can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False,
-                can_send_polls=False, can_send_other_messages=False, can_add_web_page_previews=False)
+            permissions = ChatPermissions(
+                can_send_messages=False, can_send_audios=False, can_send_documents=False,
+                can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+                can_send_voice_notes=False, can_send_polls=False,
+                can_send_other_messages=False, can_add_web_page_previews=False
+            )
             await context.bot.set_chat_permissions(chat_id=chat.id, permissions=permissions)
-            result = "🔒 تم قفل إرسال الرسائل والوسائط للأعضاء في هذا القروب."
+            result = "🔒 تم قفل الدردشة وإيقاف إرسال الرسائل والوسائط للأعضاء."
             action = "all_messages_locked"
         else:
-            permissions = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
-                can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True,
-                can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True)
+            permissions = ChatPermissions(
+                can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                can_send_voice_notes=True, can_send_polls=True,
+                can_send_other_messages=True, can_add_web_page_previews=True
+            )
             await context.bot.set_chat_permissions(chat_id=chat.id, permissions=permissions)
-            result = "🔓 تم فتح إرسال الرسائل والوسائط في هذا القروب. راجع صلاحيات تيليجرام الخاصة بالقروب إذا كانت هناك قيود إضافية."
+            result = "🔓 تم فتح الدردشة والسماح للأعضاء بإرسال الرسائل والوسائط."
             action = "all_messages_unlocked"
         log_action(chat.id, user.id, action, "Telegram default chat permissions updated")
         await msg.reply_text(result)
     except Exception as exc:
-        await msg.reply_text("❌ تعذر تغيير صلاحيات الرسائل. تأكد أن البوت مشرف ويملك صلاحية تقييد الأعضاء.\n" + str(exc)[:300])
+        log.warning("Could not change chat permissions in %s: %s", chat.id, exc)
+        await msg.reply_text(
+            "❌ تعذر تغيير صلاحيات الدردشة. تأكد أن البوت مشرف ويملك صلاحية حظر/تقييد الأعضاء."
+        )
 
 async def group_stats_cmd(update, context):
     chat = update.effective_chat
