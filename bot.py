@@ -4061,6 +4061,8 @@ async def ai_auto_group_reply(update, context):
     if not message or not chat or not user or user.is_bot or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     text = (message.text or message.caption or "").strip()
+    if re.match(r"^(?:بحث|ابحث)\s+", text, re.I):
+        return
     if not text or text.startswith("/") or not OPENAI_API_KEY:
         return
     if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (chat.id,)).fetchone():
@@ -5746,6 +5748,104 @@ async def logs_cmd(update, context):
     )
     await update.effective_message.reply_text(text)
 
+
+
+async def music_search_group_handler(update, context):
+    """Search the Saudi iTunes catalog and post an official preview clip in the group."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user or user.is_bot:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    query_text = (message.text or "").strip()
+    match = re.match(r"^(?:بحث|ابحث)\s+(?:عن\s+)?(.+)$", query_text, re.I)
+    if not match:
+        return
+    query = match.group(1).strip()
+    query = re.sub(r"^(?:أغنية|اغنية|الأغنية|الاغنية|قصيدة|شيلة|أنشودة|انشودة)\\s+", "", query, flags=re.I).strip()
+    if len(query) < 2 or len(query) > 100:
+        await message.reply_text("🎵 اكتب اسم الأغنية أو القصيدة بعد كلمة بحث، مثال: بحث رايح")
+        return
+
+    status = await message.reply_text(f"🔎 جارٍ البحث عن: {html.escape(query)}")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0),
+                                     follow_redirects=True,
+                                     headers={"User-Agent": "GroupBot/1.0"}) as client:
+            response = await client.get(
+                "https://itunes.apple.com/search",
+                params={"term": query, "media": "music", "entity": "song",
+                        "country": "sa", "limit": 8}
+            )
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results") or []
+            # Prefer an item that actually exposes a playable preview.
+            result = next((item for item in results if item.get("previewUrl")), None)
+            if not result:
+                await status.edit_text(
+                    f"لم أعثر على مقطع صوتي متاح لـ «{html.escape(query)}».\n"
+                    "جرّب كتابة اسم الفنان مع اسم الأغنية."
+                )
+                return
+
+            preview_url = result.get("previewUrl", "")
+            # Accept only HTTPS preview URLs from Apple's media CDN.
+            from urllib.parse import urlparse
+            parsed = urlparse(preview_url)
+            if parsed.scheme != "https" or not (
+                parsed.hostname or ""
+            ).lower().endswith(("mzstatic.com", "itunes.apple.com")):
+                await status.edit_text("تعذر التحقق من مصدر المقطع الصوتي.")
+                return
+
+            audio_response = await client.get(preview_url)
+            audio_response.raise_for_status()
+            audio_data = audio_response.content
+            if not audio_data or len(audio_data) > 12 * 1024 * 1024:
+                await status.edit_text("حجم المقطع غير مناسب للإرسال.")
+                return
+
+        audio_file = io.BytesIO(audio_data)
+        audio_file.name = "music_preview.m4a"
+        title = result.get("trackName") or query
+        artist = result.get("artistName") or "غير محدد"
+        album = result.get("collectionName") or ""
+        caption = (
+            f"🎵 {html.escape(title)}\n"
+            f"🎤 {html.escape(artist)}"
+            + (f"\n💿 {html.escape(album)}" if album else "")
+            + "\n\nمقطع معاينة رسمي متاح من مصدر الموسيقى."
+        )
+        await context.bot.send_audio(
+            chat_id=chat.id,
+            audio=audio_file,
+            title=title[:64],
+            performer=artist[:64],
+            caption=caption,
+            reply_to_message_id=message.message_id,
+            read_timeout=45,
+            write_timeout=45,
+            connect_timeout=15,
+            pool_timeout=15,
+        )
+        await status.delete()
+    except httpx.HTTPError as exc:
+        log.warning("Music preview search/download failed in chat %s: %s", chat.id, exc)
+        try:
+            await status.edit_text("تعذر جلب المقطع الآن بسبب مشكلة اتصال. حاول مرة أخرى لاحقًا.")
+        except Exception:
+            pass
+    except Exception:
+        log.exception("Unexpected music preview error in chat %s", chat.id)
+        try:
+            await status.edit_text("حدث خطأ أثناء تجهيز المقطع الصوتي.")
+        except Exception:
+            pass
+
+
 async def ArabicTextCommand(update, context):
     if not update.effective_message or not update.effective_user:
         return
@@ -6522,10 +6622,14 @@ async def message_filter(update, context):
                     f"📝 الاسم السابق: {old_name} ({old_user_label})\n"
                     f"🆕 الاسم الحالي: {current_name} ({new_user_label})"
                 )
-                try:
-                    await context.bot.send_message(chat_id=chat.id, text=change_text)
-                except Exception as exc:
-                    log.info("تعذر نشر تنبيه تغيير الاسم في %s: %s", chat.id, exc)
+                # Owner/deputy identity changes are private: never expose old/new
+                # names or usernames in the group. Keep the audit notice owner-only.
+                privileged_actor = is_owner(uid) or is_deputy_owner(uid)
+                if not privileged_actor:
+                    try:
+                        await context.bot.send_message(chat_id=chat.id, text=change_text)
+                    except Exception as exc:
+                        log.info("تعذر نشر تنبيه تغيير الاسم في %s: %s", chat.id, exc)
                 await notify_owners(context, change_text, "membership")
         if analytics_enabled:
             # Increment the statistical message counters only while statistics are enabled.
@@ -20267,6 +20371,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, lock_all_groups_text), group=-6)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, process_private_workflows), group=-5)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, assistant_private_text), group=-4)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, music_search_group_handler), group=-5)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_auto_group_reply), group=-3)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, assistant_private_document), group=-4)
 
