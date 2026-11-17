@@ -6657,14 +6657,8 @@ async def message_filter(update, context):
                     f"📝 الاسم السابق: {old_name} ({old_user_label})\n"
                     f"🆕 الاسم الحالي: {current_name} ({new_user_label})"
                 )
-                # Owner/deputy identity changes are private: never expose old/new
-                # names or usernames in the group. Keep the audit notice owner-only.
-                privileged_actor = is_owner(uid) or is_deputy_owner(uid)
-                if not privileged_actor:
-                    try:
-                        await context.bot.send_message(chat_id=chat.id, text=change_text)
-                    except Exception as exc:
-                        log.info("تعذر نشر تنبيه تغيير الاسم في %s: %s", chat.id, exc)
+                # Privacy hardening: never publish profile-name changes (old/new
+                # names, username, or user ID) in the group. Keep the detail private.
                 await notify_owners(context, change_text, "membership")
         if analytics_enabled:
             # Increment the statistical message counters only while statistics are enabled.
