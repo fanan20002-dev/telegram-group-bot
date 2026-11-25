@@ -1961,28 +1961,30 @@ async def refresh_external_group_membership(bot):
     Temporary errors preserve membership state and are reported as uncertain.
     """
     bot_user = await bot.get_me()
+    # Include inactive historical records too: this lets a manual refresh detect
+    # groups where the bot has since been re-added, without deleting their settings.
     rows = db.execute(
-        "SELECT chat_id,title FROM external_group_control WHERE is_external=1 AND COALESCE(is_member,1)=1"
+        "SELECT chat_id,title,COALESCE(is_member,1) FROM external_group_control WHERE is_external=1"
     ).fetchall()
     semaphore = asyncio.Semaphore(8)
 
-    async def _check(chat_id, title):
+    async def _check(chat_id, title, was_member):
         cid = int(chat_id)
         async with semaphore:
             try:
                 member = await bot.get_chat_member(chat_id=cid, user_id=bot_user.id)
-                return cid, title, member, None
+                return cid, title, int(was_member or 0), member, None
             except Exception as exc:
-                return cid, title, None, exc
+                return cid, title, int(was_member or 0), None, exc
 
-    results = await asyncio.gather(*(_check(cid, title) for cid, title in rows), return_exceptions=True)
+    results = await asyncio.gather(*(_check(cid, title, was_member) for cid, title, was_member in rows), return_exceptions=True)
     checked = removed = uncertain = 0
     inactive_statuses = {"left", "kicked"}
     for result in results:
         if isinstance(result, BaseException):
             uncertain += 1
             continue
-        cid, title, member, error = result
+        cid, title, was_member, member, error = result
         if error is not None:
             message = str(error).lower()
             definitive = isinstance(error, (Forbidden, BadRequest)) and any(token in message for token in (
@@ -2016,7 +2018,11 @@ async def refresh_external_group_membership(bot):
             db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
             removed += 1
         elif status in ("member", "administrator", "creator") or (status == "restricted" and is_member_flag is True):
-            db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), cid))
+            if not was_member:
+                db.execute("UPDATE external_group_control SET is_member=1,enabled=1,updated_at=? WHERE chat_id=?", (now(), cid))
+                log_external_group_event(cid, 0, "bot_readded_detected_by_refresh", "Group restored after membership re-check")
+            else:
+                db.execute("UPDATE external_group_control SET is_member=1,updated_at=? WHERE chat_id=?", (now(), cid))
         else:
             uncertain += 1
     db.commit()
@@ -2308,6 +2314,8 @@ def external_owner_can(uid, chat_id, capability):
 def external_owner_panel_markup(uid):
     groups = external_owner_group_rows(uid)
     rows = [[InlineKeyboardButton(f"🌐 {str(title)[:42]}", callback_data=f"xowner_group:{cid}")] for cid,title in groups]
+    if any(external_owner_can(uid, int(cid), "protection") and external_group_cap_enabled(int(cid), "protection") for cid, _ in groups):
+        rows.append([InlineKeyboardButton("⚡ أوامر الحماية الجماعية لقروباتي", callback_data="bulk_security")])
     rows.append([InlineKeyboardButton("📣 مركز الإعلانات والنشر", callback_data="xowner_campaigns")])
     rows.append([InlineKeyboardButton("👑 إدارة النائب والمشرفين والمدراء", callback_data="xowner_staff_groups")])
     rows.append([InlineKeyboardButton("🔄 تحديث القروبات", callback_data="xowner_home")])
@@ -4339,6 +4347,39 @@ BULK_SECURITY_OPTIONS = [
     ("🧯 إغراق الرسائل", "flood"),
 ]
 
+def bulk_security_group_rows(uid):
+    """Return only groups this user may administer in the bulk security panel.
+
+    External owners/staff are strictly scoped to their own external groups;
+    internal owners/delegates retain the existing watched_groups scope.
+    """
+    uid = int(uid)
+    if is_external_group_owner(uid) or is_external_group_staff(uid):
+        rows = external_access_group_rows(uid)
+        return [(int(cid), title or str(cid)) for cid, title in rows
+                if external_owner_can(uid, int(cid), "protection")
+                and external_group_cap_enabled(int(cid), "protection")]
+    allowed_ids = capability_group_ids(uid, "protection")
+    return [(int(cid), title or str(cid))
+            for cid, title in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall()
+            if int(cid) in allowed_ids and is_owner_managed_group(int(cid))]
+
+
+def bulk_security_can_manage(uid, chat_id):
+    """Revalidate scope at every callback and immediately before each write."""
+    uid, chat_id = int(uid), int(chat_id)
+    if is_external_group_owner(uid) or is_external_group_staff(uid):
+        return (external_owner_can(uid, chat_id, "protection")
+                and external_group_cap_enabled(chat_id, "protection"))
+    return (is_owner_managed_group(chat_id)
+            and chat_id in capability_group_ids(uid, "protection")
+            and can_use_capability(uid, "protection", chat_id))
+
+
+def bulk_security_has_access(uid):
+    return bool(bulk_security_group_rows(uid))
+
+
 def bulk_security_groups_markup(groups, selected):
     rows = [[InlineKeyboardButton(("✅ " if cid in selected else "⬜ ") + (title or str(cid)), callback_data=f"bulksec_toggle:{cid}")] for cid,title in groups[:45]]
     rows.append([InlineKeyboardButton("✅ تحديد الكل", callback_data="bulksec_all"), InlineKeyboardButton("🧹 إلغاء التحديد", callback_data="bulksec_none")])
@@ -5414,9 +5455,20 @@ async def my_chat_member_handler(update, context):
     new_status = getattr(cm.new_chat_member, "status", "left")
     bot_joined = new_status in ("member", "administrator", "restricted") and old_status in ("left", "kicked")
     bot_left = new_status in ("left", "kicked") and old_status in ("member", "administrator", "restricted")
+    # Capture the previous membership state before register_group marks the bot present.
+    _previous_group_state = db.execute(
+        "SELECT is_member FROM external_group_control WHERE chat_id=?", (int(chat.id),)
+    ).fetchone()
+    _was_archived_for_membership = bool(_previous_group_state and int(_previous_group_state[0] or 0) == 0)
 
     if bot_joined:
         register_group(chat, actor)
+        if _was_archived_for_membership:
+            # A verified re-add restores the group to active lists. Manual disable
+            # remains intact when the bot never left the group.
+            db.execute("UPDATE external_group_control SET enabled=1,is_member=1,updated_at=? WHERE chat_id=?", (now(), int(chat.id)))
+            db.commit()
+            log_external_group_event(chat.id, int(getattr(actor, 'id', 0) or 0), "bot_readded_reactivated", "Group restored after verified bot re-add")
         actor_id = int(getattr(actor, "id", 0) or 0)
         # A previous ordinary message may have registered this chat as internal before
         # the bot was actually added. A verified membership-add event by someone other
@@ -16337,10 +16389,9 @@ async def _callback_impl(update, context):
         return
 
     if data == "bulk_security":
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "لا تملك صلاحية أوامر الحماية الجماعية.", show_alert=True); return
-        allowed_ids = capability_group_ids(uid, "protection")
-        groups = [(cid,title) for cid,title in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall() if cid in allowed_ids]
+        groups = bulk_security_group_rows(uid)
         selected = set(context.user_data.get("bulk_security_selected", []))
         selected.intersection_update({cid for cid,_ in groups})
         context.user_data["bulk_security_selected"] = list(selected)
@@ -16351,41 +16402,39 @@ async def _callback_impl(update, context):
         return
 
     if data.startswith("bulksec_toggle:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try: cid = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone() or not can_use_capability(uid, "protection", cid):
+        if not bulk_security_can_manage(uid, cid):
             await safe_callback_answer(q, "القروب غير مسجل أو لا تملك صلاحية الحماية فيه.", show_alert=True); return
         selected=set(context.user_data.get("bulk_security_selected", []))
         if cid in selected: selected.remove(cid)
         else: selected.add(cid)
         context.user_data["bulk_security_selected"]=list(selected)
-        allowed_ids = capability_group_ids(uid, "protection")
-        groups=[(cid,title) for cid,title in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall() if cid in allowed_ids]
+        groups = bulk_security_group_rows(uid)
         await q.edit_message_text(f"⚡ أوامر الحماية الجماعية\n\nالقروبات المحددة: {len(selected)} من {len(groups)}", reply_markup=bulk_security_groups_markup(groups,selected)); return
 
     if data in ("bulksec_all", "bulksec_none"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
-        allowed_ids = capability_group_ids(uid, "protection")
-        selected=[cid for cid,_ in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall() if cid in allowed_ids] if data=="bulksec_all" else []
+        groups = bulk_security_group_rows(uid)
+        selected=[cid for cid,_ in groups] if data=="bulksec_all" else []
         context.user_data["bulk_security_selected"]=selected
-        allowed_ids = capability_group_ids(uid, "protection")
-        groups=[(cid,title) for cid,title in db.execute("SELECT chat_id,title FROM watched_groups ORDER BY title").fetchall() if cid in allowed_ids]
+        groups = bulk_security_group_rows(uid)
         await q.edit_message_text(f"⚡ أوامر الحماية الجماعية\n\nالقروبات المحددة: {len(selected)} من {len(groups)}", reply_markup=bulk_security_groups_markup(groups,set(selected))); return
 
     if data == "bulksec_actions":
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
-        selected=[cid for cid in context.user_data.get("bulk_security_selected", []) if can_use_capability(uid, "protection", cid)]
+        selected=[cid for cid in context.user_data.get("bulk_security_selected", []) if bulk_security_can_manage(uid, cid)]
         context.user_data["bulk_security_selected"] = selected
         if not selected:
             await safe_callback_answer(q, "حدد قروبًا واحدًا على الأقل تملك صلاحية الحماية فيه.", show_alert=True); return
         await q.edit_message_text(f"اختر الأمر المطلوب تنفيذه على {len(selected)} قروب.\nسيُحدّث البوت الإعدادات ويحاول نشر إشعار عام بالقروب.", reply_markup=bulk_security_actions_markup()); return
 
     if data == "bulksec_combo":
-        if not (is_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "أوامر الحماية الجماعية تتطلب صلاحية يمنحها المالك الأساسي.", show_alert=True); return
         context.user_data["bulk_security_combo"] = {}
         await q.edit_message_text(
@@ -16393,7 +16442,7 @@ async def _callback_impl(update, context):
             "ثم نفّذ جميع الأوامر المحددة على القروبات التي اخترتها.",
             reply_markup=bulk_security_combo_markup({})); return
     if data.startswith("bulksec_combo_toggle:"):
-        if not (is_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         field = data.split(":",1)[1]
         if field not in dict((f,l) for l,f in BULK_SECURITY_OPTIONS):
@@ -16406,26 +16455,26 @@ async def _callback_impl(update, context):
         await q.edit_message_text("⚙️ إعداد مجموعة أوامر حماية مختلطة\n\n🔒 = قفل | 🔓 = فتح | ⬜ = غير محدد",
                                   reply_markup=bulk_security_combo_markup(selection)); return
     if data == "bulksec_combo_clear":
-        if not (is_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         context.user_data["bulk_security_combo"] = {}
         await q.edit_message_text("تم مسح التحديد. اختر الأوامر المطلوبة:", reply_markup=bulk_security_combo_markup({})); return
     if data == "bulksec_combo_apply":
-        if not (is_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         selection = {f:int(v) for f,v in dict(context.user_data.get("bulk_security_combo", {})).items()
                      if f in SETTING_FIELDS and f in dict((field,label) for label,field in BULK_SECURITY_OPTIONS) and int(v) in (0,1)}
         selected_groups = [cid for cid in dict.fromkeys(context.user_data.get("bulk_security_selected", []))
-                           if can_use_capability(uid, "protection", cid)]
+                           if bulk_security_can_manage(uid, cid)]
         if not selection or not selected_groups:
             await safe_callback_answer(q, "حدد نوع حماية واحدًا على الأقل وقروبًا واحدًا على الأقل.", show_alert=True); return
-        if selection.get("links") == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected_groups))):
+        if selection.get("links") == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected_groups)) or (all(external_owner_can(uid, cid, "protection") for cid in selected_groups) and (is_external_group_owner(uid) or is_external_group_staff(uid)))):
             await safe_callback_answer(q, "فتح الروابط للأعضاء يتطلب المالك الأساسي أو المالك المفوض المخوّل بالحماية.", show_alert=True); return
         labels = dict((field,label) for label,field in BULK_SECURITY_OPTIONS)
         success = failed = announced = 0
         for cid in selected_groups:
             try:
-                if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone():
+                if not bulk_security_can_manage(uid, cid):
                     failed += 1; continue
                 for field, value in selection.items():
                     set_setting(cid, field, value)
@@ -16446,7 +16495,7 @@ async def _callback_impl(update, context):
                                                [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
     if data.startswith("bulksec_multi:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try: value = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "اختيار غير صحيح.", show_alert=True); return
@@ -16455,7 +16504,7 @@ async def _callback_impl(update, context):
         context.user_data["bulk_security_multi_fields"] = []
         await q.edit_message_text(f"🧩 اختر عدة أنواع ليتم {'قفلها' if value else 'فتحها'} دفعة واحدة على القروبات المحددة.", reply_markup=bulk_security_multi_markup([], value)); return
     if data.startswith("bulksec_multi_toggle:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try: _, field, raw_value = data.split(":",2); value=int(raw_value)
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
@@ -16467,7 +16516,7 @@ async def _callback_impl(update, context):
         context.user_data["bulk_security_multi_fields"] = list(selected)
         await q.edit_message_text(f"🧩 اختر عدة أنواع ليتم {'قفلها' if value else 'فتحها'} دفعة واحدة.", reply_markup=bulk_security_multi_markup(selected, value)); return
     if data.startswith(("bulksec_multi_all:", "bulksec_multi_none:")):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try: value = int(data.rsplit(":",1)[1])
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
@@ -16475,24 +16524,24 @@ async def _callback_impl(update, context):
         context.user_data["bulk_security_multi_fields"] = fields
         await q.edit_message_text(f"🧩 الأنواع المحددة: {len(fields)}. اختر الأنواع ثم نفّذ دفعة واحدة.", reply_markup=bulk_security_multi_markup(fields, value)); return
     if data.startswith("bulksec_multi_apply:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try: value = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "بيانات غير صحيحة.", show_alert=True); return
         fields = [f for f in dict.fromkeys(context.user_data.get("bulk_security_multi_fields", []))
                   if f in SETTING_FIELDS and f in dict((field,label) for label,field in BULK_SECURITY_OPTIONS)]
         selected_groups = [cid for cid in dict.fromkeys(context.user_data.get("bulk_security_selected", []))
-                           if can_use_capability(uid, "protection", cid)]
+                           if bulk_security_can_manage(uid, cid)]
         if value not in (0,1) or not fields or not selected_groups:
             await safe_callback_answer(q, "حدد نوع حماية واحدًا على الأقل وقروبًا واحدًا على الأقل.", show_alert=True); return
-        if "links" in fields and value == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected_groups))):
+        if "links" in fields and value == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected_groups)) or (all(external_owner_can(uid, cid, "protection") for cid in selected_groups) and (is_external_group_owner(uid) or is_external_group_staff(uid)))):
             await safe_callback_answer(q, "فتح الروابط للأعضاء على مستوى القروبات يتطلب المالك الأساسي أو المالك المفوض المخوّل بالحماية.", show_alert=True); return
         success = failed = announced = 0
         verb = "قفل" if value else "فتح"
         labels = dict((field,label) for label,field in BULK_SECURITY_OPTIONS)
         for cid in selected_groups:
             try:
-                if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone():
+                if not bulk_security_can_manage(uid, cid):
                     failed += 1; continue
                 for field in fields:
                     set_setting(cid, field, value)
@@ -16512,7 +16561,7 @@ async def _callback_impl(update, context):
                                                [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
     if data.startswith("bulksec_do:"):
-        if not (is_owner(uid) or is_delegated_owner(uid) or can_use_capability(uid, "protection")):
+        if not bulk_security_has_access(uid):
             await safe_callback_answer(q, "غير مصرح لك.", show_alert=True); return
         try:
             _, field, raw_value = data.split(":",2); value=int(raw_value)
@@ -16520,17 +16569,17 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q, "الأمر غير صحيح.", show_alert=True); return
         if field not in SETTING_FIELDS or value not in (0,1) or field not in dict((f,l) for l,f in BULK_SECURITY_OPTIONS):
             await safe_callback_answer(q, "هذا الإعداد غير متاح للأوامر الجماعية.", show_alert=True); return
-        selected=[cid for cid in dict.fromkeys(context.user_data.get("bulk_security_selected", [])) if can_use_capability(uid, "protection", cid)]
+        selected=[cid for cid in dict.fromkeys(context.user_data.get("bulk_security_selected", [])) if bulk_security_can_manage(uid, cid)]
         if not selected:
             await safe_callback_answer(q, "انتهى التحديد؛ اختر القروبات من جديد.", show_alert=True); return
-        if field == "links" and value == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected))):
+        if field == "links" and value == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and all(can_use_capability(uid, "protection", cid) for cid in selected)) or (all(external_owner_can(uid, cid, "protection") for cid in selected) and (is_external_group_owner(uid) or is_external_group_staff(uid)))):
             await safe_callback_answer(q, "فتح الروابط للأعضاء على مستوى القروبات يتطلب المالك الأساسي أو المالك المفوض المخوّل بالحماية.", show_alert=True); return
         option_label=dict((f,l) for l,f in BULK_SECURITY_OPTIONS)[field]
         verb="قفل" if value else "فتح"
         announcement=f"{'🔒' if value else '🔓'} أمر إداري: تم {verb} {option_label} بواسطة إدارة البوت."
         success=0; failed=0; announced=0
         for cid in selected:
-            if not db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (cid,)).fetchone() or not can_use_capability(uid, "protection", cid):
+            if not bulk_security_can_manage(uid, cid):
                 failed += 1; continue
             try:
                 set_setting(cid, field, value)
@@ -17715,9 +17764,13 @@ async def active_group_refresh_worker(app):
                         VALUES(?,?,?,0,'','',1,0,?,?,1)""",
                         (cid, fresh_title, current_external, now(), now()))
                     db.execute("""UPDATE external_group_control SET
-                        title=?, is_external=?, is_member=1, bot_status=?, last_checked_at=?, updated_at=?
+                        title=?, is_external=?, is_member=1,
+                        enabled=CASE WHEN COALESCE(is_member,1)=0 THEN 1 ELSE enabled END,
+                        bot_status=?, last_checked_at=?, updated_at=?
                         WHERE chat_id=?""",
                         (fresh_title, current_external, bot_status, now(), now(), cid))
+                    if not int(was_member or 0):
+                        log_external_group_event(cid, 0, "bot_readded_detected_by_worker", "Group restored after periodic membership check")
                     if current_external == 0:
                         # Owner-owned groups belong only in the owner's lists.
                         db.execute("INSERT OR IGNORE INTO watched_groups(chat_id,title,added_at) VALUES(?,?,?)",
