@@ -13509,9 +13509,9 @@ async def _callback_impl(update, context):
             context.user_data["mass_ban_state"]={"scope":"selected","groups":[cid],"reason":"حظر جماعي من إدارة القروب الخارجي","external_local":True,"authorized_chat_id":cid}
             await q.message.reply_text("🚫 الحظر الجماعي لهذا القروب فقط. أرسل ID العضو أو @username معروفًا، أو /cancel للإلغاء.")
             return
-        required = "rejected" if cap == "rejected" else "reentry"
-        if cap in ("banned","reentry"):
-            required = "reentry"
+        # Match each list to its own per-group permission; viewing banned users
+        # must not accidentally depend on the separate return-request permission.
+        required = {"banned": "banned", "rejected": "rejected", "reentry": "reentry"}.get(cap)
         if not external_owner_can(uid,cid,required):
             await safe_callback_answer(q,"لا تملك صلاحية عرض هذه القائمة.",show_alert=True); return
         tab = "banned" if cap == "banned" else "rejected" if cap == "rejected" else "returns"
@@ -13773,8 +13773,8 @@ async def _callback_impl(update, context):
         except ValueError: await safe_callback_answer(q, "بيانات القائمة غير صحيحة.", show_alert=True); return
         ext = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
         if ext and int(ext[0] or 0) == 1:
-            _cap = "reentry" if tab in ("banned", "returns") else "rejected"
-            allowed = external_owner_can(uid, chat_id, _cap)
+            _cap = {"banned": "banned", "rejected": "rejected", "returns": "reentry"}.get(tab)
+            allowed = bool(_cap and external_owner_can(uid, chat_id, _cap))
         else:
             allowed = is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id) or can_use_capability(uid, "join_approval", chat_id)
         if not allowed:
@@ -13793,7 +13793,10 @@ async def _callback_impl(update, context):
             reqs = db.execute("SELECT user_id,display_name,status,requested_at FROM join_request_events WHERE chat_id=? AND status='pending' ORDER BY requested_at DESC LIMIT 20", (chat_id,)).fetchall()
             lines += ["طلبات العودة:"] + ([f"• {name or uid0} — ID {uid0} — {status}" for uid0,name,reason,status,created in bans] or ["• لا توجد طلبات عودة معلقة."])
             lines += ["", "طلبات الانضمام:"] + ([f"• {name or uid0} — ID {uid0} — {status}" for uid0,name,status,requested in reqs] or ["• لا توجد طلبات انضمام معلقة."])
-        back = f"external_group:{chat_id}" if ext and int(ext[0] or 0) == 1 else f"restricted_group:{chat_id}"
+        if ext and int(ext[0] or 0) == 1:
+            back = f"xowner_group:{chat_id}" if any(int(g[0]) == chat_id for g in external_access_group_rows(uid)) else f"external_group:{chat_id}"
+        else:
+            back = f"restricted_group:{chat_id}"
         await q.edit_message_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data=back)]])); return
 
     if data == "restricted_global":
