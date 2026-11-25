@@ -4960,9 +4960,22 @@ async def message_filter(update, context):
                     f"📝 الاسم السابق: {old_name} ({old_user_label})\n"
                     f"🆕 الاسم الحالي: {current_name} ({new_user_label})"
                 )
-                # Privacy hardening: never publish profile-name changes (old/new
-                # names, username, or user ID) in the group. Keep the detail private.
+                # Notify the primary owner and deputy privately, then publish a
+                # concise audit notice in the affected group only.
                 await notify_owners(context, change_text, "membership")
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=(
+                            "🔔 تنبيه تغيير اسم عضو\n"
+                            f"👤 العضو: {html.escape(current_name)}\n"
+                            f"📝 الاسم السابق: {html.escape(old_name)}\n"
+                            f"🆕 الاسم الجديد: {html.escape(current_name)}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    log.info("Group profile-change notice failed chat=%s user=%s: %s", chat.id, uid, exc)
         if analytics_enabled:
             # Increment the statistical message counters only while statistics are enabled.
             db.execute(
@@ -17598,7 +17611,7 @@ async def global_ban_enforcement_worker(app):
 
 
 async def daily_group_ad_worker(app):
-    """Send one approved bot advertisement daily at 22:00 Riyadh time to groups only."""
+    """Internal groups: daily at 22:00; external groups: every 3 days at 22:00 Riyadh time."""
     tz = ZoneInfo("Asia/Riyadh")
     ad_text = (
         "🔰 بوت حماية ومساعدة القروبات\n\n"
@@ -17613,11 +17626,14 @@ async def daily_group_ad_worker(app):
                 target += timedelta(days=1)
             await asyncio.sleep(max(1, (target-current).total_seconds()))
             ad_date = target.date().isoformat()
-            group_ids = {int(r[0]) for r in owner_managed_group_rows()}
-            group_ids.update(int(r[0]) for r in db.execute(
+            internal_ids = {int(r[0]) for r in owner_managed_group_rows()}
+            external_rows = db.execute(
                 "SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1"
-            ).fetchall())
-            for chat_id in sorted(group_ids):
+            ).fetchall()
+            external_ids = {int(r[0]) for r in external_rows} - internal_ids
+
+            # Keep the primary owner's existing daily schedule unchanged.
+            for chat_id in sorted(internal_ids):
                 if db.execute("SELECT 1 FROM bot_ad_deliveries WHERE chat_id=? AND ad_date=?", (chat_id, ad_date)).fetchone():
                     continue
                 try:
@@ -17627,12 +17643,36 @@ async def daily_group_ad_worker(app):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.warning("Daily group ad failed chat=%s: %s", chat_id, exc)
+                    log.warning("Internal daily group ad failed chat=%s: %s", chat_id, exc)
+                await asyncio.sleep(0.15)
+
+            # External groups receive the same ad at 22:00, but only once per
+            # three elapsed calendar days per chat. The existing delivery table
+            # is reused so no migration or data deletion is required.
+            for chat_id in sorted(external_ids):
+                last = db.execute("SELECT MAX(ad_date) FROM bot_ad_deliveries WHERE chat_id=?", (chat_id,)).fetchone()
+                last_date = last[0] if last else None
+                if last_date:
+                    try:
+                        if (target.date() - datetime.strptime(last_date, "%Y-%m-%d").date()).days < 3:
+                            continue
+                    except ValueError:
+                        log.warning("Invalid external ad delivery date chat=%s value=%r", chat_id, last_date)
+                if db.execute("SELECT 1 FROM bot_ad_deliveries WHERE chat_id=? AND ad_date=?", (chat_id, ad_date)).fetchone():
+                    continue
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=ad_text, disable_web_page_preview=True)
+                    db.execute("INSERT OR IGNORE INTO bot_ad_deliveries(chat_id,ad_date,sent_at) VALUES(?,?,?)", (chat_id, ad_date, now()))
+                    db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("External three-day group ad failed chat=%s: %s", chat_id, exc)
                 await asyncio.sleep(0.15)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Daily group ad worker failed")
+            log.exception("Group ad worker failed")
             await asyncio.sleep(60)
 
 
