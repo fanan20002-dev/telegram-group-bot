@@ -378,6 +378,9 @@ CREATE TABLE IF NOT EXISTS external_owner_campaigns(
 );
 CREATE INDEX IF NOT EXISTS idx_external_owner_campaign_due
 ON external_owner_campaigns(status,scheduled_at);
+CREATE TABLE IF NOT EXISTS external_chat_permission_backups(
+    chat_id INTEGER PRIMARY KEY, permissions_json TEXT NOT NULL, saved_at TEXT NOT NULL
+);
 """)
 # Group AI enablement and cooldown tables removed; AI is private and owner-only.
 
@@ -653,6 +656,24 @@ db.commit()
 
 # Interactive games are removed from this bot.
 
+# Performance indexes: additive and safe for existing SQLite databases.
+# These indexes reduce repeated scans on the message, membership, campaign and moderation paths.
+for _index_sql in (
+    "CREATE INDEX IF NOT EXISTS idx_weekly_activity_chat_week_count ON weekly_message_activity(chat_id, week_start, message_count DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_member_activity_chat_user ON member_activity(chat_id, user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_member_violations_chat_user ON member_violations(chat_id, user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_external_groups_owner_status ON external_group_control(added_by, is_external, is_member, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_external_staff_group_active ON external_owner_staff(owner_id, chat_id, active, user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_external_staff_caps_lookup ON external_owner_staff_caps(owner_id, user_id, chat_id, capability)",
+    "CREATE INDEX IF NOT EXISTS idx_logs_chat_recent ON logs(chat_id, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_due_status ON publish_campaigns(status, scheduled_at)",
+):
+    try:
+        db.execute(_index_sql)
+    except sqlite3.DatabaseError as _index_exc:
+        log.warning("Could not create optional performance index: %s", _index_exc)
+db.commit()
+
 SETTING_FIELDS = [
     "links", "photos", "videos", "audio", "files", "stickers", "gif",
     "username", "tag", "bots", "keyboard", "repeat",
@@ -888,6 +909,8 @@ DEFAULT_AUTO_REPLIES = [
     ("من معاي", "الذكاء الاصطناعي"),
 ]
 _auto_reply_last = {}
+_auto_reply_rules_cache = {}
+_AUTO_REPLY_RULES_TTL = 3.0
 _AUTO_REPLY_COOLDOWN_SECONDS = 30
 MEMBER_POINTS_COOLDOWN = 600  # 10 minutes between automatic member-point awards
 
@@ -2261,7 +2284,7 @@ def external_owner_group_rows(uid):
 def is_external_group_owner(uid):
     if not uid or is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid):
         return False
-    return bool(db.execute("SELECT 1 FROM external_group_control WHERE is_external=1 AND is_member=1 AND added_by=? LIMIT 1", (int(uid),)).fetchone())
+    return bool(db.execute("SELECT 1 FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 AND added_by=? LIMIT 1", (int(uid),)).fetchone())
 
 def external_owner_staff_group_rows(uid):
     return db.execute("SELECT DISTINCT e.chat_id,COALESCE(NULLIF(e.title,''),CAST(e.chat_id AS TEXT)) FROM external_group_control e JOIN external_owner_staff s ON s.owner_id=e.added_by AND s.chat_id=e.chat_id WHERE e.is_external=1 AND e.is_member=1 AND e.enabled=1 AND s.user_id=? AND s.active=1 ORDER BY e.title,e.chat_id",(int(uid),)).fetchall()
@@ -2296,13 +2319,33 @@ def external_owner_group_markup(uid, chat_id):
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع",callback_data="xowner_home")]])
     owner_view=int(row[1] or 0)==int(uid)
     rows=[]
-    for cap1,cap2,label1,label2 in (("mass_ban","banned","🚫 الحظر الجماعي","⛔ المحظورون"),("rejected","reentry","❌ المرفوضون","↩️ طلبات العودة")):
-        pair=[]
-        if owner_view or external_owner_can(uid,chat_id,cap1): pair.append(InlineKeyboardButton(label1,callback_data=f"xowner_feature:{chat_id}:{cap1}"))
-        if owner_view or external_owner_can(uid,chat_id,cap2): pair.append(InlineKeyboardButton(label2,callback_data=f"xowner_feature:{chat_id}:{cap2}"))
-        if pair: rows.append(pair)
-    if owner_view or external_owner_can(uid,chat_id,"publish"): rows.append([InlineKeyboardButton("📣 النشر والإعلانات",callback_data="xowner_campaigns")])
-    if owner_view: rows.append([InlineKeyboardButton("👑 إدارة الصلاحيات",callback_data=f"xowner_staff:{chat_id}")])
+    # Main control areas: each feature remains scoped to this external group.
+    if owner_view or external_owner_can(uid,chat_id,"protection"):
+        rows.append([InlineKeyboardButton("🛡️ الحماية وقفل/فتح المحتوى",callback_data=f"xowner_locks:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"mass_ban"):
+        rows.append([InlineKeyboardButton("🚫 الحظر الجماعي",callback_data=f"xowner_feature:{chat_id}:mass_ban"),
+                     InlineKeyboardButton("⛔ الممنوعون وفك الحظر",callback_data=f"xowner_feature:{chat_id}:banned")])
+    pair=[]
+    if owner_view or external_owner_can(uid,chat_id,"rejected"): pair.append(InlineKeyboardButton("❌ المرفوضون",callback_data=f"xowner_feature:{chat_id}:rejected"))
+    if owner_view or external_owner_can(uid,chat_id,"reentry"): pair.append(InlineKeyboardButton("↩️ طلبات العودة",callback_data=f"xowner_feature:{chat_id}:reentry"))
+    if pair: rows.append(pair)
+    if owner_view:
+        rows.append([InlineKeyboardButton("👥 المشرفون والمدراء والصلاحيات",callback_data=f"xowner_staff:{chat_id}")])
+    # Expose the implemented group-scoped views in the external owner's menu.
+    if owner_view or external_owner_can(uid,chat_id,"stats"):
+        rows.append([InlineKeyboardButton("📊 إحصائيات القروب",callback_data=f"xowner_stats:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"members"):
+        rows.append([InlineKeyboardButton("👥 الأعضاء والنشاط",callback_data=f"xowner_members:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"logs"):
+        rows.append([InlineKeyboardButton("📋 سجل عمليات القروب",callback_data=f"xowner_logs:{chat_id}")])
+    if owner_view:
+        rows.append([InlineKeyboardButton("👑 معلومات المالك والنائب",callback_data=f"xowner_role_owner:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"membership_notifications"):
+        rows.append([InlineKeyboardButton("🔔 إشعارات الدخول والخروج",callback_data=f"xowner_notifications:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"join_approval"):
+        rows.append([InlineKeyboardButton("🚪 طلبات الانضمام والموافقة",callback_data=f"xowner_join_requests:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"publish"):
+        rows.append([InlineKeyboardButton("📢 الإعلانات والنشر",callback_data="xowner_campaigns")])
     rows.append([InlineKeyboardButton("⬅️ لوحة القروبات",callback_data="xowner_home")])
     return InlineKeyboardMarkup(rows)
 
@@ -2313,7 +2356,7 @@ def external_owner_staff_group_markup(uid):
     return InlineKeyboardMarkup(rows)
 
 def external_owner_staff_markup(uid,chat_id):
-    row=db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND added_by=?",(int(chat_id),int(uid))).fetchone()
+    row=db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(int(chat_id),int(uid))).fetchone()
     if not row: return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع",callback_data="xowner_staff_groups")]])
     staff=db.execute("SELECT user_id,role,active FROM external_owner_staff WHERE owner_id=? AND chat_id=? ORDER BY user_id",(int(uid),int(chat_id))).fetchall()
     rows=[[InlineKeyboardButton(f"➕ إضافة نائب/مشرف/مدير",callback_data=f"xowner_staff_add:{chat_id}")]]
@@ -2333,6 +2376,25 @@ def external_owner_staff_user_markup(owner_id,chat_id,user_id):
         rows.append([InlineKeyboardButton("🔄 تغيير الرتبة",callback_data=f"xowner_staff_role:{chat_id}:{user_id}")])
         rows.append([InlineKeyboardButton("🚫 عزل هذا الشخص",callback_data=f"xowner_staff_remove:{chat_id}:{user_id}")])
     rows.append([InlineKeyboardButton("⬅️ طاقم القروب",callback_data=f"xowner_staff:{chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+EXTERNAL_LOCK_OPTIONS = [
+    ("🔗 الروابط","links"),("🖼️ الصور","photos"),("🎥 الفيديو","videos"),
+    ("🎵 الأغاني والصوتيات","audio"),("📁 الملفات","files"),("🎭 الملصقات","stickers"),
+    ("🎞️ الصور المتحركة","gif"),("🏷️ أسماء المستخدمين","username"),
+    ("📣 الإشارات والتاق","tag"),("🤖 البوتات","bots"),("⌨️ الكيبورد","keyboard"),
+    ("🔁 تكرار الرسائل","repeat"),("👋 رسائل الدخول","entry"),
+    ("➕ إضافة الأعضاء","add_lock"),("✏️ تعديل الرسائل","edit"),
+]
+
+def external_locks_markup(chat_id):
+    rows=[]
+    for label, field in EXTERNAL_LOCK_OPTIONS:
+        rows.append([InlineKeyboardButton("🔒 قفل "+label,callback_data=f"xowner_lock_set:{chat_id}:{field}:1"),
+                     InlineKeyboardButton("🔓 فتح "+label,callback_data=f"xowner_lock_set:{chat_id}:{field}:0")])
+    rows.append([InlineKeyboardButton("🔴 قفل الدردشة",callback_data=f"xowner_chat_lock:{chat_id}:1"),
+                 InlineKeyboardButton("🟢 فتح الدردشة",callback_data=f"xowner_chat_lock:{chat_id}:0")])
+    rows.append([InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{chat_id}")])
     return InlineKeyboardMarkup(rows)
 
 def panel_markup(uid):
@@ -3224,6 +3286,16 @@ async def get_verified_active_watched_groups(bot, limit=None):
 async def start(update, context):
     remember_delegated_user(update.effective_user)
     if update.effective_chat.type == ChatType.PRIVATE:
+        # Deep-link from an external group opens the isolated external-owner panel directly.
+        if context.args and context.args[0] == "external_panel":
+            if is_external_group_owner(update.effective_user.id) or is_external_group_staff(update.effective_user.id):
+                await panel(update, context)
+            else:
+                await update.effective_message.reply_text(
+                    "⛔ لا يوجد لديك قروب خارجي مسجل أو صلاحية طاقم فعّالة. "
+                    "تأكد من أن البوت مضاف إلى قروبك وأن تسجيل الملكية اكتمل."
+                )
+            return
         if context.args and context.args[0].startswith("support_"):
             try:
                 support_chat_id = int(context.args[0].split("_", 1)[1])
@@ -3341,6 +3413,34 @@ def group_owner_panel_markup(chat_id, uid=None):
 async def panel(update, context):
     uid = update.effective_user.id
     chat = update.effective_chat
+
+    # مالك القروب الخارجي وطاقمه يحصلون على مساحة مستقلة في الخاص.
+    # عند طلب /panel من داخل القروب، نوجّههم إلى الخاص بدل عرض لوحة الإدارة المحلية.
+    if is_external_group_owner(uid) or is_external_group_staff(uid):
+        if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            try:
+                bot_info = await context.bot.get_me()
+                bot_username = getattr(bot_info, "username", None)
+            except Exception:
+                bot_username = None
+            if bot_username:
+                private_url = f"https://t.me/{bot_username}?start=external_panel"
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 فتح لوحة القروب الخارجية في الخاص", url=private_url)]])
+                await update.effective_message.reply_text(
+                    "هذه لوحة القروب الخارجية المستقلة. افتح المحادثة الخاصة مع البوت لإدارة قروباتك وصلاحيات طاقمك، دون الوصول إلى لوحة مالك البوت أو القروبات الأخرى.",
+                    reply_markup=markup,
+                )
+            else:
+                await update.effective_message.reply_text(
+                    "🌐 لإدارة قروباتك الخارجية، افتح المحادثة الخاصة مع البوت ثم أرسل /panel."
+                )
+            return
+        await update.effective_message.reply_text(
+            "🌐 لوحة القروبات الخارجية\\n\\nاختر قروبًا تملكه لإدارته، أو افتح مركز الإعلانات والنشر لقروباتك فقط.",
+            reply_markup=panel_markup(uid),
+        )
+        return
+
     # داخل القروب: مشرف Telegram يحصل على لوحة لهذا القروب فقط، دون لوحة مالك البوت.
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not is_owner(uid) and not is_delegated_owner(uid) and not is_general_manager(uid) and not is_protection_manager(uid):
         if not await is_telegram_group_admin(context.bot, uid, chat.id):
@@ -3747,10 +3847,17 @@ async def notify_external_group_owner(context, chat_id, text):
     row=db.execute("SELECT is_external,added_by FROM external_group_control WHERE chat_id=?",(int(chat_id),)).fetchone()
     if not row or not row[0]:
         return False
+    active=db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1",(int(chat_id),)).fetchone()
+    if not active:
+        return False
     owner_id=int(row[1] or 0)
     recipients={owner_id} if owner_id>0 else set()
     recipients.update(int(r[0]) for r in db.execute(
-        "SELECT DISTINCT user_id FROM external_owner_staff_caps WHERE owner_id=? AND chat_id=? AND capability='membership_notifications'",
+        "SELECT DISTINCT c.user_id FROM external_owner_staff_caps c JOIN external_owner_staff s "
+        "ON s.owner_id=c.owner_id AND s.user_id=c.user_id AND s.chat_id=c.chat_id "
+        "JOIN external_group_control e ON e.chat_id=s.chat_id AND e.added_by=s.owner_id "
+        "WHERE c.owner_id=? AND c.chat_id=? AND c.capability='membership_notifications' "
+        "AND s.active=1 AND e.is_external=1 AND e.is_member=1 AND e.enabled=1",
         (owner_id,int(chat_id))).fetchall())
     for recipient in sorted(recipients):
         try: await context.bot.send_message(chat_id=recipient,text=text)
@@ -4918,7 +5025,13 @@ async def message_filter(update, context):
             normalized = normalize_auto_reply(msg.text)
             bot_username = getattr(context.bot, "username", "") or ""
             direct_call = is_direct_bot_call(msg.text, bot_username)
-            rules = db.execute("SELECT trigger_text,reply_text FROM auto_replies WHERE chat_id=? AND enabled=1 ORDER BY LENGTH(trigger_text) DESC", (chat.id,)).fetchall()
+            _rules_cached = _auto_reply_rules_cache.get(chat.id)
+            _cache_now = time.monotonic()
+            if _rules_cached and _cache_now - _rules_cached[0] < _AUTO_REPLY_RULES_TTL:
+                rules = _rules_cached[1]
+            else:
+                rules = db.execute("SELECT trigger_text,reply_text FROM auto_replies WHERE chat_id=? AND enabled=1 ORDER BY LENGTH(trigger_text) DESC", (chat.id,)).fetchall()
+                _auto_reply_rules_cache[chat.id] = (_cache_now, rules)
             for trigger, reply in rules:
                 needle = normalize_auto_reply(trigger)
                 if not needle:
@@ -4960,9 +5073,13 @@ async def message_filter(update, context):
                     f"📝 الاسم السابق: {old_name} ({old_user_label})\n"
                     f"🆕 الاسم الحالي: {current_name} ({new_user_label})"
                 )
-                # Privacy hardening: never publish profile-name changes (old/new
-                # names, username, or user ID) in the group. Keep the detail private.
-                await notify_owners(context, change_text, "membership")
+                # Keep profile-change details private. External group data is sent
+                # only to that group's owner and explicitly authorized staff.
+                ext_profile_row=db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?",(int(chat.id),)).fetchone()
+                if ext_profile_row and int(ext_profile_row[0] or 0)==1:
+                    await notify_external_group_owner(context,chat.id,change_text)
+                else:
+                    await notify_owners(context,change_text,"membership")
         if analytics_enabled:
             # Increment the statistical message counters only while statistics are enabled.
             db.execute(
@@ -5266,11 +5383,9 @@ async def chat_join_request_handler(update, context):
     is_external_request_group = bool(ext_info and int(ext_info[0] or 0) == 1)
     recipients = set()
     if is_external_request_group:
-        try:
-            admins = await context.bot.get_chat_administrators(chat.id)
-            recipients.update(int(a.user.id) for a in admins if getattr(a, "status", "") == "creator")
-        except Exception as exc:
-            log.warning("Could not resolve external group creator for join request chat=%s: %s", chat.id, exc)
+        _external_owner_row=db.execute("SELECT added_by FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1",(int(chat.id),)).fetchone()
+        if _external_owner_row and int(_external_owner_row[0] or 0)>0:
+            recipients.add(int(_external_owner_row[0]))
     else:
         if OWNER_ID:
             recipients.add(int(OWNER_ID))
@@ -5384,12 +5499,14 @@ def is_authorized_manual_add(chat_id, member, actor):
         return False
     registered = db.execute("SELECT 1 FROM watched_groups WHERE chat_id=?", (int(chat_id),)).fetchone()
     if not registered:
-        registered = db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1", (int(chat_id),)).fetchone()
+        registered = db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1", (int(chat_id),)).fetchone()
     if not registered:
         return False
     try:
-        ext_row = db.execute("SELECT is_external,added_by FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
+        ext_row = db.execute("SELECT is_external,added_by,enabled,is_member FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
         if ext_row and int(ext_row[0] or 0) == 1:
+            if not int(ext_row[2] or 0) or not int(ext_row[3] or 0):
+                return False
             authorized = int(ext_row[1] or 0) == actor_id or bool(
                 db.execute("SELECT 1 FROM external_owner_staff_caps c JOIN external_owner_staff s "
                            "ON s.owner_id=c.owner_id AND s.user_id=c.user_id AND s.chat_id=c.chat_id "
@@ -13006,8 +13123,8 @@ async def broadcast_draft_message(update, context):
         return
     if context.user_data.get("awaiting_xowner_staff_id") and chat.type == ChatType.PRIVATE:
         cid=int(context.user_data.get("awaiting_xowner_staff_id") or 0)
-        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND added_by=?",(cid,user.id)).fetchone():
-            context.user_data.pop("awaiting_xowner_staff_id",None); await msg.reply_text("لم يعد هذا القروب ضمن ملكيتك."); return
+        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,user.id)).fetchone():
+            context.user_data.pop("awaiting_xowner_staff_id",None); await msg.reply_text("لم يعد هذا القروب ضمن ملكيتك أو أنه غير نشط."); return
         raw=(msg.text or "").strip()
         if not raw.isdigit() or int(raw)<=0:
             context.user_data.pop("awaiting_xowner_staff_id",None); await msg.reply_text("تم إلغاء العملية. أرسل رقم Telegram ID صحيحًا من جديد."); return
@@ -13484,12 +13601,136 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q,"لا تملك صلاحية هذا القروب.",show_alert=True); return
         title=db.execute("SELECT title FROM external_group_control WHERE chat_id=?",(cid,)).fetchone()
         await q.edit_message_text(f"🌐 إدارة القروب: {(title[0] if title else str(cid))}\n\nاختر القسم المطلوب.",reply_markup=external_owner_group_markup(uid,cid)); return
+    if data.startswith("xowner_locks:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"protection"):
+            await safe_callback_answer(q,"لا تملك صلاحية الحماية في هذا القروب.",show_alert=True); return
+        await q.edit_message_text("🛡️ الحماية وقفل وفتح المحتوى\nاختر النوع والإجراء المطلوب. كل تغيير يخص هذا القروب فقط.",reply_markup=external_locks_markup(cid)); return
+    if data.startswith("xowner_lock_set:"):
+        try:
+            _,raw_cid,field,raw_value=data.split(":",3); cid=int(raw_cid); value=int(raw_value)
+        except Exception: await safe_callback_answer(q,"بيانات الأمر غير صحيحة.",show_alert=True); return
+        allowed_fields={x[1] for x in EXTERNAL_LOCK_OPTIONS}
+        if field not in allowed_fields or value not in (0,1) or not external_owner_can(uid,cid,"protection"):
+            await safe_callback_answer(q,"لا تملك صلاحية تنفيذ هذا الإجراء.",show_alert=True); return
+        try:
+            await context.bot.get_chat(cid)
+            set_setting(cid,field,value)
+            log_action(cid,uid,"external_setting",f"{field}={value}")
+            await safe_callback_answer(q,"تم تحديث إعداد الحماية.")
+            await q.edit_message_text(f"{'🔒 تم قفل' if value else '🔓 تم فتح'} {dict(EXTERNAL_LOCK_OPTIONS).get(field,field)} في هذا القروب.",reply_markup=external_locks_markup(cid))
+        except Exception as exc:
+            log.warning("External lock setting failed chat=%s field=%s: %s",cid,field,exc)
+            await safe_callback_answer(q,"تعذر تحديث الإعداد.",show_alert=True)
+        return
+    if data.startswith("xowner_chat_lock:"):
+        try: _,raw_cid,raw_value=data.split(":",2); cid=int(raw_cid); lock=int(raw_value)
+        except Exception: await safe_callback_answer(q,"بيانات الأمر غير صحيحة.",show_alert=True); return
+        if lock not in (0,1) or not external_owner_can(uid,cid,"protection"):
+            await safe_callback_answer(q,"لا تملك صلاحية قفل الدردشة لهذا القروب.",show_alert=True); return
+        try:
+            chat=await context.bot.get_chat(cid)
+            if getattr(chat,"type",None) not in (ChatType.GROUP,ChatType.SUPERGROUP):
+                await safe_callback_answer(q,"قفل الدردشة متاح للقروبات فقط.",show_alert=True); return
+            permission_fields=("can_send_messages","can_send_audios","can_send_documents","can_send_photos","can_send_videos","can_send_video_notes","can_send_voice_notes","can_send_polls","can_send_other_messages","can_add_web_page_previews")
+            if lock:
+                existing=db.execute("SELECT permissions_json FROM external_chat_permission_backups WHERE chat_id=?",(cid,)).fetchone()
+                if not existing:
+                    current=getattr(chat,"permissions",None)
+                    if current is None:
+                        await safe_callback_answer(q,"تعذر قراءة صلاحيات القروب الحالية؛ لم يتم قفل الدردشة حتى لا نفقد إعداداته.",show_alert=True); return
+                    snapshot={name:getattr(current,name,None) for name in permission_fields if getattr(current,name,None) is not None}
+                    if not snapshot:
+                        await safe_callback_answer(q,"تعذر حفظ صلاحيات القروب الحالية بشكل موثوق؛ لم يتم قفل الدردشة.",show_alert=True); return
+                    db.execute("INSERT OR REPLACE INTO external_chat_permission_backups(chat_id,permissions_json,saved_at) VALUES(?,?,?)",(cid,json.dumps(snapshot,ensure_ascii=False),now())); db.commit()
+                permissions=ChatPermissions(can_send_messages=False,can_send_audios=False,can_send_documents=False,can_send_photos=False,can_send_videos=False,can_send_video_notes=False,can_send_voice_notes=False,can_send_polls=False,can_send_other_messages=False,can_add_web_page_previews=False)
+                await context.bot.set_chat_permissions(chat_id=cid,permissions=permissions)
+            else:
+                backup=db.execute("SELECT permissions_json FROM external_chat_permission_backups WHERE chat_id=?",(cid,)).fetchone()
+                if not backup:
+                    await safe_callback_answer(q,"لا توجد نسخة محفوظة من صلاحيات القروب السابقة. لم أغيّر الإعدادات حتى لا أفتح صلاحيات كانت مقيدة يدويًا.",show_alert=True); return
+                try: original=json.loads(backup[0] or "{}")
+                except Exception: original={}
+                if not original:
+                    await safe_callback_answer(q,"نسخة الصلاحيات السابقة غير مكتملة؛ لم يتم تغيير الإعدادات.",show_alert=True); return
+                permissions=ChatPermissions(**{k:v for k,v in original.items() if k in permission_fields})
+                await context.bot.set_chat_permissions(chat_id=cid,permissions=permissions)
+                db.execute("DELETE FROM external_chat_permission_backups WHERE chat_id=?",(cid,)); db.commit()
+            log_action(cid,uid,"all_messages_locked" if lock else "all_messages_unlocked","external owner panel; original permissions preserved")
+            await safe_callback_answer(q,"تم تنفيذ الأمر.")
+            await q.edit_message_text("🔒 تم قفل الدردشة مع حفظ صلاحياتها السابقة." if lock else "🔓 تمت استعادة صلاحيات الدردشة السابقة.",reply_markup=external_locks_markup(cid))
+        except Exception as exc:
+            log.warning("External chat lock failed chat=%s: %s",cid,exc)
+            await safe_callback_answer(q,"تعذر التنفيذ. تأكد من صلاحية البوت لتقييد الأعضاء.",show_alert=True)
+        return
+    if data.startswith("xowner_stats:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"stats"):
+            await safe_callback_answer(q,"لا تملك صلاحية الإحصائيات لهذا القروب.",show_alert=True); return
+        week=_week_start()
+        row=db.execute("SELECT COALESCE(SUM(message_count),0),COUNT(*) FROM weekly_message_activity WHERE chat_id=? AND week_start=?",(cid,week)).fetchone()
+        known=db.execute("SELECT COUNT(*) FROM member_activity WHERE chat_id=?",(cid,)).fetchone()[0]
+        top=db.execute("SELECT COALESCE(ma.display_name,'عضو'),wa.message_count FROM weekly_message_activity wa LEFT JOIN member_activity ma ON ma.chat_id=wa.chat_id AND ma.user_id=wa.user_id WHERE wa.chat_id=? AND wa.week_start=? ORDER BY wa.message_count DESC LIMIT 5",(cid,week)).fetchall()
+        top_text="\\n".join(f"{i}. {name} — {count}" for i,(name,count) in enumerate(top,1)) or "لا توجد بيانات كافية"
+        await q.edit_message_text(f"📊 إحصائيات القروب\\nالرسائل هذا الأسبوع: {row[0]}\\nالأعضاء المتفاعلون: {row[1]}\\nالأعضاء المسجلون: {known}\\n\\n🏆 الأكثر تفاعلًا:\\n{top_text}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
+    if data.startswith("xowner_logs:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"logs"):
+            await safe_callback_answer(q,"لا تملك صلاحية السجل لهذا القروب.",show_alert=True); return
+        rows=db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 15",(cid,)).fetchall()
+        body="\\n".join(f"• {a}: {d or ''} ({t or ''})" for a,d,t in rows) or "لا توجد عمليات مسجلة."
+        await q.edit_message_text("📋 آخر عمليات القروب\\n\\n"+body[:3800],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
+    if data.startswith("xowner_members:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"members"):
+            await safe_callback_answer(q,"لا تملك صلاحية إدارة الأعضاء.",show_alert=True); return
+        rows=db.execute("SELECT user_id,display_name,username,message_count FROM member_activity WHERE chat_id=? ORDER BY message_count DESC LIMIT 30",(cid,)).fetchall()
+        body="\\n".join(f"• {name or 'عضو'} — {('@'+username) if username else user_id} — {count} رسالة" for user_id,name,username,count in rows) or "لا توجد أسماء مسجلة بعد."
+        await q.edit_message_text("👥 الأعضاء المعروفون لدى البوت (آخر 30 حسب النشاط)\\n\\n"+body[:3800],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
+    if data.startswith("xowner_role_owner:") or data.startswith("xowner_role_deputy:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not is_external_group_owner(uid) or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND added_by=? AND is_external=1",(cid,uid)).fetchone():
+            await safe_callback_answer(q,"هذه المعلومات متاحة لمالك هذا القروب فقط.",show_alert=True); return
+        if data.startswith("xowner_role_owner:"):
+            text="👑 المالك الأساسي\\nأنت مالك هذا القروب الخارجي، وتملك صلاحيات إدارته."
+        else:
+            deputy=db.execute("SELECT user_id,role FROM external_owner_staff WHERE owner_id=? AND chat_id=? AND active=1 AND role='نائب' ORDER BY user_id",(uid,cid)).fetchall()
+            text="🛡️ نائب المالك\\n"+("\\n".join(f"• {x[0]}" for x in deputy) if deputy else "لم يتم تعيين نائب لهذا القروب بعد.")
+        await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 إدارة الطاقم",callback_data=f"xowner_staff:{cid}")],[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
+    if data.startswith("xowner_notifications:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"membership_notifications"):
+            await safe_callback_answer(q,"لا تملك صلاحية إعداد الإشعارات.",show_alert=True); return
+        recipients=db.execute("SELECT DISTINCT c.user_id FROM external_owner_staff_caps c JOIN external_owner_staff s ON s.owner_id=c.owner_id AND s.user_id=c.user_id AND s.chat_id=c.chat_id JOIN external_group_control e ON e.chat_id=s.chat_id AND e.added_by=s.owner_id WHERE c.owner_id=(SELECT added_by FROM external_group_control WHERE chat_id=?) AND c.chat_id=? AND c.capability='membership_notifications' AND s.active=1 AND e.is_external=1 AND e.is_member=1 AND e.enabled=1",(cid,cid)).fetchall()
+        await q.edit_message_text("🔔 إشعارات العضوية\\nتصل الإشعارات إلى مالك القروب، وإلى المفوضين الذين منحتهم صلاحية «إشعارات الدخول والخروج».\\n\\nالمفوضون الحاليون: "+(", ".join(str(r[0]) for r in recipients) if recipients else "لا يوجد مفوضون إضافيون."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 إدارة صلاحيات الإشعارات",callback_data=f"xowner_staff:{cid}")],[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
+    if data.startswith("xowner_join_requests:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"join_approval"):
+            await safe_callback_answer(q,"لا تملك صلاحية مراجعة طلبات هذا القروب.",show_alert=True); return
+        pending=db.execute("SELECT user_id,display_name,username,requested_at FROM join_request_events WHERE chat_id=? AND status='pending' ORDER BY requested_at DESC LIMIT 20",(cid,)).fetchall()
+        lines=[f"🚪 طلبات الانضمام المعلقة — {cid}",""]
+        rows=[]
+        for target_id,name,username,requested_at in pending:
+            lines.append(f"• {name or 'عضو'} — ID {target_id} — @{username or 'بدون اسم'} — {requested_at or ''}")
+            rows.append([InlineKeyboardButton(f"✅ قبول {str(name or target_id)[:18]}",callback_data=f"joinreq_approve:{cid}:{target_id}"),InlineKeyboardButton("❌ رفض",callback_data=f"joinreq_deny:{cid}:{target_id}")])
+        if not pending: lines.append("لا توجد طلبات معلقة حاليًا.")
+        rows.append([InlineKeyboardButton("🔄 تحديث",callback_data=f"xowner_join_requests:{cid}"),InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")])
+        await q.edit_message_text("\n".join(lines)[:3800],reply_markup=InlineKeyboardMarkup(rows)); return
     if data.startswith("xowner_feature:"):
         try: _,raw_cid,cap=data.split(":",2); cid=int(raw_cid)
         except Exception: await safe_callback_answer(q,"طلب غير صالح.",show_alert=True); return
         if not external_owner_can(uid,cid,cap):
             await safe_callback_answer(q,"لا تملك صلاحية هذا القسم في هذا القروب.",show_alert=True); return
-        labels={"mass_ban":"الحظر الجماعي","banned":"المحظورون","rejected":"المرفوضون","reentry":"طلبات العودة"}
+        labels={"mass_ban":"الحظر الجماعي","banned":"المحظورون","rejected":"المرفوضون","reentry":"طلبات العودة","join_approval":"طلبات الانضمام والموافقة"}
+        if cap == "join_approval":
+            await q.edit_message_text(f"🚪 طلبات الانضمام — القروب {cid}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("فتح الطلبات المعلقة",callback_data=f"xowner_join_requests:{cid}")],[InlineKeyboardButton("⬅️ رجوع",callback_data=f"xowner_group:{cid}")]])); return
         if cap == "mass_ban":
             if not external_owner_can(uid,cid,"mass_ban"):
                 await safe_callback_answer(q,"لا تملك صلاحية الحظر الجماعي لهذا القروب.",show_alert=True); return
@@ -13509,12 +13750,12 @@ async def _callback_impl(update, context):
     if data.startswith("xowner_staff:"):
         try: cid=int(data.split(":",1)[1])
         except Exception: await safe_callback_answer(q,"قروب غير صالح.",show_alert=True); return
-        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"هذا القروب ليس ضمن ملكيتك.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"هذا القروب ليس ضمن ملكيتك أو أنه غير نشط.",show_alert=True); return
         await q.edit_message_text("👑 إدارة الطاقم والصلاحيات لهذا القروب فقط. اختر شخصًا لتحديد صلاحياته أو أضف شخصًا جديدًا.",reply_markup=external_owner_staff_markup(uid,cid)); return
     if data.startswith("xowner_staff_add:"):
         try: cid=int(data.split(":",1)[1])
         except Exception: await safe_callback_answer(q,"قروب غير صالح.",show_alert=True); return
-        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"لا تملك هذا القروب.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"لا تملك هذا القروب أو أنه غير نشط.",show_alert=True); return
         context.user_data["awaiting_xowner_staff_id"]=cid
         await q.edit_message_text("أرسل رقم Telegram ID للشخص الذي تريد تعيينه نائبًا أو مشرفًا أو مديرًا لهذا القروب. ستبدأ صلاحياته بدون أي صلاحيات إضافية حتى تحددها أنت.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء",callback_data=f"xowner_staff:{cid}")]])); return
     if data.startswith("xowner_staff_user:"):
@@ -13525,7 +13766,7 @@ async def _callback_impl(update, context):
     if data.startswith("xowner_staff_cap:"):
         try: _,raw_cid,raw_uid,cap=data.split(":",3); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if cap not in EXTERNAL_OWNER_CAPS or cap=="manage_staff" or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone():
+        if cap not in EXTERNAL_OWNER_CAPS or cap=="manage_staff" or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone():
             await safe_callback_answer(q,"لا يمكن تعديل هذه الصلاحية.",show_alert=True); return
         exists=db.execute("SELECT 1 FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=? AND capability=?",(uid,target,cid,cap)).fetchone()
         if exists: db.execute("DELETE FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=? AND capability=?",(uid,target,cid,cap)); status="سُحبت"
@@ -13535,21 +13776,27 @@ async def _callback_impl(update, context):
     if data.startswith("xowner_staff_role:"):
         try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"الشخص غير مفوض.",show_alert=True); return
+        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"القروب غير نشط أو الشخص غير مفوض.",show_alert=True); return
         rows=[[InlineKeyboardButton(role,callback_data=f"xowner_staff_setrole:{cid}:{target}:{role}")] for role in ("نائب","مشرف","مدير")]
         rows.append([InlineKeyboardButton("⬅️ رجوع",callback_data=f"xowner_staff_user:{cid}:{target}")])
         await q.edit_message_text("اختر الرتبة لهذا القروب فقط:",reply_markup=InlineKeyboardMarkup(rows)); return
     if data.startswith("xowner_staff_setrole:"):
         try: _,raw_cid,raw_uid,role=data.split(":",3); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if role not in ("نائب","مشرف","مدير") or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"تغيير الرتبة غير مسموح.",show_alert=True); return
-        db.execute("UPDATE external_owner_staff SET role=? WHERE owner_id=? AND user_id=? AND chat_id=?",(role,uid,target,cid)); db.commit()
+        if role not in ("نائب","مشرف","مدير") or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"تغيير الرتبة غير مسموح أو أن التفويض لم يعد نشطًا.",show_alert=True); return
+        cur=db.execute("UPDATE external_owner_staff SET role=? WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(role,uid,target,cid))
+        if not cur.rowcount: await safe_callback_answer(q,"تعذر تغيير الرتبة؛ تأكد من أن الشخص لا يزال مفوضًا.",show_alert=True); return
+        db.commit()
         await q.edit_message_text(f"تم تحديث رتبة المستخدم {target} إلى {role}.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
     if data.startswith("xowner_staff_remove:"):
         try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"لا تملك هذا القروب.",show_alert=True); return
-        db.execute("UPDATE external_owner_staff SET active=0 WHERE owner_id=? AND user_id=? AND chat_id=?",(uid,target,cid)); db.execute("DELETE FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=?",(uid,target,cid)); db.commit()
+        if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"لا تملك هذا القروب أو أنه غير نشط.",show_alert=True); return
+        cur=db.execute("UPDATE external_owner_staff SET active=0 WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid))
+        if not cur.rowcount:
+            await safe_callback_answer(q,"هذا الشخص غير مفوض حاليًا.",show_alert=True); return
+        db.execute("DELETE FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=?",(uid,target,cid)); db.commit()
+        log_action(cid,uid,"external_owner_staff_removed",f"target={target}")
         await q.edit_message_text(f"✅ تم عزل المستخدم {target} وسحب جميع صلاحياته في هذا القروب.",reply_markup=external_owner_staff_markup(uid,cid)); return
     if data == "xowner_campaigns":
         if not (is_external_group_owner(uid) or any(external_owner_can(uid,int(g[0]),"publish") for g in external_owner_staff_group_rows(uid))):
@@ -13759,9 +14006,14 @@ async def _callback_impl(update, context):
         try: _, chat_raw, tab = data.split(":", 2); chat_id = int(chat_raw)
         except ValueError: await safe_callback_answer(q, "بيانات القائمة غير صحيحة.", show_alert=True); return
         ext = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
+        if tab not in ("banned", "rejected", "returns"):
+            await safe_callback_answer(q, "نوع القائمة غير صحيح.", show_alert=True); return
         if ext and int(ext[0] or 0) == 1:
-            _cap = "reentry" if tab in ("banned", "returns") else "rejected"
-            allowed = external_owner_can(uid, chat_id, _cap)
+            if tab == "returns":
+                allowed = external_owner_can(uid, chat_id, "reentry") or external_owner_can(uid, chat_id, "join_approval")
+            else:
+                _cap = "reentry" if tab == "banned" else "rejected"
+                allowed = external_owner_can(uid, chat_id, _cap)
         else:
             allowed = is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id) or can_use_capability(uid, "join_approval", chat_id)
         if not allowed:
@@ -13811,8 +14063,8 @@ async def _callback_impl(update, context):
         if not authorized_approver:
             await safe_callback_answer(q, "لا تملك صلاحية قبول أو رفض طلبات الانضمام لهذا القروب.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
-        if not reqrow or reqrow[0] not in ("pending", "approved"):
-            await safe_callback_answer(q, "الطلب لم يعد معلقًا.", show_alert=True); return
+        if not reqrow or reqrow[0] != "pending":
+            await safe_callback_answer(q, "الطلب لم يعد معلقًا أو تمت معالجته مسبقًا.", show_alert=True); return
         if action == "joinreq_approve":
             if global_ban_applies(target_id, chat_id):
                 await safe_callback_answer(q, "هذا العضو عليه حظر إداري نشط ولا يمكن قبول طلبه قبل فك الحظر صراحةً.", show_alert=True); return
@@ -17598,7 +17850,7 @@ async def global_ban_enforcement_worker(app):
 
 
 async def daily_group_ad_worker(app):
-    """Send one approved bot advertisement daily at 22:00 Riyadh time to groups only."""
+    """Internal groups: daily at 22:00; external groups: every 3 days at 22:00 Riyadh time."""
     tz = ZoneInfo("Asia/Riyadh")
     ad_text = (
         "🔰 بوت حماية ومساعدة القروبات\n\n"
@@ -17613,11 +17865,14 @@ async def daily_group_ad_worker(app):
                 target += timedelta(days=1)
             await asyncio.sleep(max(1, (target-current).total_seconds()))
             ad_date = target.date().isoformat()
-            group_ids = {int(r[0]) for r in owner_managed_group_rows()}
-            group_ids.update(int(r[0]) for r in db.execute(
+            internal_ids = {int(r[0]) for r in owner_managed_group_rows()}
+            external_rows = db.execute(
                 "SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1"
-            ).fetchall())
-            for chat_id in sorted(group_ids):
+            ).fetchall()
+            external_ids = {int(r[0]) for r in external_rows} - internal_ids
+
+            # Keep the primary owner's existing daily schedule unchanged.
+            for chat_id in sorted(internal_ids):
                 if db.execute("SELECT 1 FROM bot_ad_deliveries WHERE chat_id=? AND ad_date=?", (chat_id, ad_date)).fetchone():
                     continue
                 try:
@@ -17627,12 +17882,36 @@ async def daily_group_ad_worker(app):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.warning("Daily group ad failed chat=%s: %s", chat_id, exc)
+                    log.warning("Internal daily group ad failed chat=%s: %s", chat_id, exc)
+                await asyncio.sleep(0.15)
+
+            # External groups receive the same ad at 22:00, but only once per
+            # three elapsed calendar days per chat. The existing delivery table
+            # is reused so no migration or data deletion is required.
+            for chat_id in sorted(external_ids):
+                last = db.execute("SELECT MAX(ad_date) FROM bot_ad_deliveries WHERE chat_id=?", (chat_id,)).fetchone()
+                last_date = last[0] if last else None
+                if last_date:
+                    try:
+                        if (target.date() - datetime.strptime(last_date, "%Y-%m-%d").date()).days < 3:
+                            continue
+                    except ValueError:
+                        log.warning("Invalid external ad delivery date chat=%s value=%r", chat_id, last_date)
+                if db.execute("SELECT 1 FROM bot_ad_deliveries WHERE chat_id=? AND ad_date=?", (chat_id, ad_date)).fetchone():
+                    continue
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=ad_text, disable_web_page_preview=True)
+                    db.execute("INSERT OR IGNORE INTO bot_ad_deliveries(chat_id,ad_date,sent_at) VALUES(?,?,?)", (chat_id, ad_date, now()))
+                    db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("External three-day group ad failed chat=%s: %s", chat_id, exc)
                 await asyncio.sleep(0.15)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Daily group ad worker failed")
+            log.exception("Group ad worker failed")
             await asyncio.sleep(60)
 
 
