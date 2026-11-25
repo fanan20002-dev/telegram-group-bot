@@ -2347,6 +2347,8 @@ def external_owner_group_markup(uid, chat_id):
         rows.append([InlineKeyboardButton("🔔 إشعارات الدخول والخروج",callback_data=f"xowner_notifications:{chat_id}")])
     if owner_view or external_owner_can(uid,chat_id,"join_approval"):
         rows.append([InlineKeyboardButton("🚪 طلبات الانضمام والموافقة",callback_data=f"xowner_join_requests:{chat_id}")])
+        if owner_view:
+            rows.append([InlineKeyboardButton("🔗 إنشاء/تجديد رابط بموافقة المالك",callback_data=f"xowner_join_link:{chat_id}")])
     if owner_view or external_owner_can(uid,chat_id,"publish"):
         rows.append([InlineKeyboardButton("📢 الإعلانات والنشر",callback_data="xowner_campaigns")])
     rows.append([InlineKeyboardButton("⬅️ لوحة القروبات",callback_data="xowner_home")])
@@ -5556,6 +5558,16 @@ async def chat_member_handler(update, context):
         actor = getattr(cm, "from_user", None)
         actor_id = int(getattr(actor, "id", 0) or 0)
         authorized_direct_add = is_authorized_manual_add(chat_id, member, actor)
+        # In external groups, an invitation link must always go through Telegram's
+        # join-request flow, even when the link was shared by the group owner/admin.
+        # Preserve the existing internal-group direct-add exception unchanged.
+        _external_scope = db.execute(
+            "SELECT is_external FROM external_group_control WHERE chat_id=?", (int(chat_id),)
+        ).fetchone()
+        _is_external_group = bool(_external_scope and int(_external_scope[0] or 0) == 1)
+        _used_invite_link = getattr(cm, "invite_link", None) is not None
+        if _is_external_group and _used_invite_link:
+            authorized_direct_add = False
         log.info(
             "MEMBER_JOIN_TRANSITION chat_id=%s member_id=%s actor_id=%s owner_authorized=%s approval_enabled=%s",
             chat_id, member.id, actor_id or 0, int(authorized_direct_add),
@@ -13970,6 +13982,28 @@ async def _callback_impl(update, context):
         log_action(chat_id, uid, "group_feature_toggle", f"{feature}={int(new_state)}")
         note = ""
         await q.edit_message_text(f"تم {'تشغيل' if new_state else 'إيقاف'} الإعداد بنجاح.{note}", reply_markup=group_controls_markup(chat_id)); return
+
+    if data.startswith("xowner_join_link:"):
+        try: chat_id = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
+        _owner_row = db.execute(
+            "SELECT added_by,is_external,is_member,enabled FROM external_group_control WHERE chat_id=?",
+            (chat_id,)
+        ).fetchone()
+        if not _owner_row or not _owner_row[1] or not _owner_row[2] or not _owner_row[3] or int(_owner_row[0] or 0) != int(uid):
+            await safe_callback_answer(q, "إنشاء رابط الموافقة متاح لمالك هذا القروب الخارجي فقط.", show_alert=True); return
+        try:
+            _request_link = await create_managed_join_request_link(context.bot, chat_id)
+            await q.message.reply_text(
+                f"🔗 رابط الانضمام بموافقة مالك القروب:\n{_request_link}\n\n"
+                "كل من يستخدم هذا الرابط سيرسل طلب انضمام ينتظر موافقتك. تم إلغاء رابط الدعوة الأساسي السابق إن سمحت Telegram بذلك. "
+                "استخدم الرابط الجديد ووزّعه بدل الروابط القديمة."
+            )
+            await safe_callback_answer(q, "تم إنشاء رابط طلب الانضمام.")
+        except Exception as exc:
+            await safe_callback_answer(q, "تعذر إنشاء الرابط. تأكد أن البوت مشرف ويملك صلاحية دعوة المستخدمين.", show_alert=True)
+            log.warning("External join-request invite creation failed chat=%s: %s", chat_id, exc)
+        return
 
     if data.startswith("gctrl_link:"):
         if not (is_owner(uid) or is_deputy_owner(uid)):
