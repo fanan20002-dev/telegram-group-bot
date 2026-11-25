@@ -2274,6 +2274,7 @@ EXTERNAL_OWNER_CAPS = {
     "reentry": "↩️ طلبات العودة", "members": "👥 إدارة الأعضاء",
     "protection": "🛡️ الحماية", "stats": "📊 الإحصائيات",
     "logs": "📋 السجلات", "membership_notifications": "🔔 إشعارات الدخول والخروج",
+    "tag": "📣 استدعاء التاق للأعضاء",
     "manage_staff": "👑 إدارة النائب والمشرفين والمدراء",
     "join_approval": "🚪 مراجعة طلبات الانضمام",
 }
@@ -2322,6 +2323,8 @@ def external_owner_group_markup(uid, chat_id):
     # Main control areas: each feature remains scoped to this external group.
     if owner_view or external_owner_can(uid,chat_id,"protection"):
         rows.append([InlineKeyboardButton("🛡️ الحماية وقفل/فتح المحتوى",callback_data=f"xowner_locks:{chat_id}")])
+    if owner_view or external_owner_can(uid,chat_id,"tag"):
+        rows.append([InlineKeyboardButton("📣 استدعاء التاق للأعضاء",callback_data=f"xowner_tag_group:{chat_id}")])
     if owner_view or external_owner_can(uid,chat_id,"mass_ban"):
         rows.append([InlineKeyboardButton("🚫 الحظر الجماعي",callback_data=f"xowner_feature:{chat_id}:mass_ban"),
                      InlineKeyboardButton("⛔ الممنوعون وفك الحظر",callback_data=f"xowner_feature:{chat_id}:banned")])
@@ -13601,6 +13604,34 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q,"لا تملك صلاحية هذا القروب.",show_alert=True); return
         title=db.execute("SELECT title FROM external_group_control WHERE chat_id=?",(cid,)).fetchone()
         await q.edit_message_text(f"🌐 إدارة القروب: {(title[0] if title else str(cid))}\n\nاختر القسم المطلوب.",reply_markup=external_owner_group_markup(uid,cid)); return
+    if data.startswith("xowner_tag_group:"):
+        try: cid=int(data.split(":",1)[1])
+        except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
+        if not external_owner_can(uid,cid,"tag"):
+            await safe_callback_answer(q,"لا تملك صلاحية استدعاء التاق في هذا القروب.",show_alert=True); return
+        members=db.execute("SELECT user_id,display_name FROM member_activity WHERE chat_id=? ORDER BY display_name COLLATE NOCASE",(cid,)).fetchall()
+        mentions=[]; seen_ids=set()
+        for member_id,display_name in members:
+            if not member_id or member_id in seen_ids: continue
+            seen_ids.add(member_id)
+            label=html.escape((display_name or "عضو").replace("\n"," ")[:80])
+            mentions.append(f'<a href="tg://user?id={member_id}">{label}</a>')
+        if not mentions:
+            await safe_callback_answer(q,"لا توجد أسماء أعضاء مسجلة لهذا القروب بعد.",show_alert=True); return
+        try:
+            for chunk in split_mentions_for_telegram(mentions):
+                await context.bot.send_message(chat_id=cid,text=chunk,parse_mode="HTML",disable_web_page_preview=True)
+                await asyncio.sleep(0.35)
+            log_action(cid,uid,"external_mass_mention",f"members={len(mentions)}")
+            await q.edit_message_text(
+                f"📣 تم إرسال التاق إلى {len(mentions)} عضوًا مسجلًا في هذا القروب فقط.\n\n"
+                "ملاحظة: تيليجرام لا يتيح للبوت جلب جميع الأعضاء مباشرة؛ يشمل التاق الأعضاء الذين يعرفهم البوت والمسجلين في قاعدة بياناته.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])
+            )
+        except Exception as exc:
+            log.warning("External owner mass mention failed chat=%s user=%s: %s",cid,uid,exc)
+            await safe_callback_answer(q,"تعذر إرسال التاق. تحقق من صلاحيات البوت وحدود تيليجرام.",show_alert=True)
+        return
     if data.startswith("xowner_locks:"):
         try: cid=int(data.split(":",1)[1])
         except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
