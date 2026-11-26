@@ -2221,6 +2221,7 @@ def external_group_manage_markup(chat_id, uid=None):
     rows.append([InlineKeyboardButton("⛔ المحظورون", callback_data=f"restricted_group_tab:{chat_id}:banned")])
     rows.append([InlineKeyboardButton("❌ المرفوضون", callback_data=f"restricted_group_tab:{chat_id}:rejected")])
     rows.append([InlineKeyboardButton("↩️ طلبات العودة والانضمام", callback_data=f"restricted_group_tab:{chat_id}:returns")])
+    rows.append([InlineKeyboardButton("🔗 إدارة رابط دعوة القروب", callback_data=f"external_link_manage:{chat_id}")])
     rows.append([InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="external_groups")])
     return InlineKeyboardMarkup(rows)
 
@@ -2562,6 +2563,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات", callback_data="group_controls")],
         [InlineKeyboardButton("🎛️ تحكم جماعي بالإحصائيات والردود الآلية", callback_data="owner_global_controls")],
         [InlineKeyboardButton("🏠 إدارة صلاحيات القروبات الداخلية", callback_data="internal_groups_controls")],
+        [InlineKeyboardButton("🌐 إدارة القروبات الخارجية ومعلوماتها", callback_data="external_groups")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
@@ -15085,7 +15087,7 @@ async def _callback_impl(update, context):
 
     # External group control center: owner or users explicitly granted external_groups.
     if data in {"external_groups", "external_groups_refresh"} or data.startswith("external_groups_page:"):
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
+        if not can_manage_external_groups(uid):
             await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
         page = 0
         if data.startswith("external_groups_page:"):
@@ -15111,7 +15113,7 @@ async def _callback_impl(update, context):
                 await safe_callback_answer(q, "تعذر إكمال التحديث. لم تُحذف السجلات بسبب هذا الخطأ.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا نشطًا. استخدم زر التحديث للتحقق من العضوية الفعلية. تُحفظ السجلات والإعدادات التاريخية للقروبات التي غادرها البوت.", reply_markup=external_groups_markup(page)); return
     if data.startswith("external_group:"):
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
+        if not can_manage_external_groups(uid):
             await safe_callback_answer(q, "غير مصرح لك بإدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
@@ -15130,12 +15132,105 @@ async def _callback_impl(update, context):
             log.debug("Could not resolve external group creator for %s: %s", ext_chat_id, owner_exc)
         caps = db.execute("SELECT capability,enabled FROM external_group_capabilities WHERE chat_id=? ORDER BY capability", (ext_chat_id,)).fetchall()
         cap_text = "\n".join(f"• {EXTERNAL_CAPABILITY_LABELS.get(cap,cap)}: {'مفعّل' if on else 'معطّل'}" for cap,on in caps)
+        recorded_owner = html.escape(added_name or "غير معروف")
+        recorded_username = (" — @" + html.escape(added_username)) if added_username else ""
         text = (f"🌐 معلومات القروب الخارجي\n\nالقروب: {html.escape(title or str(ext_chat_id))}\nID: {ext_chat_id}\n"
-                f"مالك القروب في Telegram: {telegram_owner_label}\n"
-                f"أضاف البوت: {html.escape(added_name or 'غير معروف')} (ID: {added_by or 'غير معروف'})"
-                f"{' — @'+html.escape(added_username) if added_username else ''}\nتاريخ التسجيل: {created_at}\n"
-                f"حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
+                f"👑 مالك القروب في Telegram: {telegram_owner_label}\n"
+                f"👤 اسم الحساب المسجل عند إضافة البوت: {recorded_owner} (ID: {added_by or 'غير معروف'}){recorded_username}\n"
+                f"📅 تاريخ التسجيل: {created_at}\n"
+                f"⚙️ حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=external_group_manage_markup(ext_chat_id, uid)); return
+    if data.startswith("external_link_manage:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "إدارة روابط القروبات الخارجية متاحة لمالك البوت الأساسي فقط.", show_alert=True); return
+        try: ext_chat_id = int(data.split(":", 1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
+        if not ext_row:
+            await safe_callback_answer(q, "القروب الخارجي غير مسجل.", show_alert=True); return
+        await sync_group_link_record(context.bot, ext_chat_id)
+        link_row = db.execute("SELECT invite_link,link_status,last_updated_at FROM group_link_directory WHERE chat_id=?", (ext_chat_id,)).fetchone()
+        invite_link, link_status, link_updated = link_row if link_row else ("", "unknown", "")
+        buttons = []
+        if invite_link.startswith("https://"):
+            buttons.append([InlineKeyboardButton("🔗 فتح الرابط الحالي", url=invite_link)])
+        buttons.append([InlineKeyboardButton("♻️ إلغاء الرابط الحالي وإنشاء رابط جديد", callback_data=f"external_link_renew:{ext_chat_id}")])
+        buttons.append([InlineKeyboardButton("🗑️ سحب الرابط الحالي", callback_data=f"external_link_revoke:{ext_chat_id}")])
+        buttons.append([InlineKeyboardButton("⬅️ معلومات وإدارة القروب", callback_data=f"external_group:{ext_chat_id}")])
+        await q.edit_message_text(
+            f"🔗 إدارة رابط القروب الخارجي\n\nالقروب: {html.escape(ext_row[0] or str(ext_chat_id))}\nID: {ext_chat_id}\n"
+            f"الرابط الحالي: {html.escape(invite_link or 'لا يوجد رابط محفوظ')}\nحالة الرابط: {html.escape(link_status or 'غير معروف')}\n"
+            f"آخر تحديث: {html.escape(link_updated or 'غير متوفر')}\n\n"
+            "ملاحظة: إذا كان القروب عامًا وله اسم مستخدم (t.me/username)، فلا يمكن سحب رابطه من خلال البوت؛ يجب تغيير اسم المستخدم من إعدادات القروب.",
+            parse_mode="HTML", disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("external_link_revoke:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "سحب روابط القروبات الخارجية متاح لمالك البوت الأساسي فقط.", show_alert=True); return
+        try: ext_chat_id = int(data.split(":", 1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
+        if not ext_row:
+            await safe_callback_answer(q, "القروب الخارجي غير مسجل.", show_alert=True); return
+        try:
+            chat_info = await context.bot.get_chat(ext_chat_id)
+            if getattr(chat_info, "username", None):
+                await safe_callback_answer(q, "القروب عام؛ لا يمكن سحب رابط t.me العام من البوت. غيّر اسم المستخدم من إعدادات Telegram.", show_alert=True); return
+            candidates = set()
+            if getattr(chat_info, "invite_link", None): candidates.add(chat_info.invite_link)
+            directory_row = db.execute("SELECT invite_link FROM group_link_directory WHERE chat_id=?", (ext_chat_id,)).fetchone()
+            if directory_row and directory_row[0]: candidates.add(directory_row[0])
+            tracked = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (ext_chat_id,)).fetchall()
+            candidates.update(link for (link,) in tracked if link)
+            revoked, failures = 0, 0
+            for invite in candidates:
+                try:
+                    await context.bot.revoke_chat_invite_link(chat_id=ext_chat_id, invite_link=invite)
+                    revoked += 1
+                    db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), ext_chat_id, invite))
+                except Exception as exc:
+                    failures += 1
+                    log.info("Could not revoke external invite for %s: %s", ext_chat_id, exc)
+            db.execute("UPDATE group_link_directory SET invite_link='',link_status='revoked',last_updated_at=? WHERE chat_id=?", (now(), ext_chat_id))
+            db.commit()
+            log_external_group_event(ext_chat_id, uid, "invite_link_revoke", f"revoked={revoked}; failures={failures}")
+            if revoked: await safe_callback_answer(q, f"تم سحب {revoked} رابط دعوة.", show_alert=True)
+            elif failures: await safe_callback_answer(q, "تعذر سحب الرابط. تحقق من صلاحية البوت وأن الرابط صادر من البوت.", show_alert=True)
+            else: await safe_callback_answer(q, "لا يوجد رابط دعوة خاص محفوظ لسحبه.", show_alert=True)
+        except Exception:
+            log.exception("External invite revocation failed for %s", ext_chat_id)
+            await safe_callback_answer(q, "تعذر الوصول إلى القروب أو سحب الرابط. تحقق من صلاحيات البوت.", show_alert=True)
+        await q.edit_message_text("🔗 تم تحديث حالة رابط القروب الخارجي.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 مراجعة الروابط", callback_data=f"external_link_manage:{ext_chat_id}")],
+            [InlineKeyboardButton("⬅️ إدارة القروب", callback_data=f"external_group:{ext_chat_id}")]]))
+        return
+
+    if data.startswith("external_link_renew:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "تجديد روابط القروبات الخارجية متاح لمالك البوت الأساسي فقط.", show_alert=True); return
+        try: ext_chat_id = int(data.split(":", 1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1", (ext_chat_id,)).fetchone()
+        if not ext_row:
+            await safe_callback_answer(q, "القروب غير موجود أو أن البوت ليس عضوًا فيه.", show_alert=True); return
+        try:
+            link = await create_managed_external_direct_invite_link(context.bot, ext_chat_id)
+            db.execute("""INSERT INTO group_link_directory(chat_id,title,group_type,invite_link,link_status,last_updated_at)
+                VALUES(?,?,'external',?,'created_by_bot',?) ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,group_type='external',invite_link=excluded.invite_link,
+                link_status='created_by_bot',last_updated_at=excluded.last_updated_at""", (ext_chat_id, ext_row[0] or str(ext_chat_id), link, now()))
+            db.commit()
+            log_external_group_event(ext_chat_id, uid, "invite_link_renew", "Primary direct invite link rotated")
+            await safe_callback_answer(q, "تم إنشاء رابط دخول جديد.", show_alert=True)
+            await q.edit_message_text(f"✅ تم إنشاء رابط جديد للقروب الخارجي\n\n{html.escape(link)}", parse_mode="HTML", disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 فتح الرابط الجديد", url=link)],
+                    [InlineKeyboardButton("⬅️ إدارة الرابط", callback_data=f"external_link_manage:{ext_chat_id}")]]))
+        except Exception as exc:
+            log.warning("External invite renewal failed for %s: %s", ext_chat_id, exc)
+            await safe_callback_answer(q, "تعذر إنشاء رابط جديد. تأكد من أن البوت مشرف ويملك صلاحية دعوة المستخدمين.", show_alert=True)
+        return
+
     if data.startswith("external_toggle:"):
         if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
