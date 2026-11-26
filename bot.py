@@ -177,10 +177,10 @@ db.execute("""CREATE TABLE IF NOT EXISTS publish_campaigns(
     completed_at TEXT DEFAULT '',
     success_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0,
-    result_text TEXT DEFAULT ''
+    result_text TEXT DEFAULT '',
+    claimed_at TEXT DEFAULT ''
 )""")
 db.commit()
-
 # Additive staff management system. Existing tables and data are retained.
 db.executescript("""
 CREATE TABLE IF NOT EXISTS staff_appeals(
@@ -342,6 +342,18 @@ db.execute("""CREATE TABLE IF NOT EXISTS group_link_directory(
     last_member_event_at TEXT NOT NULL DEFAULT ''
 )""")
 db.execute("CREATE INDEX IF NOT EXISTS idx_group_link_directory_type ON group_link_directory(group_type,title)")
+# Additive migrations only: retain all existing group directory records.
+for _column, _definition in (
+    ("owner_id", "INTEGER"),
+    ("owner_name", "TEXT NOT NULL DEFAULT ''"),
+    ("owner_username", "TEXT NOT NULL DEFAULT ''"),
+    ("last_metadata_notice_at", "TEXT NOT NULL DEFAULT ''"),
+):
+    try:
+        db.execute(f"ALTER TABLE group_link_directory ADD COLUMN {_column} {_definition}")
+    except Exception as _migration_exc:
+        if "duplicate column name" not in str(_migration_exc).lower():
+            raise
 db.commit()
 
 db.execute("""CREATE TABLE IF NOT EXISTS internal_group_capabilities(
@@ -374,7 +386,7 @@ CREATE TABLE IF NOT EXISTS external_owner_campaigns(
     targets_json TEXT NOT NULL, scheduled_at TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'scheduled', created_at TEXT NOT NULL,
     completed_at TEXT DEFAULT '', success_count INTEGER NOT NULL DEFAULT 0,
-    failed_count INTEGER NOT NULL DEFAULT 0, result_text TEXT DEFAULT ''
+    failed_count INTEGER NOT NULL DEFAULT 0, result_text TEXT DEFAULT '', claimed_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_external_owner_campaign_due
 ON external_owner_campaigns(status,scheduled_at);
@@ -382,6 +394,14 @@ CREATE TABLE IF NOT EXISTS external_chat_permission_backups(
     chat_id INTEGER PRIMARY KEY, permissions_json TEXT NOT NULL, saved_at TEXT NOT NULL
 );
 """)
+for _table in ("publish_campaigns", "external_owner_campaigns"):
+    try:
+        db.execute(f"ALTER TABLE {_table} ADD COLUMN claimed_at TEXT DEFAULT ''")
+    except sqlite3.OperationalError as _migration_exc:
+        if "duplicate column name" not in str(_migration_exc).lower():
+            raise
+db.commit()
+
 # Group AI enablement and cooldown tables removed; AI is private and owner-only.
 
 
@@ -765,6 +785,15 @@ db.execute("""CREATE TABLE IF NOT EXISTS friday_reminder_sent(
     chat_id INTEGER NOT NULL,
     friday_date TEXT NOT NULL,
     sent_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(chat_id,friday_date)
+)""")
+# Track retry attempts for Friday reminders; successful sends remain in friday_reminder_sent.
+db.execute("""CREATE TABLE IF NOT EXISTS friday_reminder_attempts(
+    chat_id INTEGER NOT NULL,
+    friday_date TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(chat_id,friday_date)
 )""")
 for _scope in ('internal','external'):
@@ -1458,7 +1487,26 @@ async def require_group_permission(update, permission, message=None):
     if ext and ext[0] and external_group_active(chat_id):
         cap = "protection" if permission == "protection" else ("tag" if permission == "tag" else "members")
         external_group_permission = external_group_cap_enabled(chat_id, cap) and await is_telegram_group_admin(update.get_bot(), uid, chat_id)
-    if has_group_permission(chat_id, uid, permission) or external_group_permission:
+    if ext and ext[0] and external_group_active(chat_id):
+        external_cap = {
+            "protection": "protection",
+            "tag": "tag",
+            "members": "members",
+            "delete": "members",
+            "mute": "members",
+            "kick": "members",
+            "ban": "members",
+            "unban": "members",
+            "pin": "members",
+            "manage_roles": "manage_staff",
+            "logs": "logs",
+            "stats": "stats",
+            "welcome": "welcome",
+            "settings": "protection",
+        }.get(permission, permission)
+        if external_owner_can(uid, chat_id, external_cap):
+            return True
+    elif has_group_permission(chat_id, uid, permission):
         return True
     await update.effective_message.reply_text(message or "⛔ لا تملك الصلاحية المطلوبة في هذا القروب.")
     return False
@@ -1480,17 +1528,28 @@ async def require_admin(update):
                          or can_use_capability(uid, "protection", chat_id))
     telegram_admin = await is_telegram_group_admin(update.get_bot(), uid, chat_id)
     ext = external_group_info(chat_id)
-    if ext and ext[0] and not is_owner(uid):
+    if ext and ext[0]:
         command_text = (update.effective_message.text or "").strip().lower()
         command_name = command_text.split()[0].split("@")[0] if command_text.startswith("/") else ""
         member_commands = {"/ban","/unban","/kick","/mute","/unmute","/warn","/muted","/unmuteall","/del","/pin","/badges","/badge_remove","/givepoints","/setmembertitle"}
-        if command_name in member_commands and not external_group_cap_enabled(chat_id, "members"):
-            await update.effective_message.reply_text("⛔ إدارة الأعضاء غير مفعّلة لهذا القروب."); return False
         protection_commands = {"/locks","/settings","/archive_on","/archive_off","/archive"}
         arabic_lock_text = normalized_arabic_text(command_text)
         arabic_lock_aliases = {normalized_arabic_text(alias) for alias in ARABIC_ALIASES}
-        if (command_name in protection_commands or arabic_lock_text in arabic_lock_aliases) and not external_group_cap_enabled(chat_id, "protection"):
-            await update.effective_message.reply_text("⛔ الحماية غير مفعّلة لهذا القروب."); return False
+        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid):
+            await update.effective_message.reply_text("⛔ صلاحيات القروبات الخارجية منفصلة عن صلاحيات مالك البوت وطاقمه.")
+            return False
+        if command_name in member_commands:
+            external_ok = external_owner_can(uid, chat_id, "members")
+        elif command_name in protection_commands or arabic_lock_text in arabic_lock_aliases:
+            external_ok = external_owner_can(uid, chat_id, "protection")
+        else:
+            external_ok = any(external_owner_can(uid, chat_id, cap) for cap in
+                              ("members", "protection", "stats", "logs", "tag", "welcome", "publish", "reentry", "join_approval"))
+        if not external_ok:
+            await update.effective_message.reply_text("⛔ لا تملك الصلاحية اللازمة في هذا القروب الخارجي. اطلب من مالك القروب منحك الصلاحية المناسبة.")
+            return False
+        # The bot still needs its own Telegram permissions to perform the requested action.
+        return True
     external_protection_ok = external_group_cap_enabled(chat_id, "protection")
     if not has_internal_role and not (telegram_admin and external_protection_ok):
         await update.effective_message.reply_text("⛔ ليس لديك صلاحية الإدارة في هذا القروب.")
@@ -2073,7 +2132,9 @@ async def refresh_external_group_membership(bot):
 
 
 async def sync_group_link_record(bot, chat_id, *, member_event=False):
-    """Refresh group title/count and a link only when Telegram exposes or permits it."""
+    """Refresh title, member count, invite URL and actual Telegram creator.
+    External metadata changes are reported privately to the bot owner only.
+    """
     chat_id = int(chat_id)
     try:
         chat = await bot.get_chat(chat_id)
@@ -2081,50 +2142,104 @@ async def sync_group_link_record(bot, chat_id, *, member_event=False):
         username = getattr(chat, "username", None)
         link = f"https://t.me/{username}" if username else ""
         link_status = "public" if link else "private_unavailable"
-        # For private groups, Telegram may expose the bot's primary invite link only
-        # when it has sufficient admin rights. Reuse a stored link to avoid minting
-        # a new invite on every refresh.
+
+        owner_id, owner_name, owner_username = None, "", ""
+        try:
+            admins = await bot.get_chat_administrators(chat_id)
+            creator = next((a.user for a in admins if getattr(a, "status", "") == "creator"), None)
+            if creator:
+                owner_id = int(creator.id)
+                owner_name = getattr(creator, "full_name", "") or ""
+                owner_username = getattr(creator, "username", "") or ""
+        except Exception as owner_exc:
+            log.debug("Could not resolve creator for group %s: %s", chat_id, owner_exc)
+
+        old = db.execute("""SELECT title,invite_link,member_count,owner_id,owner_name,owner_username,
+                    last_metadata_notice_at
+            FROM group_link_directory WHERE chat_id=?""", (chat_id,)).fetchone()
+        old_title, old_link, old_count, old_owner_id, old_owner_name, old_owner_username, last_notice = (
+            old if old else ("", "", None, None, "", "", "")
+        )
+
         if not link:
             exposed = getattr(chat, "invite_link", None)
             if exposed:
                 link, link_status = exposed, "available"
+            elif old_link:
+                link, link_status = old_link, "stored_unverified"
             else:
-                stored = db.execute("SELECT invite_link FROM group_link_directory WHERE chat_id=?", (chat_id,)).fetchone()
-                if stored and stored[0]:
-                    link, link_status = stored[0], "stored_unverified"
-                else:
-                    try:
-                        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
-                        can_invite = bool(getattr(bot_member, "can_invite_users", False)) or getattr(bot_member, "status", "") == "creator"
-                        if can_invite:
-                            created = await bot.create_chat_invite_link(chat_id=chat_id, name="رابط دليل القروبات")
-                            link, link_status = created.invite_link, "created_by_bot"
-                    except Exception as link_exc:
-                        log.debug("Invite link unavailable for %s: %s", chat_id, link_exc)
+                try:
+                    bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+                    can_invite = bool(getattr(bot_member, "can_invite_users", False)) or getattr(bot_member, "status", "") == "creator"
+                    if can_invite:
+                        created = await bot.create_chat_invite_link(chat_id=chat_id, name="رابط دليل القروبات")
+                        link, link_status = created.invite_link, "created_by_bot"
+                except Exception as link_exc:
+                    log.debug("Invite link unavailable for %s: %s", chat_id, link_exc)
+
         try:
             member_count = await bot.get_chat_member_count(chat_id)
         except Exception as count_exc:
             log.debug("Member count unavailable for %s: %s", chat_id, count_exc)
-            old = db.execute("SELECT member_count FROM group_link_directory WHERE chat_id=?", (chat_id,)).fetchone()
-            member_count = old[0] if old else None
-        group_row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
+            member_count = old_count
+
+        group_row = db.execute("SELECT is_external,added_by FROM external_group_control WHERE chat_id=?", (chat_id,)).fetchone()
         group_type = "external" if group_row and bool(group_row[0]) else "internal"
         timestamp = now()
-        db.execute("""INSERT INTO group_link_directory(chat_id,title,group_type,invite_link,member_count,link_status,last_updated_at,last_member_event_at)
-            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+        db.execute("""INSERT INTO group_link_directory
+            (chat_id,title,group_type,invite_link,member_count,link_status,last_updated_at,
+             last_member_event_at,owner_id,owner_name,owner_username,last_metadata_notice_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
             title=excluded.title,group_type=excluded.group_type,
             invite_link=CASE WHEN excluded.invite_link<>'' THEN excluded.invite_link ELSE group_link_directory.invite_link END,
             member_count=COALESCE(excluded.member_count,group_link_directory.member_count),
             link_status=CASE WHEN excluded.invite_link<>'' THEN excluded.link_status ELSE group_link_directory.link_status END,
             last_updated_at=excluded.last_updated_at,
-            last_member_event_at=CASE WHEN ? THEN excluded.last_member_event_at ELSE group_link_directory.last_member_event_at END""",
-            (chat_id,title,group_type,link,member_count,link_status,timestamp,timestamp if member_event else "",1 if member_event else 0))
+            last_member_event_at=CASE WHEN ? THEN excluded.last_member_event_at ELSE group_link_directory.last_member_event_at END,
+            owner_id=COALESCE(excluded.owner_id,group_link_directory.owner_id),
+            owner_name=CASE WHEN excluded.owner_name<>'' THEN excluded.owner_name ELSE group_link_directory.owner_name END,
+            owner_username=CASE WHEN excluded.owner_username<>'' THEN excluded.owner_username ELSE group_link_directory.owner_username END""",
+            (chat_id,title,group_type,link,member_count,link_status,timestamp,
+             timestamp if member_event else "",owner_id,owner_name,owner_username,last_notice or "",
+             1 if member_event else 0))
         db.commit()
+
+        # Avoid notification spam: title/owner/link changes are immediate; count-only notices are throttled to 6 hours.
+        if group_type == "external" and OWNER_ID:
+            changes = []
+            if old and old_title and old_title != title:
+                changes.append(f"تغير اسم القروب: {old_title} ← {title}")
+            if old and old_owner_id and owner_id and int(old_owner_id) != int(owner_id):
+                changes.append(f"تغير مالك القروب: {old_owner_name or old_owner_id} ← {owner_name or owner_id}")
+            if old and old_link and link and old_link != link:
+                changes.append("تغير رابط القروب")
+            count_changed = old and old_count is not None and member_count is not None and int(old_count) != int(member_count)
+            allow_count_notice = False
+            if count_changed:
+                try:
+                    previous_notice = datetime.fromisoformat(str(last_notice)) if last_notice else None
+                    allow_count_notice = previous_notice is None or (datetime.now() - previous_notice).total_seconds() >= 21600
+                except Exception:
+                    allow_count_notice = True
+                if allow_count_notice:
+                    changes.append(f"تغير عدد الأعضاء: {old_count} ← {member_count}")
+            if changes:
+                notice = ("🔔 تحديث معلومات قروبك الخارجي\n"
+                          f"القروب: {title}\n"
+                          + "\n".join(f"• {item}" for item in changes)
+                          + f"\nعدد الأعضاء الحالي: {member_count if member_count is not None else 'غير متاح'}")
+                try:
+                    await bot.send_message(chat_id=int(OWNER_ID), text=notice)
+                    db.execute("UPDATE group_link_directory SET last_metadata_notice_at=? WHERE chat_id=?",
+                               (timestamp, chat_id))
+                    db.commit()
+                except Exception as notice_exc:
+                    log.info("Could not notify bot owner %s about external metadata change for %s: %s", OWNER_ID, chat_id, notice_exc)
         return True
     except Exception as exc:
         log.warning("Could not sync group link directory for %s: %s", chat_id, exc)
         return False
-
 
 async def group_link_directory_worker(app):
     """Periodic safety sync for counts/titles/links missed by Telegram update delivery."""
@@ -2144,7 +2259,7 @@ async def group_link_directory_worker(app):
 async def refresh_group_link_directory(bot):
     """Refresh tracked groups concurrently; temporary Telegram failures never erase records."""
     rows = db.execute("""SELECT e.chat_id FROM external_group_control e
-        WHERE COALESCE(e.is_member,1)=1 AND e.enabled=1
+        WHERE COALESCE(e.is_member,1)=1
         ORDER BY e.is_external,e.title""").fetchall()
     known = {int(r[0]) for r in rows}
     known.update(int(cid) for (cid,) in db.execute("SELECT chat_id FROM watched_groups").fetchall())
@@ -2186,13 +2301,16 @@ def external_groups_markup(page=0):
     pages = max(1, (int(total) + per_page - 1) // per_page)
     page = max(0, min(int(page), pages - 1))
     rows = []
-    groups = db.execute("""SELECT e.chat_id,COALESCE(NULLIF(e.title,''),w.title,e.chat_id),e.enabled,e.added_by_name,e.added_by
+    groups = db.execute("""SELECT e.chat_id,COALESCE(NULLIF(e.title,''),w.title,e.chat_id),e.enabled,
+                e.added_by_name,e.added_by,d.member_count
         FROM external_group_control e LEFT JOIN watched_groups w ON w.chat_id=e.chat_id
+        LEFT JOIN group_link_directory d ON d.chat_id=e.chat_id
         WHERE e.is_external=1 AND e.is_member=1 ORDER BY e.created_at DESC LIMIT ? OFFSET ?""",
         (per_page, page * per_page)).fetchall()
-    for cid, title, enabled, added_name, added_by in groups:
+    for cid, title, enabled, added_name, added_by, member_count in groups:
         state = "🟢" if enabled else "🔴"
-        rows.append([InlineKeyboardButton(f"{state} {str(title)[:45]} · {cid}", callback_data=f"external_group:{cid}")])
+        count_label = f"{int(member_count):,} عضو" if member_count is not None else "العدد غير متاح"
+        rows.append([InlineKeyboardButton(f"{state} {str(title)[:32]} · {count_label}", callback_data=f"external_group:{cid}")])
     if not rows:
         rows.append([InlineKeyboardButton("لا توجد قروبات خارجية مسجلة حتى الآن", callback_data="noop")])
     nav = []
@@ -2215,8 +2333,12 @@ def external_group_manage_markup(chat_id, uid=None):
     if not row:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القروبات الخارجية", callback_data="external_groups")]])
     title, enabled, ai_enabled, added_by, added_name, added_username = row
-    rows = [[InlineKeyboardButton(("⏸️ إيقاف البوت عن القروب" if enabled else "▶️ تفعيل البوت للقروب"),
-                                  callback_data=f"external_toggle:{chat_id}")]]
+    rows = [
+        [InlineKeyboardButton("🔄 تحديث معلومات القروب الآن", callback_data=f"external_metadata_refresh:{chat_id}")],
+        [InlineKeyboardButton("🔗 استخراج / تجديد رابط الدخول المباشر", callback_data=f"xowner_join_link:{chat_id}")],
+        [InlineKeyboardButton(("⏸️ إيقاف البوت عن القروب" if enabled else "▶️ تفعيل البوت للقروب"),
+                                  callback_data=f"external_toggle:{chat_id}")]
+    ]
     for cap, label in EXTERNAL_CAPABILITY_LABELS.items():
         if cap == "ai":
             continue
@@ -2605,7 +2727,8 @@ def panel_markup(uid):
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
-        [InlineKeyboardButton("🌐 نشر إعلان للقروبات الخارجية", callback_data="owner_external_broadcast")],
+        [InlineKeyboardButton("🌐 إدارة القروبات الخارجية وصلاحياتها", callback_data="external_groups")],
+        [InlineKeyboardButton("📣 نشر إعلان للقروبات الخارجية", callback_data="owner_external_broadcast")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
@@ -4054,12 +4177,16 @@ async def group_role_command(update, context):
         return
     if not external_group_active(chat.id) and not is_owner(user.id if user else 0):
         await msg.reply_text("⛔ خدمات البوت متوقفة عن هذا القروب من المالك الأساسي."); return
-    # مالك البوت/المفوّض يدير رتب البوت، كما يمكن لمالك القروب ومشرفيه
-    # إدارة الرتب المحلية داخل قروبهم فقط بعد التحقق من صلاحيات Telegram.
+    # External-group staff are managed only from that group's isolated staff panel.
+    # Never write external members into the bot owner's internal group_roles table.
     ext_info = external_group_info(chat.id)
-    if ext_info and ext_info[0] and not is_owner(user.id) and not external_group_cap_enabled(chat.id, "members"):
-        await msg.reply_text("⛔ إدارة الأعضاء والرتب غير مفعّلة لهذا القروب من المالك الأساسي.")
+    if ext_info and ext_info[0]:
+        if not external_owner_can(user.id, chat.id, "manage_staff"):
+            await msg.reply_text("⛔ إدارة رتب طاقم القروب الخارجي متاحة لمالكه فقط من لوحة إدارة الطاقم.")
+            return
+        await msg.reply_text("ℹ️ لإضافة نائب أو مشرف أو تنزيل رتبته في القروب الخارجي، استخدم: لوحة القروب ← إدارة المشرفين والمدراء والصلاحيات.")
         return
+    # Internal groups retain their existing owner/delegate workflow.
     if not (is_owner(user.id) or is_delegated_owner(user.id)):
         if not await is_telegram_group_admin(context.bot, user.id, chat.id):
             await msg.reply_text("⛔ إدارة الرتب متاحة لمالك القروب ومشرفيه فقط.")
@@ -14300,14 +14427,22 @@ async def _callback_impl(update, context):
     if data.startswith("xowner_join_link:"):
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "قروب غير صحيح.", show_alert=True); return
+        if not is_owner(uid):
+            await safe_callback_answer(q, "استخراج وتجديد روابط القروبات الخارجية متاح لمالك البوت الأساسي فقط.", show_alert=True); return
         _owner_row = db.execute(
-            "SELECT added_by,is_external,is_member,enabled FROM external_group_control WHERE chat_id=?",
+            "SELECT is_external,is_member FROM external_group_control WHERE chat_id=?",
             (chat_id,)
         ).fetchone()
-        if not _owner_row or not _owner_row[1] or not _owner_row[2] or not _owner_row[3] or int(_owner_row[0] or 0) != int(uid):
-            await safe_callback_answer(q, "إنشاء رابط الدخول المباشر متاح لمالك هذا القروب الخارجي فقط.", show_alert=True); return
+        if not _owner_row or not _owner_row[0] or not _owner_row[1]:
+            await safe_callback_answer(q, "القروب الخارجي غير نشط أو أن البوت ليس عضوًا فيه.", show_alert=True); return
         try:
             _direct_link = await create_managed_external_direct_invite_link(context.bot, chat_id)
+            db.execute("""INSERT INTO group_link_directory(chat_id,title,group_type,invite_link,link_status,last_updated_at)
+                SELECT chat_id,title,'external',?,'primary_direct',? FROM external_group_control WHERE chat_id=?
+                ON CONFLICT(chat_id) DO UPDATE SET invite_link=excluded.invite_link,
+                    link_status='primary_direct',last_updated_at=excluded.last_updated_at""",
+                (_direct_link, now(), chat_id))
+            db.commit()
             await q.message.reply_text(
                 f"🔗 رابط الدخول المباشر للقروب الخارجي:\n{_direct_link}\n\n"
                 "✅ الدخول عبر هذا الرابط لا يتطلب موافقة مسبقة من مالك القروب.\n"
@@ -15287,7 +15422,7 @@ async def _callback_impl(update, context):
 
     # External group control center: owner or users explicitly granted external_groups.
     if data in {"external_groups", "external_groups_refresh"} or data.startswith("external_groups_page:"):
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
+        if not is_owner(uid):
             await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
         page = 0
         if data.startswith("external_groups_page:"):
@@ -15313,10 +15448,14 @@ async def _callback_impl(update, context):
                 await safe_callback_answer(q, "تعذر إكمال التحديث. لم تُحذف السجلات بسبب هذا الخطأ.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا نشطًا. استخدم زر التحديث للتحقق من العضوية الفعلية. تُحفظ السجلات والإعدادات التاريخية للقروبات التي غادرها البوت.", reply_markup=external_groups_markup(page)); return
     if data.startswith("external_group:"):
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
+        if not is_owner(uid):
             await safe_callback_answer(q, "غير مصرح لك بإدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        try:
+            await sync_group_link_record(context.bot, ext_chat_id)
+        except Exception:
+            log.exception("Could not refresh external group detail before display: %s", ext_chat_id)
         row = db.execute("""SELECT e.title,e.enabled,e.ai_enabled,e.added_by,e.added_by_name,e.added_by_username,e.created_at
             FROM external_group_control e WHERE e.chat_id=? AND e.is_external=1""", (ext_chat_id,)).fetchone()
         if not row:
@@ -15330,14 +15469,41 @@ async def _callback_impl(update, context):
                 telegram_owner_label = f"{html.escape(creator.full_name or 'مالك القروب')} (ID: {creator.id})" + (f" — @{html.escape(creator.username)}" if creator.username else "")
         except Exception as owner_exc:
             log.debug("Could not resolve external group creator for %s: %s", ext_chat_id, owner_exc)
+        directory = db.execute("""SELECT member_count,invite_link,link_status,last_updated_at,
+                    owner_name,owner_username FROM group_link_directory WHERE chat_id=?""", (ext_chat_id,)).fetchone()
+        member_count, invite_link, link_status, metadata_updated, directory_owner_name, directory_owner_username = (
+            directory if directory else (None, "", "غير متوفر", "", "", "")
+        )
+        if directory_owner_name:
+            telegram_owner_label = html.escape(directory_owner_name) + (f" — @{html.escape(directory_owner_username)}" if directory_owner_username else "")
+        count_text = f"{int(member_count):,}" if member_count is not None else "غير متاح"
+        link_text = html.escape(invite_link) if invite_link else "غير متاح حاليًا"
         caps = db.execute("SELECT capability,enabled FROM external_group_capabilities WHERE chat_id=? ORDER BY capability", (ext_chat_id,)).fetchall()
         cap_text = "\n".join(f"• {EXTERNAL_CAPABILITY_LABELS.get(cap,cap)}: {'مفعّل' if on else 'معطّل'}" for cap,on in caps)
-        text = (f"🌐 معلومات القروب الخارجي\n\nالقروب: {html.escape(title or str(ext_chat_id))}\nID: {ext_chat_id}\n"
-                f"مالك القروب في Telegram: {telegram_owner_label}\n"
-                f"أضاف البوت: {html.escape(added_name or 'غير معروف')} (ID: {added_by or 'غير معروف'})"
-                f"{' — @'+html.escape(added_username) if added_username else ''}\nتاريخ التسجيل: {created_at}\n"
-                f"حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
+        text = (f"🌐 معلومات القروب الخارجي — عرض خاص بمالك البوت\n\nالقروب: {html.escape(title or str(ext_chat_id))}\nID: {ext_chat_id}\n"
+                f"صاحب القروب: {telegram_owner_label}\n"
+                f"من أضاف البوت: {html.escape(added_name or 'غير معروف')} (ID: {added_by or 'غير معروف'})"
+                f"{' — @'+html.escape(added_username) if added_username else ''}\n"
+                f"عدد الأعضاء: {count_text}\nرابط القروب: {link_text}\nحالة الرابط: {html.escape(link_status or 'غير متوفر')}\n"
+                f"آخر تحديث للمعلومات: {html.escape(metadata_updated or 'لم يتم التحديث بعد')}\n"
+                f"تاريخ التسجيل: {created_at}\nحالة البوت: {'مفعّل' if enabled else 'متوقف'}\n"
+                f"الذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=external_group_manage_markup(ext_chat_id, uid)); return
+    if data.startswith("external_metadata_refresh:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q, "تحديث بيانات القروبات الخارجية متاح لمالك البوت فقط.", show_alert=True); return
+        try: metadata_chat_id = int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
+        ext_row = db.execute("SELECT is_external,is_member FROM external_group_control WHERE chat_id=?", (metadata_chat_id,)).fetchone()
+        if not ext_row or not ext_row[0] or not ext_row[1]:
+            await safe_callback_answer(q, "القروب الخارجي غير نشط حاليًا.", show_alert=True); return
+        ok = await sync_group_link_record(context.bot, metadata_chat_id)
+        if not ok:
+            await safe_callback_answer(q, "تعذر تحديث البيانات من تيليجرام.", show_alert=True); return
+        await safe_callback_answer(q, "تم تحديث الاسم والمالك وعدد الأعضاء والرابط.")
+        await q.edit_message_text("✅ تم تحديث بيانات القروب. افتح تفاصيله مجددًا لعرض القيم الحالية.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ تفاصيل القروب", callback_data=f"external_group:{metadata_chat_id}")]]))
+        return
     if data.startswith("external_toggle:"):
         if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
@@ -18167,61 +18333,95 @@ async def callback(update, context):
 
 
 async def friday_prayer_reminder_worker(app):
-    """Send a Friday prayer reminder to active internal/external groups at 11:00 Riyadh time."""
+    """Send Friday reminders at/after 11:00 Riyadh time and retry failed groups every 5 minutes that Friday."""
     tz = ZoneInfo("Asia/Riyadh")
+    retry_interval_seconds = 5 * 60
+    poll_interval_seconds = 60
     reminder_text = (
-        "🕌 تذكير صلاة الجمعة\n\n"
-        "قال الله تعالى: ﴿يَا أَيُّهَا الَّذِينَ آمَنُوا إِذَا نُودِيَ لِلصَّلَاةِ مِنْ يَوْمِ الْجُمُعَةِ فَاسْعَوْا إِلَىٰ ذِكْرِ اللَّهِ وَذَرُوا الْبَيْعَ﴾\n"
-        "نسأل الله أن يتقبل منا ومنكم، وأن يجعل جمعتكم مباركة.\n"
+        "🕌 تذكير صلاة الجمعة\\n\\n"
+        "قال الله تعالى: ﴿يَا أَيُّهَا الَّذِينَ آمَنُوا إِذَا نُودِيَ لِلصَّلَاةِ مِنْ يَوْمِ الْجُمُعَةِ فَاسْعَوْا إِلَىٰ ذِكْرِ اللَّهِ وَذَرُوا الْبَيْعَ﴾\\n"
+        "نسأل الله أن يتقبل منا ومنكم، وأن يجعل جمعتكم مباركة.\\n"
         "لا تنسوا التبكير إلى الصلاة والإنصات للخطبة."
     )
     while True:
         try:
             current = datetime.now(tz)
-            # Friday is weekday 4. Send at 11:00 Saudi time, without catch-up bursts.
-            days_until_friday = (4 - current.weekday()) % 7
-            target = current.replace(hour=11, minute=0, second=0, microsecond=0) + timedelta(days=days_until_friday)
-            if target <= current:
-                target += timedelta(days=7)
-            await asyncio.sleep(max(1, (target - current).total_seconds()))
-            friday_date = target.date().isoformat()
+            # Friday is weekday 4. Keep retrying unsent groups for the remainder of Friday.
+            if current.weekday() == 4 and (current.hour, current.minute) >= (11, 0):
+                friday_date = current.date().isoformat()
+                group_ids = set()
+                for row in owner_managed_group_rows():
+                    group_ids.add(int(row[0]))
+                external_rows = db.execute(
+                    "SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1"
+                ).fetchall()
+                group_ids.update(int(row[0]) for row in external_rows)
 
-            group_ids = set()
-            for row in owner_managed_group_rows():
-                group_ids.add(int(row[0]))
-            external_rows = db.execute(
-                "SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1"
-            ).fetchall()
-            group_ids.update(int(row[0]) for row in external_rows)
+                for chat_id in sorted(group_ids):
+                    already_sent = db.execute(
+                        "SELECT 1 FROM friday_reminder_sent WHERE chat_id=? AND friday_date=?",
+                        (chat_id, friday_date)
+                    ).fetchone()
+                    if already_sent:
+                        continue
 
-            for chat_id in sorted(group_ids):
-                already_sent = db.execute(
-                    "SELECT 1 FROM friday_reminder_sent WHERE chat_id=? AND friday_date=?",
-                    (chat_id, friday_date)
-                ).fetchone()
-                if already_sent:
-                    continue
-                try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=reminder_text,
-                        disable_web_page_preview=True
-                    )
-                    db.execute(
-                        "INSERT OR IGNORE INTO friday_reminder_sent(chat_id,friday_date,sent_at) VALUES(?,?,?)",
-                        (chat_id, friday_date, now())
-                    )
-                    db.commit()
-                    await asyncio.sleep(0.15)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning("Friday reminder failed for chat %s (%s)", chat_id, type(exc).__name__)
+                    attempt = db.execute(
+                        "SELECT last_attempt_at FROM friday_reminder_attempts WHERE chat_id=? AND friday_date=?",
+                        (chat_id, friday_date)
+                    ).fetchone()
+                    if attempt and attempt[0]:
+                        try:
+                            last_attempt = datetime.fromisoformat(attempt[0])
+                            if last_attempt.tzinfo is None:
+                                last_attempt = last_attempt.replace(tzinfo=tz)
+                            if (current - last_attempt).total_seconds() < retry_interval_seconds:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=reminder_text,
+                            disable_web_page_preview=True
+                        )
+                        db.execute(
+                            "INSERT OR IGNORE INTO friday_reminder_sent(chat_id,friday_date,sent_at) VALUES(?,?,?)",
+                            (chat_id, friday_date, now())
+                        )
+                        db.execute(
+                            """INSERT INTO friday_reminder_attempts(chat_id,friday_date,last_attempt_at,attempt_count,last_error)
+                               VALUES(?,?,?,?, '')
+                               ON CONFLICT(chat_id,friday_date) DO UPDATE SET
+                                   last_attempt_at=excluded.last_attempt_at,
+                                   attempt_count=friday_reminder_attempts.attempt_count+1,
+                                   last_error=''""",
+                            (chat_id, friday_date, current.isoformat(), 1)
+                        )
+                        db.commit()
+                        await asyncio.sleep(0.15)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        error_text = f"{type(exc).__name__}: {str(exc)[:300]}"
+                        db.execute(
+                            """INSERT INTO friday_reminder_attempts(chat_id,friday_date,last_attempt_at,attempt_count,last_error)
+                               VALUES(?,?,?,?,?)
+                               ON CONFLICT(chat_id,friday_date) DO UPDATE SET
+                                   last_attempt_at=excluded.last_attempt_at,
+                                   attempt_count=friday_reminder_attempts.attempt_count+1,
+                                   last_error=excluded.last_error""",
+                            (chat_id, friday_date, current.isoformat(), 1, error_text)
+                        )
+                        db.commit()
+                        log.warning("Friday reminder attempt failed for chat %s (%s); will retry in 5 minutes", chat_id, type(exc).__name__)
+
+            await asyncio.sleep(poll_interval_seconds)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Friday prayer reminder worker failed")
-            await asyncio.sleep(60)
+            await asyncio.sleep(poll_interval_seconds)
 
 
 # Automatic assistant introductions are removed; only the approved bot introduction remains.
@@ -18361,6 +18561,39 @@ async def publish_campaigns_worker(app):
     """Deliver due campaigns from persistent storage; safe across process restarts."""
     while True:
         try:
+            # Recover stale campaign claims after a worker/process interruption.
+            # Do not blindly resend: Telegram may already have accepted some targets.
+            stale_before = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            stale_internal = db.execute(
+                "SELECT id,creator_id FROM publish_campaigns WHERE status='sending' AND claimed_at<>'' AND claimed_at<?",
+                (stale_before,)
+            ).fetchall()
+            for stale_id, stale_creator in stale_internal:
+                cur = db.execute(
+                    "UPDATE publish_campaigns SET status='interrupted',completed_at=?,result_text=?,claimed_at='' WHERE id=? AND status='sending' AND claimed_at<?",
+                    (now(), "توقف الإرسال بسبب إعادة تشغيل البوت أو انقطاع العامل. لم تتم إعادة المحاولة تلقائيًا لتجنب تكرار الرسائل؛ راجع القروبات المستهدفة ثم أعد إنشاء الحملة.", stale_id, stale_before)
+                )
+                db.commit()
+                if cur.rowcount:
+                    try:
+                        await app.bot.send_message(int(stale_creator), f"⚠️ توقفت الحملة #{stale_id} أثناء الإرسال ولم تكتمل. لم أعد إرسالها تلقائيًا حتى لا تتكرر الرسائل. راجع القروبات المستهدفة ثم أنشئ حملة جديدة عند الحاجة.")
+                    except Exception:
+                        log.warning("Could not notify creator about interrupted campaign %s", stale_id)
+            stale_external = db.execute(
+                "SELECT id,owner_id FROM external_owner_campaigns WHERE status='sending' AND claimed_at<>'' AND claimed_at<?",
+                (stale_before,)
+            ).fetchall()
+            for stale_id, stale_owner in stale_external:
+                cur = db.execute(
+                    "UPDATE external_owner_campaigns SET status='interrupted',completed_at=?,result_text=?,claimed_at='' WHERE id=? AND status='sending' AND claimed_at<?",
+                    (now(), "توقف الإرسال بسبب إعادة تشغيل البوت أو انقطاع العامل. لم تتم إعادة المحاولة تلقائيًا لتجنب تكرار الرسائل؛ راجع القروبات المستهدفة ثم أعد إنشاء الإعلان.", stale_id, stale_before)
+                )
+                db.commit()
+                if cur.rowcount:
+                    try:
+                        await app.bot.send_message(int(stale_owner), f"⚠️ توقف الإعلان المجدول #{stale_id} أثناء الإرسال ولم يكتمل. لم أعد إرساله تلقائيًا حتى لا تتكرر الرسائل. راجع القروبات المستهدفة ثم أنشئ إعلانًا جديدًا عند الحاجة.")
+                    except Exception:
+                        log.warning("Could not notify external owner about interrupted campaign %s", stale_id)
             due = db.execute(
                 "SELECT id,creator_id,source_chat_id,source_message_id,targets_json FROM publish_campaigns "
                 "WHERE status='scheduled' AND scheduled_at<>'' AND scheduled_at<=? ORDER BY scheduled_at LIMIT 10",
@@ -18368,7 +18601,7 @@ async def publish_campaigns_worker(app):
             ).fetchall()
             for campaign_id, creator_id, source_chat_id, source_message_id, targets_json in due:
                 # Claim before sending to prevent duplicate delivery if two worker loops overlap.
-                cur = db.execute("UPDATE publish_campaigns SET status='sending' WHERE id=? AND status='scheduled'", (campaign_id,))
+                cur = db.execute("UPDATE publish_campaigns SET status='sending',claimed_at=? WHERE id=? AND status='scheduled'", (now(), campaign_id))
                 db.commit()
                 if not cur.rowcount:
                     continue
@@ -18400,7 +18633,7 @@ async def publish_campaigns_worker(app):
                 result = f"نجح: {sent}\nتعذر: {failed}"
                 if errors:
                     result += "\n" + "\n".join(errors[:15])
-                db.execute("UPDATE publish_campaigns SET status='completed',completed_at=?,success_count=?,failed_count=?,result_text=? WHERE id=?",
+                db.execute("UPDATE publish_campaigns SET status='completed',completed_at=?,success_count=?,failed_count=?,result_text=?,claimed_at='' WHERE id=?",
                            (now(), sent, failed, result[:3000], campaign_id))
                 db.commit()
                 try:
@@ -18412,7 +18645,7 @@ async def publish_campaigns_worker(app):
             # never list or manage these records.
             ext_due=db.execute("SELECT id,owner_id,source_chat_id,source_message_id,targets_json FROM external_owner_campaigns WHERE status='scheduled' AND scheduled_at<>'' AND scheduled_at<=? ORDER BY scheduled_at LIMIT 10",(datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%Y-%m-%d %H:%M"),)).fetchall()
             for campaign_id, owner_id, source_chat_id, source_message_id, targets_json in ext_due:
-                claim=db.execute("UPDATE external_owner_campaigns SET status='sending' WHERE id=? AND status='scheduled'",(campaign_id,)); db.commit()
+                claim=db.execute("UPDATE external_owner_campaigns SET status='sending',claimed_at=? WHERE id=? AND status='scheduled'",(now(),campaign_id)); db.commit()
                 if not claim.rowcount: continue
                 try: targets=[int(x) for x in json.loads(targets_json or '[]')]
                 except Exception: targets=[]
@@ -18428,7 +18661,7 @@ async def publish_campaigns_worker(app):
                     except Exception as exc: failed+=1; errs.append(f"{cid}: {str(exc)[:100]}")
                     await asyncio.sleep(0.08)
                 result=f"نجح: {sent} | تعذر: {failed}"+("\n"+"\n".join(errs[:10]) if errs else "")
-                db.execute("UPDATE external_owner_campaigns SET status='completed',completed_at=?,success_count=?,failed_count=?,result_text=? WHERE id=?",(now(),sent,failed,result[:2500],campaign_id)); db.commit()
+                db.execute("UPDATE external_owner_campaigns SET status='completed',completed_at=?,success_count=?,failed_count=?,result_text=?,claimed_at='' WHERE id=?",(now(),sent,failed,result[:2500],campaign_id)); db.commit()
                 try: await app.bot.send_message(int(owner_id),f"📣 اكتمل الإعلان المجدول #{campaign_id}\n{result}")
                 except Exception: log.info("Could not notify external owner %s for campaign %s",owner_id,campaign_id)
         except asyncio.CancelledError:
