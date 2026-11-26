@@ -1945,7 +1945,7 @@ STAFF_CAPABILITY_LABELS = {
     "reentry": "🚫 مراجعة المطرودين وطلبات العودة",
     "join_approval": "✅ الموافقة على انضمام الأعضاء",
     "external_groups": "🌐 إدارة القروبات الخارجية",
-    "membership_notifications": "🔔 استقبال إشعارات دخول وخروج الأعضاء",
+    "membership_notifications": "🔔 استقبال إشعارات القروبات الخارجية",
     "external_monitor": "👁️ الاطلاع على مركز مراقبة القروبات الخارجية (قراءة فقط)",
     "manage_staff": "👥 إدارة الطاقم وتوزيع الصلاحيات",
 }
@@ -3685,7 +3685,7 @@ async def panel(update, context):
                 private_url = f"https://t.me/{bot_username}?start=external_panel"
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 فتح لوحة القروب الخارجية في الخاص", url=private_url)]])
                 await update.effective_message.reply_text(
-                    "هذه لوحة القروب الخارجية المستقلة. افتح المحادثة الخاصة مع البوت لإدارة قروباتك وصلاحيات طاقمك، دون الوصول إلى لوحة مالك البوت أو القروبات الأخرى.",
+                    "🌐 مرحباً بك في لوحة القروبات الخارجية\n\nهذه اللوحة مخصصة لإدارة قروباتك الخارجية بشكل مستقل.\n\nيمكنك من خلالها إدارة قروباتك، والتحكم في إعداداتها وصلاحيات فريق الإشراف، ومتابعة شؤون الأعضاء وإدارة الخدمات المتاحة لك.\n\n📌 اضغط على الزر أدناه لفتح لوحة التحكم الخاصة بك.",
                     reply_markup=markup,
                 )
             else:
