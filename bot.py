@@ -1921,6 +1921,9 @@ def unified_permissions_markup(target_uid):
     archive_granted = bool(db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability='archive' AND chat_id=0", (target_uid,)).fetchone())
     rows.append([InlineKeyboardButton(("✅ " if archive_granted else "⬜ ") + "📨 سجل التحويلات والملفات — جميع القروبات", callback_data=f"unifiedcap:{target_uid}:archive")])
     rows.append([InlineKeyboardButton("✅ منح جميع الصلاحيات التشغيلية", callback_data=f"unifiedall:{target_uid}")])
+    rows.append([InlineKeyboardButton("🧹 سحب جميع الصلاحيات التشغيلية", callback_data=f"unifiedrevokeall:{target_uid}")])
+    rows.append([InlineKeyboardButton("⬇️ تنزيل الرتب الإدارية فقط", callback_data=f"unifieddemote:{target_uid}")])
+    rows.append([InlineKeyboardButton("🚫 عزل من الطاقم وسحب الصلاحيات", callback_data=f"unifiedisolate:{target_uid}")])
     rows.append([InlineKeyboardButton("📍 تحديد الصلاحيات حسب القروب", callback_data=f"unifiedgroups:{target_uid}")])
     rows.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"unifiedmanage:{target_uid}"), InlineKeyboardButton("⬅️ لوحة التحكم", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -2221,7 +2224,6 @@ def external_group_manage_markup(chat_id, uid=None):
     rows.append([InlineKeyboardButton("⛔ المحظورون", callback_data=f"restricted_group_tab:{chat_id}:banned")])
     rows.append([InlineKeyboardButton("❌ المرفوضون", callback_data=f"restricted_group_tab:{chat_id}:rejected")])
     rows.append([InlineKeyboardButton("↩️ طلبات العودة والانضمام", callback_data=f"restricted_group_tab:{chat_id}:returns")])
-    rows.append([InlineKeyboardButton("🔗 إدارة رابط دعوة القروب", callback_data=f"external_link_manage:{chat_id}")])
     rows.append([InlineKeyboardButton("⬅️ قائمة القروبات", callback_data="external_groups")])
     return InlineKeyboardMarkup(rows)
 
@@ -2354,7 +2356,7 @@ def external_owner_panel_markup(uid):
     if any(external_owner_can(uid, int(cid), "protection") and external_group_cap_enabled(int(cid), "protection") for cid, _ in groups):
         rows.append([InlineKeyboardButton("⚡ أوامر الحماية الجماعية لقروباتي", callback_data="bulk_security")])
     rows.append([InlineKeyboardButton("📣 مركز الإعلانات والنشر", callback_data="xowner_campaigns")])
-    rows.append([InlineKeyboardButton("👑 إدارة النائب والمشرفين والمدراء", callback_data="xowner_staff_groups")])
+    rows.append([InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="xowner_staff_groups")])
     rows.append([InlineKeyboardButton("🔄 تحديث القروبات", callback_data="xowner_home")])
     rows.append([InlineKeyboardButton("❌ إغلاق اللوحة", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -2377,8 +2379,6 @@ def external_owner_group_markup(uid, chat_id):
     if owner_view or external_owner_can(uid,chat_id,"rejected"): pair.append(InlineKeyboardButton("❌ المرفوضون",callback_data=f"xowner_feature:{chat_id}:rejected"))
     if owner_view or external_owner_can(uid,chat_id,"reentry"): pair.append(InlineKeyboardButton("↩️ طلبات العودة",callback_data=f"xowner_feature:{chat_id}:reentry"))
     if pair: rows.append(pair)
-    if owner_view:
-        rows.append([InlineKeyboardButton("👥 المشرفون والمدراء والصلاحيات",callback_data=f"xowner_staff:{chat_id}")])
     # Expose the implemented group-scoped views in the external owner's menu.
     if owner_view or external_owner_can(uid,chat_id,"stats"):
         rows.append([InlineKeyboardButton("📊 إحصائيات القروب",callback_data=f"xowner_stats:{chat_id}")])
@@ -2411,7 +2411,7 @@ def external_owner_staff_markup(uid,chat_id):
     staff=db.execute("SELECT user_id,role,active FROM external_owner_staff WHERE owner_id=? AND chat_id=? ORDER BY user_id",(int(uid),int(chat_id))).fetchall()
     rows=[[InlineKeyboardButton(f"➕ إضافة نائب/مشرف/مدير",callback_data=f"xowner_staff_add:{chat_id}")]]
     for user_id,role,active in staff:
-        rows.append([InlineKeyboardButton(f"{'🟢' if active else '🔴'} {role} · {user_id}",callback_data=f"xowner_staff_user:{chat_id}:{user_id}")])
+        rows.append([InlineKeyboardButton(f"{'🟢' if active else '🔴'} {role} · {user_display_name(user_id)[:32]}",callback_data=f"xowner_staff_user:{chat_id}:{user_id}")])
     rows.append([InlineKeyboardButton("⬅️ اختيار القروب",callback_data="xowner_staff_groups")])
     return InlineKeyboardMarkup(rows)
 
@@ -2423,7 +2423,9 @@ def external_owner_staff_user_markup(owner_id,chat_id,user_id):
         rows.append([InlineKeyboardButton(("✅ " if granted else "⬜ ")+label,callback_data=f"xowner_staff_cap:{chat_id}:{user_id}:{cap}")])
     role_row=db.execute("SELECT role,active FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=?",(owner_id,user_id,chat_id)).fetchone()
     if role_row:
-        rows.append([InlineKeyboardButton("🔄 تغيير الرتبة",callback_data=f"xowner_staff_role:{chat_id}:{user_id}")])
+        rows.append([InlineKeyboardButton("✅ منح جميع الصلاحيات",callback_data=f"xowner_staff_all:{chat_id}:{user_id}")])
+        rows.append([InlineKeyboardButton("🧹 سحب جميع الصلاحيات",callback_data=f"xowner_staff_none:{chat_id}:{user_id}")])
+        rows.append([InlineKeyboardButton("🔄 تغيير/تنزيل الرتبة",callback_data=f"xowner_staff_role:{chat_id}:{user_id}")])
         rows.append([InlineKeyboardButton("🚫 عزل هذا الشخص",callback_data=f"xowner_staff_remove:{chat_id}:{user_id}")])
     rows.append([InlineKeyboardButton("⬅️ طاقم القروب",callback_data=f"xowner_staff:{chat_id}")])
     return InlineKeyboardMarkup(rows)
@@ -2446,6 +2448,40 @@ def external_locks_markup(chat_id):
                  InlineKeyboardButton("🟢 فتح الدردشة",callback_data=f"xowner_chat_lock:{chat_id}:0")])
     rows.append([InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{chat_id}")])
     return InlineKeyboardMarkup(rows)
+
+def primary_external_broadcast_markup(selected=None, page=0):
+    """Selection keyboard for primary-owner external broadcasts, with pagination."""
+    selected = {int(x) for x in (selected or set())}
+    all_groups = db.execute(
+        "SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) "
+        "FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 "
+        "ORDER BY title,chat_id"
+    ).fetchall()
+    per_page = 25
+    pages = max(1, (len(all_groups) + per_page - 1) // per_page)
+    page = max(0, min(int(page), pages - 1))
+    rows = []
+    for cid, title in all_groups[page * per_page:(page + 1) * per_page]:
+        mark = "✅" if int(cid) in selected else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {str(title)[:45]}",
+            callback_data=f"owner_external_broadcast_toggle:{int(cid)}"
+        )])
+    if not rows:
+        rows.append([InlineKeyboardButton("لا توجد قروبات خارجية نشطة", callback_data="noop")])
+    rows.append([InlineKeyboardButton("🌐 تحديد جميع القروبات الخارجية", callback_data="owner_external_broadcast_all")])
+    rows.append([InlineKeyboardButton("🧹 إلغاء التحديد", callback_data="owner_external_broadcast_clear")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"owner_external_broadcast_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page+1}/{pages} · الإجمالي {len(all_groups)}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"owner_external_broadcast_page:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(f"➡️ متابعة وكتابة الإعلان ({len(selected)})", callback_data="owner_external_broadcast_prepare")])
+    rows.append([InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
 
 def panel_markup(uid):
     """واجهة مرتبة حسب الدور، مع الحفاظ على جميع أقسام الإدارة السابقة."""
@@ -2489,7 +2525,6 @@ def panel_markup(uid):
         delegated_rows = [
             [InlineKeyboardButton("🛡️📡 الحماية والرادار الأمني", callback_data="security_groups"), InlineKeyboardButton("👥🧰 إدارة الأعضاء والإشراف", callback_data="administration_groups")],
             [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
-        [InlineKeyboardButton("🌐 نشر إعلان للقروبات الخارجية", callback_data="owner_external_broadcast")],
             [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
             [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
             [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🔔 التنبيهات", callback_data="alerts")],
@@ -2563,10 +2598,10 @@ def panel_markup(uid):
         [InlineKeyboardButton("⚙️ تحكم الإحصائيات والإشعارات", callback_data="group_controls")],
         [InlineKeyboardButton("🎛️ تحكم جماعي بالإحصائيات والردود الآلية", callback_data="owner_global_controls")],
         [InlineKeyboardButton("🏠 إدارة صلاحيات القروبات الداخلية", callback_data="internal_groups_controls")],
-        [InlineKeyboardButton("🌐 إدارة القروبات الخارجية ومعلوماتها", callback_data="external_groups")],
         [InlineKeyboardButton("🚫 المحظورون والمرفوضون وطلبات العودة", callback_data="restricted_members")],
         [InlineKeyboardButton("🔒 قفل الرسائل في قروبات محددة", callback_data="allmsg_open:lock"), InlineKeyboardButton("🔓 فتح الرسائل في قروبات محددة", callback_data="allmsg_open:unlock")],
         [InlineKeyboardButton("📣📢 مركز الإعلانات والنشر", callback_data="campaign_center"), InlineKeyboardButton("👋🎉 الترحيب الذكي", callback_data="welcome")],
+        [InlineKeyboardButton("🌐 نشر إعلان للقروبات الخارجية", callback_data="owner_external_broadcast")],
         [InlineKeyboardButton("📊📈 الإحصائيات", callback_data="statistics"), InlineKeyboardButton("📋🧾 سجل المخالفات والعمليات", callback_data="logs")],
         [InlineKeyboardButton("🎬 مركز الوسائط", callback_data="media_admin")],
         [InlineKeyboardButton("⚙️ إعدادات القروبات", callback_data="settings"), InlineKeyboardButton("🏅🎖️ الرتب الإدارية", callback_data="roles_groups")],
@@ -2574,8 +2609,7 @@ def panel_markup(uid):
         [InlineKeyboardButton("📣 استدعاء التاق للقروبات", callback_data="owner_tag_groups")],
         [InlineKeyboardButton("💬 إدارة الردود الآلية لكل القروبات", callback_data="owner_autoreplies")],
         [InlineKeyboardButton("📨 صندوق استفسارات الأعضاء", callback_data="inquiries_inbox"), InlineKeyboardButton("🧭 مركز الطاقم", callback_data="staff_center")],
-        [InlineKeyboardButton("🛡️ توزيع الصلاحيات والقروبات", callback_data="unified_permissions")],
-        [InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="staff_permissions")],
+        [InlineKeyboardButton("👥 إدارة المشرفين والمدراء والصلاحيات", callback_data="unified_permissions")],
         [InlineKeyboardButton("🗂️ استفسارات الطاقم", callback_data="staff_inquiries_inbox")],
         [InlineKeyboardButton("📡 إدارة القنوات والنشر", callback_data="channels_manage")],
         [InlineKeyboardButton("👑 إدارة نائب المالك", callback_data="deputy_owner_manage"), InlineKeyboardButton("🛡️ إدارة المالك المفوّض", callback_data="delegated_owner")],
@@ -13924,21 +13958,40 @@ async def _callback_impl(update, context):
         else: db.execute("INSERT INTO external_owner_staff_caps(owner_id,user_id,chat_id,capability,granted_at) VALUES(?,?,?,?,?)",(uid,target,cid,cap,now())); status="مُنحت"
         db.commit(); log_action(cid,uid,"external_owner_staff_capability",f"target={target};cap={cap};{status}")
         await q.edit_message_text(f"✅ {status} صلاحية {EXTERNAL_OWNER_CAPS[cap]} للمستخدم {target} في هذا القروب فقط.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
+    if data.startswith("xowner_staff_all:") or data.startswith("xowner_staff_none:"):
+        grant_all = data.startswith("xowner_staff_all:")
+        try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
+        except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
+        if (not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone()
+                or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone()):
+            await safe_callback_answer(q,"لا تملك صلاحية تعديل هذا المستخدم أو أن القروب غير نشط.",show_alert=True); return
+        if grant_all:
+            for cap in EXTERNAL_OWNER_CAPS:
+                if cap == "manage_staff": continue
+                db.execute("INSERT OR REPLACE INTO external_owner_staff_caps(owner_id,user_id,chat_id,capability,granted_at) VALUES(?,?,?,?,?)",(uid,target,cid,cap,now()))
+            action="مُنحت جميع صلاحيات القروب"
+        else:
+            db.execute("DELETE FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=?",(uid,target,cid))
+            action="سُحبت جميع صلاحيات القروب"
+        db.commit(); log_action(cid,uid,"external_owner_staff_bulk_capabilities",f"target={target};grant_all={int(grant_all)}")
+        await q.edit_message_text(f"✅ {action} للمستخدم {user_display_name(target)} داخل هذا القروب فقط.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
+
     if data.startswith("xowner_staff_role:"):
         try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
         if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"القروب غير نشط أو الشخص غير مفوض.",show_alert=True); return
-        rows=[[InlineKeyboardButton(role,callback_data=f"xowner_staff_setrole:{cid}:{target}:{role}")] for role in ("نائب","مشرف","مدير")]
+        rows=[[InlineKeyboardButton(role,callback_data=f"xowner_staff_setrole:{cid}:{target}:{role}")] for role in ("نائب","مشرف","مدير","عضو (تنزيل الرتبة)")]
         rows.append([InlineKeyboardButton("⬅️ رجوع",callback_data=f"xowner_staff_user:{cid}:{target}")])
         await q.edit_message_text("اختر الرتبة لهذا القروب فقط:",reply_markup=InlineKeyboardMarkup(rows)); return
     if data.startswith("xowner_staff_setrole:"):
         try: _,raw_cid,raw_uid,role=data.split(":",3); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
-        if role not in ("نائب","مشرف","مدير") or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"تغيير الرتبة غير مسموح أو أن التفويض لم يعد نشطًا.",show_alert=True); return
-        cur=db.execute("UPDATE external_owner_staff SET role=? WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(role,uid,target,cid))
+        if role not in ("نائب","مشرف","مدير","عضو (تنزيل الرتبة)") or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"تغيير الرتبة غير مسموح أو أن التفويض لم يعد نشطًا.",show_alert=True); return
+        role_value = "عضو" if role == "عضو (تنزيل الرتبة)" else role
+        cur=db.execute("UPDATE external_owner_staff SET role=? WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(role_value,uid,target,cid))
         if not cur.rowcount: await safe_callback_answer(q,"تعذر تغيير الرتبة؛ تأكد من أن الشخص لا يزال مفوضًا.",show_alert=True); return
         db.commit()
-        await q.edit_message_text(f"تم تحديث رتبة المستخدم {target} إلى {role}.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
+        await q.edit_message_text(f"تم تحديث رتبة المستخدم {user_display_name(target)} إلى {role_value}.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
     if data.startswith("xowner_staff_remove:"):
         try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
@@ -13952,13 +14005,18 @@ async def _callback_impl(update, context):
     if data == "owner_external_broadcast":
         if not is_owner(uid):
             await safe_callback_answer(q, "هذه الخاصية لمالك البوت الأساسي فقط.", show_alert=True); return
-        groups = db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 ORDER BY title,chat_id").fetchall()
+        try:
+            await refresh_external_group_membership(context.bot)
+        except Exception:
+            log.exception("External membership refresh before primary-owner broadcast failed")
+        groups = db.execute("SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1").fetchall()
         if not groups:
             await q.edit_message_text("لا توجد قروبات خارجية نشطة حاليًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
         context.user_data["primary_external_broadcast_targets"] = []
-        rows = [[InlineKeyboardButton("⬜ " + str(title)[:45], callback_data=f"owner_external_broadcast_toggle:{cid}")] for cid,title in groups[:80]]
-        rows += [[InlineKeyboardButton("🌐 تحديد جميع القروبات الخارجية", callback_data="owner_external_broadcast_all")], [InlineKeyboardButton("➡️ متابعة وكتابة الإعلان", callback_data="owner_external_broadcast_prepare")], [InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]]
-        await q.edit_message_text("🌐 نشر إعلان للقروبات الخارجية\n\nحدد القروبات التي تريد إرسال الإعلان إليها. لن يتم الإرسال إلا للقروبات التي تختارها.", reply_markup=InlineKeyboardMarkup(rows)); return
+        context.user_data["primary_external_broadcast_page"] = 0
+        await q.edit_message_text(
+            "🌐 نشر إعلان للقروبات الخارجية\n\nحدد القروبات التي تريد إرسال الإعلان إليها. يمكنك اختيار قروبات محددة أو تحديد الكل، ولن يتم الإرسال إلا للقروبات التي تختارها.",
+            reply_markup=primary_external_broadcast_markup(set(), 0)); return
     if data.startswith("owner_external_broadcast_toggle:"):
         if not is_owner(uid):
             await safe_callback_answer(q, "هذه الخاصية لمالك البوت الأساسي فقط.", show_alert=True); return
@@ -13970,19 +14028,29 @@ async def _callback_impl(update, context):
         selected=set(int(x) for x in context.user_data.get("primary_external_broadcast_targets",[]))
         selected.remove(cid) if cid in selected else selected.add(cid)
         context.user_data["primary_external_broadcast_targets"]=sorted(selected)
-        groups=db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 ORDER BY title,chat_id").fetchall()
-        rows=[[InlineKeyboardButton(("✅ " if int(gid) in selected else "⬜ ")+str(title)[:45],callback_data=f"owner_external_broadcast_toggle:{gid}")] for gid,title in groups[:80]]
-        rows += [[InlineKeyboardButton("🌐 تحديد جميع القروبات الخارجية",callback_data="owner_external_broadcast_all")],[InlineKeyboardButton(f"➡️ متابعة ({len(selected)})",callback_data="owner_external_broadcast_prepare")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]]
-        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows)); return
+        page = int(context.user_data.get("primary_external_broadcast_page", 0))
+        await q.edit_message_reply_markup(reply_markup=primary_external_broadcast_markup(selected, page)); return
     if data == "owner_external_broadcast_all":
         if not is_owner(uid):
             await safe_callback_answer(q,"هذه الخاصية لمالك البوت الأساسي فقط.",show_alert=True); return
         context.user_data["primary_external_broadcast_targets"]=[int(r[0]) for r in db.execute("SELECT chat_id FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 ORDER BY title,chat_id").fetchall()]
-        groups=db.execute("SELECT chat_id,COALESCE(NULLIF(title,''),CAST(chat_id AS TEXT)) FROM external_group_control WHERE is_external=1 AND is_member=1 AND enabled=1 ORDER BY title,chat_id").fetchall()
         selected=set(context.user_data["primary_external_broadcast_targets"])
-        rows=[[InlineKeyboardButton("✅ "+str(title)[:45],callback_data=f"owner_external_broadcast_toggle:{gid}")] for gid,title in groups[:80]]
-        rows += [[InlineKeyboardButton(f"➡️ متابعة ({len(selected)})",callback_data="owner_external_broadcast_prepare")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]]
-        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows)); return
+        page = int(context.user_data.get("primary_external_broadcast_page", 0))
+        await q.edit_message_reply_markup(reply_markup=primary_external_broadcast_markup(selected, page)); return
+    if data == "owner_external_broadcast_clear":
+        if not is_owner(uid):
+            await safe_callback_answer(q,"هذه الخاصية لمالك البوت الأساسي فقط.",show_alert=True); return
+        context.user_data["primary_external_broadcast_targets"] = []
+        page = int(context.user_data.get("primary_external_broadcast_page", 0))
+        await q.edit_message_reply_markup(reply_markup=primary_external_broadcast_markup(set(), page)); return
+    if data.startswith("owner_external_broadcast_page:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q,"هذه الخاصية لمالك البوت الأساسي فقط.",show_alert=True); return
+        try: page = max(0, int(data.split(":",1)[1]))
+        except ValueError: page = 0
+        context.user_data["primary_external_broadcast_page"] = page
+        selected = set(int(x) for x in context.user_data.get("primary_external_broadcast_targets", []))
+        await q.edit_message_reply_markup(reply_markup=primary_external_broadcast_markup(selected, page)); return
     if data == "owner_external_broadcast_prepare":
         if not is_owner(uid):
             await safe_callback_answer(q,"هذه الخاصية لمالك البوت الأساسي فقط.",show_alert=True); return
@@ -14008,12 +14076,12 @@ async def _callback_impl(update, context):
             except Exception as exc:
                 failed+=1; details.append(f"{cid}: {str(exc)[:100]}")
             await asyncio.sleep(0.08)
-        for key in ("primary_external_broadcast_draft","primary_external_broadcast_targets","awaiting_primary_external_broadcast_content"): context.user_data.pop(key,None)
+        for key in ("primary_external_broadcast_draft","primary_external_broadcast_targets","awaiting_primary_external_broadcast_content","primary_external_broadcast_page"): context.user_data.pop(key,None)
         await q.edit_message_text(f"📣 انتهى نشر الإعلان للقروبات الخارجية\nنجح الإرسال: {sent}\nتعذر الإرسال: {failed}"+("\n"+"\n".join(details[:10]) if details else ""),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌐 إعلان خارجي جديد",callback_data="owner_external_broadcast")],[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
     if data == "owner_external_broadcast_cancel":
         if not is_owner(uid):
             await safe_callback_answer(q,"هذه الخاصية لمالك البوت الأساسي فقط.",show_alert=True); return
-        for key in ("primary_external_broadcast_draft","primary_external_broadcast_targets","awaiting_primary_external_broadcast_content"): context.user_data.pop(key,None)
+        for key in ("primary_external_broadcast_draft","primary_external_broadcast_targets","awaiting_primary_external_broadcast_content","primary_external_broadcast_page"): context.user_data.pop(key,None)
         await q.edit_message_text("تم إلغاء نشر الإعلان الخارجي.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ الرئيسية",callback_data="home")]])); return
 
     if data == "xowner_campaigns":
@@ -14612,7 +14680,7 @@ async def _callback_impl(update, context):
         if not is_owner(uid):
             await safe_callback_answer(q, "توزيع الصلاحيات الشاملة للمالك الأساسي فقط.", show_alert=True); return
         context.user_data["awaiting_unified_target_id"] = True
-        await q.message.reply_text("🛡️ توزيع الصلاحيات والقروبات\nأرسل Telegram ID للمفوّض أو المدير أو المشرف الذي تريد إدارته.\nيمكنك منح أو سحب الرتب، وتحديد جميع القروبات أو قروبات محددة. للإلغاء أرسل /cancel.")
+        await q.message.reply_text("🛡️ توزيع الصلاحيات والقروبات\nأرسل Telegram ID للمشرف أو المدير الذي تريد إدارته. ستظهر لك صفحة موحدة للاسم والرتبة والصلاحيات، مع منح الكل أو تخصيص صلاحيات معينة أو تنزيل الرتبة أو العزل. للإلغاء أرسل /cancel.")
         return
     if data.startswith("unifiedmanage:"):
         if not is_owner(uid): await safe_callback_answer(q, "للمالك الأساسي فقط.", show_alert=True); return
@@ -14646,6 +14714,28 @@ async def _callback_impl(update, context):
         db.commit(); log_action(0,uid,"unified_role_changed",f"target={target_uid}; role={role}; action={action}")
         await safe_callback_answer(q, action, show_alert=True)
         await q.edit_message_text(f"{action} للمستخدم {target_uid}.", reply_markup=unified_permissions_markup(target_uid)); return
+    if data.startswith("unifiedrevokeall:") or data.startswith("unifieddemote:") or data.startswith("unifiedisolate:"):
+        if not is_owner(uid):
+            await safe_callback_answer(q,"هذه الإجراءات للمالك الأساسي فقط.",show_alert=True); return
+        action_key=data.split(":",1)[0]
+        try: target_uid=int(data.split(":",1)[1])
+        except ValueError: await safe_callback_answer(q,"معرّف المستخدم غير صحيح.",show_alert=True); return
+        if target_uid<=0 or target_uid==OWNER_ID or is_deputy_owner(target_uid):
+            await safe_callback_answer(q,"لا يمكن تعديل حساب المالك الأساسي أو نائبه.",show_alert=True); return
+        if action_key in ("unifieddemote","unifiedrevokeall","unifiedisolate"):
+            db.execute("DELETE FROM managers WHERE user_id=?",(target_uid,))
+            db.execute("DELETE FROM protection_managers WHERE user_id=?",(target_uid,))
+            db.execute("DELETE FROM delegated_owners WHERE user_id=?",(target_uid,))
+            db.execute("DELETE FROM group_roles WHERE user_id=?",(target_uid,))
+        if action_key in ("unifiedrevokeall","unifiedisolate"):
+            db.execute("DELETE FROM staff_capabilities WHERE user_id=?",(target_uid,))
+            db.execute("DELETE FROM staff_capability_denials WHERE user_id=?",(target_uid,))
+        # Preserve staff badges and audit history; isolation only revokes access.
+        db.commit()
+        log_action(0,uid,"unified_staff_bulk_change",f"target={target_uid};action={action_key}")
+        label={"unifiedrevokeall":"سحب جميع الرتب والصلاحيات التشغيلية","unifieddemote":"تنزيل الرتب الإدارية مع إبقاء الصلاحيات المخصصة","unifiedisolate":"عزل المستخدم وسحب الرتب والصلاحيات"}[action_key]
+        await q.edit_message_text(f"✅ {label} للمستخدم {user_display_name(target_uid)}.",reply_markup=unified_permissions_markup(target_uid)); return
+
     if data.startswith("unifiedall:"):
         if not is_owner(uid):
             await safe_callback_answer(q, "منح جميع الصلاحيات للمالك الأساسي فقط.", show_alert=True); return
@@ -15087,7 +15177,7 @@ async def _callback_impl(update, context):
 
     # External group control center: owner or users explicitly granted external_groups.
     if data in {"external_groups", "external_groups_refresh"} or data.startswith("external_groups_page:"):
-        if not can_manage_external_groups(uid):
+        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
             await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية من المالك الأساسي.", show_alert=True); return
         page = 0
         if data.startswith("external_groups_page:"):
@@ -15113,7 +15203,7 @@ async def _callback_impl(update, context):
                 await safe_callback_answer(q, "تعذر إكمال التحديث. لم تُحذف السجلات بسبب هذا الخطأ.", show_alert=True)
         await q.edit_message_text("🌐 إدارة القروبات الخارجية\n\nاختر قروبًا نشطًا. استخدم زر التحديث للتحقق من العضوية الفعلية. تُحفظ السجلات والإعدادات التاريخية للقروبات التي غادرها البوت.", reply_markup=external_groups_markup(page)); return
     if data.startswith("external_group:"):
-        if not can_manage_external_groups(uid):
+        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_manage_external_groups(uid):
             await safe_callback_answer(q, "غير مصرح لك بإدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
@@ -15132,105 +15222,12 @@ async def _callback_impl(update, context):
             log.debug("Could not resolve external group creator for %s: %s", ext_chat_id, owner_exc)
         caps = db.execute("SELECT capability,enabled FROM external_group_capabilities WHERE chat_id=? ORDER BY capability", (ext_chat_id,)).fetchall()
         cap_text = "\n".join(f"• {EXTERNAL_CAPABILITY_LABELS.get(cap,cap)}: {'مفعّل' if on else 'معطّل'}" for cap,on in caps)
-        recorded_owner = html.escape(added_name or "غير معروف")
-        recorded_username = (" — @" + html.escape(added_username)) if added_username else ""
         text = (f"🌐 معلومات القروب الخارجي\n\nالقروب: {html.escape(title or str(ext_chat_id))}\nID: {ext_chat_id}\n"
-                f"👑 مالك القروب في Telegram: {telegram_owner_label}\n"
-                f"👤 اسم الحساب المسجل عند إضافة البوت: {recorded_owner} (ID: {added_by or 'غير معروف'}){recorded_username}\n"
-                f"📅 تاريخ التسجيل: {created_at}\n"
-                f"⚙️ حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
+                f"مالك القروب في Telegram: {telegram_owner_label}\n"
+                f"أضاف البوت: {html.escape(added_name or 'غير معروف')} (ID: {added_by or 'غير معروف'})"
+                f"{' — @'+html.escape(added_username) if added_username else ''}\nتاريخ التسجيل: {created_at}\n"
+                f"حالة البوت: {'مفعّل' if enabled else 'متوقف'}\nالذكاء الاصطناعي الجماعي: معطّل\n\nالصلاحيات المتاحة:\n{cap_text}")
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=external_group_manage_markup(ext_chat_id, uid)); return
-    if data.startswith("external_link_manage:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "إدارة روابط القروبات الخارجية متاحة لمالك البوت الأساسي فقط.", show_alert=True); return
-        try: ext_chat_id = int(data.split(":", 1)[1])
-        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
-        if not ext_row:
-            await safe_callback_answer(q, "القروب الخارجي غير مسجل.", show_alert=True); return
-        await sync_group_link_record(context.bot, ext_chat_id)
-        link_row = db.execute("SELECT invite_link,link_status,last_updated_at FROM group_link_directory WHERE chat_id=?", (ext_chat_id,)).fetchone()
-        invite_link, link_status, link_updated = link_row if link_row else ("", "unknown", "")
-        buttons = []
-        if invite_link.startswith("https://"):
-            buttons.append([InlineKeyboardButton("🔗 فتح الرابط الحالي", url=invite_link)])
-        buttons.append([InlineKeyboardButton("♻️ إلغاء الرابط الحالي وإنشاء رابط جديد", callback_data=f"external_link_renew:{ext_chat_id}")])
-        buttons.append([InlineKeyboardButton("🗑️ سحب الرابط الحالي", callback_data=f"external_link_revoke:{ext_chat_id}")])
-        buttons.append([InlineKeyboardButton("⬅️ معلومات وإدارة القروب", callback_data=f"external_group:{ext_chat_id}")])
-        await q.edit_message_text(
-            f"🔗 إدارة رابط القروب الخارجي\n\nالقروب: {html.escape(ext_row[0] or str(ext_chat_id))}\nID: {ext_chat_id}\n"
-            f"الرابط الحالي: {html.escape(invite_link or 'لا يوجد رابط محفوظ')}\nحالة الرابط: {html.escape(link_status or 'غير معروف')}\n"
-            f"آخر تحديث: {html.escape(link_updated or 'غير متوفر')}\n\n"
-            "ملاحظة: إذا كان القروب عامًا وله اسم مستخدم (t.me/username)، فلا يمكن سحب رابطه من خلال البوت؛ يجب تغيير اسم المستخدم من إعدادات القروب.",
-            parse_mode="HTML", disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("external_link_revoke:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "سحب روابط القروبات الخارجية متاح لمالك البوت الأساسي فقط.", show_alert=True); return
-        try: ext_chat_id = int(data.split(":", 1)[1])
-        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1", (ext_chat_id,)).fetchone()
-        if not ext_row:
-            await safe_callback_answer(q, "القروب الخارجي غير مسجل.", show_alert=True); return
-        try:
-            chat_info = await context.bot.get_chat(ext_chat_id)
-            if getattr(chat_info, "username", None):
-                await safe_callback_answer(q, "القروب عام؛ لا يمكن سحب رابط t.me العام من البوت. غيّر اسم المستخدم من إعدادات Telegram.", show_alert=True); return
-            candidates = set()
-            if getattr(chat_info, "invite_link", None): candidates.add(chat_info.invite_link)
-            directory_row = db.execute("SELECT invite_link FROM group_link_directory WHERE chat_id=?", (ext_chat_id,)).fetchone()
-            if directory_row and directory_row[0]: candidates.add(directory_row[0])
-            tracked = db.execute("SELECT invite_link FROM managed_join_invite_links WHERE chat_id=? AND active=1", (ext_chat_id,)).fetchall()
-            candidates.update(link for (link,) in tracked if link)
-            revoked, failures = 0, 0
-            for invite in candidates:
-                try:
-                    await context.bot.revoke_chat_invite_link(chat_id=ext_chat_id, invite_link=invite)
-                    revoked += 1
-                    db.execute("UPDATE managed_join_invite_links SET active=0,revoked_at=? WHERE chat_id=? AND invite_link=?", (now(), ext_chat_id, invite))
-                except Exception as exc:
-                    failures += 1
-                    log.info("Could not revoke external invite for %s: %s", ext_chat_id, exc)
-            db.execute("UPDATE group_link_directory SET invite_link='',link_status='revoked',last_updated_at=? WHERE chat_id=?", (now(), ext_chat_id))
-            db.commit()
-            log_external_group_event(ext_chat_id, uid, "invite_link_revoke", f"revoked={revoked}; failures={failures}")
-            if revoked: await safe_callback_answer(q, f"تم سحب {revoked} رابط دعوة.", show_alert=True)
-            elif failures: await safe_callback_answer(q, "تعذر سحب الرابط. تحقق من صلاحية البوت وأن الرابط صادر من البوت.", show_alert=True)
-            else: await safe_callback_answer(q, "لا يوجد رابط دعوة خاص محفوظ لسحبه.", show_alert=True)
-        except Exception:
-            log.exception("External invite revocation failed for %s", ext_chat_id)
-            await safe_callback_answer(q, "تعذر الوصول إلى القروب أو سحب الرابط. تحقق من صلاحيات البوت.", show_alert=True)
-        await q.edit_message_text("🔗 تم تحديث حالة رابط القروب الخارجي.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 مراجعة الروابط", callback_data=f"external_link_manage:{ext_chat_id}")],
-            [InlineKeyboardButton("⬅️ إدارة القروب", callback_data=f"external_group:{ext_chat_id}")]]))
-        return
-
-    if data.startswith("external_link_renew:"):
-        if not is_owner(uid):
-            await safe_callback_answer(q, "تجديد روابط القروبات الخارجية متاح لمالك البوت الأساسي فقط.", show_alert=True); return
-        try: ext_chat_id = int(data.split(":", 1)[1])
-        except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
-        ext_row = db.execute("SELECT title FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1", (ext_chat_id,)).fetchone()
-        if not ext_row:
-            await safe_callback_answer(q, "القروب غير موجود أو أن البوت ليس عضوًا فيه.", show_alert=True); return
-        try:
-            link = await create_managed_external_direct_invite_link(context.bot, ext_chat_id)
-            db.execute("""INSERT INTO group_link_directory(chat_id,title,group_type,invite_link,link_status,last_updated_at)
-                VALUES(?,?,'external',?,'created_by_bot',?) ON CONFLICT(chat_id) DO UPDATE SET
-                title=excluded.title,group_type='external',invite_link=excluded.invite_link,
-                link_status='created_by_bot',last_updated_at=excluded.last_updated_at""", (ext_chat_id, ext_row[0] or str(ext_chat_id), link, now()))
-            db.commit()
-            log_external_group_event(ext_chat_id, uid, "invite_link_renew", "Primary direct invite link rotated")
-            await safe_callback_answer(q, "تم إنشاء رابط دخول جديد.", show_alert=True)
-            await q.edit_message_text(f"✅ تم إنشاء رابط جديد للقروب الخارجي\n\n{html.escape(link)}", parse_mode="HTML", disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 فتح الرابط الجديد", url=link)],
-                    [InlineKeyboardButton("⬅️ إدارة الرابط", callback_data=f"external_link_manage:{ext_chat_id}")]]))
-        except Exception as exc:
-            log.warning("External invite renewal failed for %s: %s", ext_chat_id, exc)
-            await safe_callback_answer(q, "تعذر إنشاء رابط جديد. تأكد من أن البوت مشرف ويملك صلاحية دعوة المستخدمين.", show_alert=True)
-        return
-
     if data.startswith("external_toggle:"):
         if not can_manage_external_groups(uid): await safe_callback_answer(q, "تحتاج صلاحية إدارة القروبات الخارجية.", show_alert=True); return
         try: ext_chat_id = int(data.split(":",1)[1])
