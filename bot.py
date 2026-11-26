@@ -14781,25 +14781,37 @@ async def _callback_impl(update, context):
         if target_uid<=0 or target_uid==OWNER_ID or is_deputy_owner(target_uid):
             await safe_callback_answer(q,"لا يمكن تعديل حساب المالك الأساسي أو نائبه.",show_alert=True); return
         telegram_demotion_results = []
+        telegram_not_present = []
         if action_key in ("unifieddemote", "unifiedrevokeall", "unifiedisolate"):
-            # Remove Telegram admin rights for all three actions in internal groups.
-            # Lookup failures are reported, never silently treated as success.
-            for internal_cid, _title in owner_managed_group_rows():
+            # Process every internal group independently. A target who is not a
+            # member/admin in one group must not prevent processing the others.
+            # Genuine API/permission errors are retained and reported by group.
+            for internal_cid, internal_title in owner_managed_group_rows():
                 internal_cid = int(internal_cid)
+                internal_title = str(internal_title or internal_cid)
                 try:
                     member = await context.bot.get_chat_member(chat_id=internal_cid, user_id=target_uid)
                 except Exception as exc:
-                    telegram_demotion_results.append((internal_cid, False, f"تعذر التحقق من العضوية: {str(exc)[:140]}"))
+                    err = str(exc)
+                    low = err.lower()
+                    if any(marker in low for marker in ("user not found", "participant_id_invalid", "participant not found", "user_id_invalid")):
+                        telegram_not_present.append((internal_cid, internal_title))
+                        continue
+                    telegram_demotion_results.append((internal_cid, internal_title, False, f"تعذر التحقق: {err[:140]}"))
                     continue
-                if getattr(member, "status", "") not in ("administrator", "admin"):
+                status = getattr(member, "status", "")
+                if status not in ("administrator", "admin"):
+                    telegram_not_present.append((internal_cid, internal_title))
                     continue
                 ok, reason = await demote_member_in_telegram(context.bot, internal_cid, target_uid)
-                telegram_demotion_results.append((internal_cid, ok, reason))
-            failures = [(cid, reason) for cid, ok, reason in telegram_demotion_results if not ok]
+                telegram_demotion_results.append((internal_cid, internal_title, bool(ok), str(reason)))
+            failures = [(title, reason) for _cid, title, ok, reason in telegram_demotion_results if not ok]
             if failures:
-                details = "\n".join(f"{cid}: {reason}" for cid, reason in failures[:8])
-                await safe_callback_answer(q, "تعذر سحب إشراف تيليجرام. لم أُكمل سحب الصلاحيات.", show_alert=True)
-                await q.edit_message_text(f"❌ لم يكتمل الإجراء للمستخدم {user_display_name(target_uid)}.\n\n{details}\n\nتأكد من أن البوت مشرف ويملك صلاحية can_promote_members في القروبات المتعذرة، ثم أعد المحاولة.", reply_markup=unified_permissions_markup(target_uid))
+                details = "\n".join(f"• {title}: {reason}" for title, reason in failures[:12])
+                await safe_callback_answer(q, "تعذر إكمال تنزيل الإشراف في بعض القروبات.", show_alert=True)
+                await q.edit_message_text(
+                    f"⚠️ تمت معالجة القروبات الممكنة للمستخدم {user_display_name(target_uid)}، لكن بقيت قروبات تعذر التحقق منها أو تنزيل إشرافه فيها.\n\n{details}\n\nلم تُسحب صلاحياته من قاعدة بيانات البوت حتى لا يحدث عزل جزئي مضلل. تأكد من صلاحية البوت can_promote_members في القروبات المذكورة ثم أعد المحاولة.",
+                    reply_markup=unified_permissions_markup(target_uid))
                 return
         if action_key in ("unifieddemote","unifiedrevokeall","unifiedisolate"):
             db.execute("DELETE FROM managers WHERE user_id=?",(target_uid,))
@@ -14815,11 +14827,10 @@ async def _callback_impl(update, context):
         label={"unifiedrevokeall":"سحب جميع الرتب والصلاحيات التشغيلية","unifieddemote":"تنزيل الرتب الإدارية مع إبقاء الصلاحيات المخصصة","unifiedisolate":"عزل المستخدم وسحب الرتب والصلاحيات"}[action_key]
         report = ""
         if action_key in ("unifieddemote", "unifiedrevokeall", "unifiedisolate"):
-            done = sum(1 for _cid, ok, _reason in telegram_demotion_results if ok)
-            failed = sum(1 for _cid, ok, _reason in telegram_demotion_results if not ok)
-            report = f"\nإزالة رتبة تيليجرام في القروبات الداخلية: {done} نجحت، {failed} تعذرت."
-            if failed:
-                report += "\nقد يلزم منح البوت صلاحية ترقية المشرفين (can_promote_members) في القروبات المتعذرة."
+            done = sum(1 for _cid, _title, ok, _reason in telegram_demotion_results if ok)
+            skipped = len(telegram_not_present)
+            report = f"\nنتيجة القروبات الداخلية: {done} قروبًا نُزّل فيه الإشراف أو لم تعد فيه رتبة إدارية، و{skipped} قروبًا لم يكن الشخص عضوًا/مشرفًا فيه."
+            report += "\nتمت معالجة القروبات واحدًا تلو الآخر دون إيقاف العملية بسبب غياب الشخص عن قروب معين."
         await q.edit_message_text(f"✅ {label} للمستخدم {user_display_name(target_uid)}.{report}",reply_markup=unified_permissions_markup(target_uid)); return
 
     if data.startswith("unifiedall:"):
