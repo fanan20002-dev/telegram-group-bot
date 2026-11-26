@@ -782,7 +782,7 @@ db.execute("""CREATE TABLE IF NOT EXISTS managed_join_invite_links(
     active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, revoked_at TEXT DEFAULT '',
     PRIMARY KEY(chat_id,invite_link)
 )""")
-db.execute("DELETE FROM motivation_groups WHERE chat_id NOT IN (SELECT w.chat_id FROM watched_groups w JOIN external_group_control e ON e.chat_id=w.chat_id WHERE e.is_external=0)")
+# Preserve motivation_groups records; inactive/external groups are filtered at query time.
 
 
 # Preserve legacy join-approval settings table for safe migration.
@@ -800,15 +800,19 @@ def is_owner_managed_group(chat_id):
 
 
 def group_control_scope(chat_id):
-    """Classify group controls as internal owner-managed or external."""
+    """Return an explicit scope; unknown/legacy groups are never silently trusted as internal."""
     row = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
-    return "external" if row is not None and int(row[0] or 0) == 1 else "internal"
+    if row is None or row[0] is None:
+        return "unknown"
+    return "external" if int(row[0]) == 1 else "internal"
 
 
 def owner_global_control_enabled(chat_id, feature):
     if feature not in {"stats", "auto_replies"}:
         return True
     scope = group_control_scope(chat_id)
+    if scope == "unknown":
+        return False
     row = db.execute("SELECT enabled FROM owner_global_feature_controls WHERE scope=? AND feature=?", (scope,feature)).fetchone()
     return bool(row[0]) if row else True
 
@@ -830,8 +834,8 @@ def set_owner_global_control(scope, feature, enabled, uid):
 def owner_managed_group_rows():
     """Return registered owner-managed groups only; external groups are intentionally excluded."""
     return db.execute("""SELECT w.chat_id, COALESCE(NULLIF(w.title,''), CAST(w.chat_id AS TEXT))
-        FROM watched_groups w LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
-        WHERE e.chat_id IS NOT NULL AND e.is_external=0
+        FROM watched_groups w JOIN external_group_control e ON e.chat_id=w.chat_id
+        WHERE e.is_external=0 AND COALESCE(e.enabled,1)=1 AND COALESCE(e.is_member,1)=1
         ORDER BY w.title, w.chat_id""").fetchall()
 
 
@@ -1562,7 +1566,7 @@ def register_group(chat, actor=None):
             (chat.id, chat.title or "", now()))
     else:
         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (chat.id,))
-        db.execute("DELETE FROM motivation_groups WHERE chat_id=?", (chat.id,))
+# Preserve motivation_groups records; inactive/external groups are filtered at query time.
 
     # Default external permissions: common group tools only. Sensitive tools stay disabled.
     for _cap, _enabled in (("tag",1),("protection",1),("members",1),("settings",1),("welcome",1),("stats",1),
@@ -13749,6 +13753,8 @@ async def demote_member_in_telegram(bot, chat_id, user_id):
     try:
         chat_id = int(chat_id)
         user_id = int(user_id)
+        if user_id == int(bot.id):
+            return False, "لا يمكن للبوت تنزيل إشراف نفسه من خلال إجراء إدارة الأعضاء"
         # Verify the bot itself has the Telegram privilege required to demote admins.
         bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
         bot_status = getattr(bot_member, "status", "")
@@ -13763,15 +13769,22 @@ async def demote_member_in_telegram(bot, chat_id, user_id):
             return False, "لا يمكن تنزيل مالك القروب الأساسي"
         if status not in ("administrator", "admin"):
             return True, "الشخص ليس مشرفًا في تيليجرام؛ لا توجد رتبة تيليجرام لسحبها"
-        await bot.promote_chat_member(
-            chat_id=int(chat_id), user_id=int(user_id),
+        result = await bot.promote_chat_member(
+            chat_id=chat_id, user_id=user_id,
             is_anonymous=False, can_manage_chat=False, can_delete_messages=False,
             can_manage_video_chats=False, can_restrict_members=False,
             can_promote_members=False, can_change_info=False, can_invite_users=False,
             can_post_messages=False, can_edit_messages=False, can_pin_messages=False,
             can_manage_topics=False,
         )
-        return True, "أزيلت رتبة الإشراف من تيليجرام"
+        if result is False:
+            return False, "رفض تيليجرام تنفيذ تنزيل الإشراف"
+        # Verify the actual Telegram state before the caller removes the bot-side role.
+        verified = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        verified_status = getattr(verified, "status", "")
+        if verified_status in ("administrator", "admin", "creator", "owner"):
+            return False, "لم يؤكد تيليجرام إزالة رتبة الإشراف؛ أبقيت صلاحيات الشخص في قاعدة البيانات"
+        return True, "أزيلت رتبة الإشراف وتأكدت حالة العضو في تيليجرام"
     except Exception as exc:
         log.warning("Could not demote Telegram admin %s in %s: %s", user_id, chat_id, exc)
         return False, str(exc)[:180]
@@ -18089,7 +18102,7 @@ async def active_group_refresh_worker(app):
                     else:
                         # External groups remain registered in the external center, never in owner lists.
                         db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
-                        db.execute("DELETE FROM motivation_groups WHERE chat_id=?", (cid,))
+# Preserve motivation_groups records; inactive/external groups are filtered at query time.
                     db.commit()
                     # Apply the correct reply policy immediately after ownership classification changes.
                     ensure_auto_replies(cid)
@@ -18105,7 +18118,7 @@ async def active_group_refresh_worker(app):
                                 (now(), now(), cid))
                             archive_watched_group(cid, "periodic_membership_refresh_confirmed_inactive")
                             db.execute("DELETE FROM watched_groups WHERE chat_id=?", (cid,))
-                            db.execute("DELETE FROM motivation_groups WHERE chat_id=?", (cid,))
+    # Preserve motivation_groups records; inactive/external groups are filtered at query time.
                             db.commit()
                             log_external_group_event(cid, 0, "bot_membership_lost", str(exc)[:500])
                             try:
