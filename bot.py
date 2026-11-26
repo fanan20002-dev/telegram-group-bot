@@ -13740,6 +13740,33 @@ async def motivation_cmd(update, context):
 
 # Removed by owner request: motivation_daily_worker (automatic scheduled content disabled).
 
+async def demote_member_in_telegram(bot, chat_id, user_id):
+    """Remove Telegram admin rights without banning the member.
+
+    Requires the bot to be an administrator with can_promote_members in the
+    target supergroup. Returns (success, reason) and never changes group ownership.
+    """
+    try:
+        member = await bot.get_chat_member(chat_id=int(chat_id), user_id=int(user_id))
+        status = getattr(member, "status", "")
+        if status in ("creator", "owner"):
+            return False, "لا يمكن تنزيل مالك القروب الأساسي"
+        if status not in ("administrator", "admin"):
+            return True, "ليس مشرفًا في تيليجرام؛ أزيلت صلاحياته من البوت فقط"
+        await bot.promote_chat_member(
+            chat_id=int(chat_id), user_id=int(user_id),
+            is_anonymous=False, can_manage_chat=False, can_delete_messages=False,
+            can_manage_video_chats=False, can_restrict_members=False,
+            can_promote_members=False, can_change_info=False, can_invite_users=False,
+            can_post_messages=False, can_edit_messages=False, can_pin_messages=False,
+            can_manage_topics=False,
+        )
+        return True, "أزيلت رتبة الإشراف من تيليجرام"
+    except Exception as exc:
+        log.warning("Could not demote Telegram admin %s in %s: %s", user_id, chat_id, exc)
+        return False, str(exc)[:180]
+
+
 async def _callback_impl(update, context):
     q = update.callback_query
     await safe_callback_answer(q)
@@ -13988,20 +14015,25 @@ async def _callback_impl(update, context):
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
         if role not in ("نائب","مشرف","مدير","عضو (تنزيل الرتبة)") or not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone() or not db.execute("SELECT 1 FROM external_owner_staff WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid)).fetchone(): await safe_callback_answer(q,"تغيير الرتبة غير مسموح أو أن التفويض لم يعد نشطًا.",show_alert=True); return
         role_value = "عضو" if role == "عضو (تنزيل الرتبة)" else role
+        demote_note = ""
+        if role_value == "عضو":
+            ok, reason = await demote_member_in_telegram(context.bot, cid, target)
+            demote_note = f"\nتيليجرام: {reason}"
         cur=db.execute("UPDATE external_owner_staff SET role=? WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(role_value,uid,target,cid))
         if not cur.rowcount: await safe_callback_answer(q,"تعذر تغيير الرتبة؛ تأكد من أن الشخص لا يزال مفوضًا.",show_alert=True); return
         db.commit()
-        await q.edit_message_text(f"تم تحديث رتبة المستخدم {user_display_name(target)} إلى {role_value}.",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
+        await q.edit_message_text(f"تم تحديث رتبة المستخدم {user_display_name(target)} إلى {role_value}.{demote_note}",reply_markup=external_owner_staff_user_markup(uid,cid,target)); return
     if data.startswith("xowner_staff_remove:"):
         try: _,raw_cid,raw_uid=data.split(":",2); cid=int(raw_cid); target=int(raw_uid)
         except Exception: await safe_callback_answer(q,"بيانات غير صحيحة.",show_alert=True); return
         if not db.execute("SELECT 1 FROM external_group_control WHERE chat_id=? AND is_external=1 AND is_member=1 AND enabled=1 AND added_by=?",(cid,uid)).fetchone(): await safe_callback_answer(q,"لا تملك هذا القروب أو أنه غير نشط.",show_alert=True); return
+        demote_ok, demote_reason = await demote_member_in_telegram(context.bot, cid, target)
         cur=db.execute("UPDATE external_owner_staff SET active=0 WHERE owner_id=? AND user_id=? AND chat_id=? AND active=1",(uid,target,cid))
         if not cur.rowcount:
             await safe_callback_answer(q,"هذا الشخص غير مفوض حاليًا.",show_alert=True); return
         db.execute("DELETE FROM external_owner_staff_caps WHERE owner_id=? AND user_id=? AND chat_id=?",(uid,target,cid)); db.commit()
         log_action(cid,uid,"external_owner_staff_removed",f"target={target}")
-        await q.edit_message_text(f"✅ تم عزل المستخدم {target} وسحب جميع صلاحياته في هذا القروب.",reply_markup=external_owner_staff_markup(uid,cid)); return
+        await q.edit_message_text(f"✅ تم عزل المستخدم {user_display_name(target)} وسحب صلاحياته من البوت في هذا القروب.\nتيليجرام: {demote_reason}",reply_markup=external_owner_staff_markup(uid,cid)); return
     if data == "owner_external_broadcast":
         if not is_owner(uid):
             await safe_callback_answer(q, "هذه الخاصية لمالك البوت الأساسي فقط.", show_alert=True); return
@@ -14722,6 +14754,13 @@ async def _callback_impl(update, context):
         except ValueError: await safe_callback_answer(q,"معرّف المستخدم غير صحيح.",show_alert=True); return
         if target_uid<=0 or target_uid==OWNER_ID or is_deputy_owner(target_uid):
             await safe_callback_answer(q,"لا يمكن تعديل حساب المالك الأساسي أو نائبه.",show_alert=True); return
+        telegram_demotion_results = []
+        if action_key in ("unifieddemote", "unifiedisolate"):
+            # The primary owner may demote this staff member only in owner-managed
+            # internal groups where the bot has Telegram promotion rights.
+            for internal_cid, _title in owner_managed_group_rows():
+                ok, reason = await demote_member_in_telegram(context.bot, int(internal_cid), target_uid)
+                telegram_demotion_results.append((int(internal_cid), ok, reason))
         if action_key in ("unifieddemote","unifiedrevokeall","unifiedisolate"):
             db.execute("DELETE FROM managers WHERE user_id=?",(target_uid,))
             db.execute("DELETE FROM protection_managers WHERE user_id=?",(target_uid,))
@@ -14734,7 +14773,14 @@ async def _callback_impl(update, context):
         db.commit()
         log_action(0,uid,"unified_staff_bulk_change",f"target={target_uid};action={action_key}")
         label={"unifiedrevokeall":"سحب جميع الرتب والصلاحيات التشغيلية","unifieddemote":"تنزيل الرتب الإدارية مع إبقاء الصلاحيات المخصصة","unifiedisolate":"عزل المستخدم وسحب الرتب والصلاحيات"}[action_key]
-        await q.edit_message_text(f"✅ {label} للمستخدم {user_display_name(target_uid)}.",reply_markup=unified_permissions_markup(target_uid)); return
+        report = ""
+        if action_key in ("unifieddemote", "unifiedisolate"):
+            done = sum(1 for _cid, ok, _reason in telegram_demotion_results if ok)
+            failed = sum(1 for _cid, ok, _reason in telegram_demotion_results if not ok)
+            report = f"\nإزالة رتبة تيليجرام في القروبات الداخلية: {done} نجحت، {failed} تعذرت."
+            if failed:
+                report += "\nقد يلزم منح البوت صلاحية ترقية المشرفين (can_promote_members) في القروبات المتعذرة."
+        await q.edit_message_text(f"✅ {label} للمستخدم {user_display_name(target_uid)}.{report}",reply_markup=unified_permissions_markup(target_uid)); return
 
     if data.startswith("unifiedall:"):
         if not is_owner(uid):
