@@ -648,6 +648,10 @@ CREATE TABLE IF NOT EXISTS member_points_events(
     reason TEXT DEFAULT '', created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_member_points_rank ON member_reputation(chat_id,points DESC);
+CREATE TABLE IF NOT EXISTS weekly_points_publications(
+    chat_id INTEGER NOT NULL, period_end TEXT NOT NULL, sent_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(chat_id, period_end)
+);
 CREATE TABLE IF NOT EXISTS member_daily_activity(
     chat_id INTEGER NOT NULL, activity_date TEXT NOT NULL, user_id INTEGER NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 0, last_message_at TEXT NOT NULL DEFAULT '',
@@ -1466,7 +1470,7 @@ def group_role(chat_id, uid):
 
 
 def has_group_permission(chat_id, uid, permission):
-    if is_owner(uid) or is_delegated_owner(uid):
+    if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid):
         return True
     if is_general_manager(uid) or is_protection_manager(uid):
         return True
@@ -1475,6 +1479,17 @@ def has_group_permission(chat_id, uid, permission):
     if permission == "tag" and can_use_capability(uid, "tag", chat_id):
         return True
     return permission in GROUP_ROLE_PERMISSIONS.get(group_role(chat_id, uid), set())
+
+
+def can_manage_group_mutes(uid, chat_id):
+    """صلاحية موحدة لعرض وتنفيذ الكتم وفك الكتم وفق تفويض البوت الحالي."""
+    chat_id = int(chat_id)
+    if external_group_active(chat_id):
+        return (external_owner_can(uid, chat_id, "members")
+                or can_use_capability(uid, "members", chat_id)
+                or has_group_permission(chat_id, uid, "mute"))
+    return (has_group_permission(chat_id, uid, "mute")
+            or can_use_capability(uid, "members", chat_id))
 
 
 async def require_group_permission(update, permission, message=None):
@@ -1523,7 +1538,8 @@ async def require_admin(update):
     if not external_group_active(chat_id) and not is_owner(uid):
         await update.effective_message.reply_text("⛔ خدمات البوت متوقفة عن هذا القروب من المالك الأساسي.")
         return False
-    has_internal_role = (is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid)
+    has_internal_role = (is_owner(uid) or is_deputy_owner(uid) or is_general_manager(uid)
+                         or is_protection_manager(uid) or is_delegated_owner(uid)
                          or bool(group_role(chat_id, uid))
                          or can_use_capability(uid, "protection", chat_id))
     telegram_admin = await is_telegram_group_admin(update.get_bot(), uid, chat_id)
@@ -2541,6 +2557,11 @@ def external_owner_group_markup(uid, chat_id):
     if owner_view or external_owner_can(uid,chat_id,"mass_ban"):
         member_rows.append(InlineKeyboardButton("🚫 الحظر الجماعي",callback_data=f"xowner_feature:{chat_id}:mass_ban"))
     if member_rows: rows.append(member_rows)
+    # Member moderation actions are available in the external-group panel too.
+    # Authorization is checked again by the admin_action callback and execution handler.
+    if can_manage_group_mutes(uid, chat_id):
+        rows.append([InlineKeyboardButton("🔇 كتم عضو",callback_data=f"admin_action:mute:{chat_id}"),
+                     InlineKeyboardButton("🔊 فك الكتم",callback_data=f"admin_action:unmute:{chat_id}")])
     restricted_rows=[]
     if owner_view or external_owner_can(uid,chat_id,"reentry"):
         restricted_rows.append(InlineKeyboardButton("⛔ المحظورون",callback_data=f"xowner_feature:{chat_id}:banned"))
@@ -4418,7 +4439,7 @@ async def kick(update, context):
         await update.message.reply_text(f"❌ تعذر الطرد: {e}")
 
 async def mute(update, context):
-    if not await require_group_permission(update, "mute"): return
+    if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم /mute بالرد على رسالة العضو.")
@@ -4437,7 +4458,7 @@ async def mute(update, context):
         await update.message.reply_text(f"❌ تعذر الكتم: {e}")
 
 async def unmute(update, context):
-    if not await require_group_permission(update, "unmute"): return
+    if not await require_admin(update): return
     target = target_from_update(update, context)
     if not target:
         await update.message.reply_text("استخدم /unmute بالرد على رسالة العضو.")
@@ -4461,7 +4482,7 @@ async def unmute(update, context):
         await update.message.reply_text(f"❌ تعذر فك الكتم: {e}")
 
 async def muted_cmd(update, context):
-    if not await require_group_permission(update, "unmute"): return
+    if not await require_admin(update): return
     rows = db.execute("SELECT user_id,muted_at FROM group_mutes WHERE chat_id=? ORDER BY muted_at DESC LIMIT 50", (update.effective_chat.id,)).fetchall()
     if not rows:
         await update.message.reply_text("🔇 لا توجد أسماء في قائمة المكتومين التي يتابعها البوت."); return
@@ -4469,7 +4490,7 @@ async def muted_cmd(update, context):
     await update.message.reply_text("🔇 قائمة المكتومين المسجلين لدى البوت:\n" + body + "\n\nلفك كتم عضو: /unmute بالرد على رسالته أو /unmute رقم_العضو")
 
 async def unmuteall_cmd(update, context):
-    if not await require_group_permission(update, "unmute"): return
+    if not await require_admin(update): return
     chat_id = update.effective_chat.id
     rows = db.execute("SELECT user_id FROM group_mutes WHERE chat_id=?", (chat_id,)).fetchall()
     if not rows:
@@ -5300,15 +5321,14 @@ async def message_filter(update, context):
                        (chat.id, activity_date, msg.from_user.id, now()))
 
         # Member points/reputation are an independent feature; analytics switches do not disable them.
-        if msg.text and len(msg.text.strip()) >= 3 and not msg.text.strip().startswith("/"):
-            ensure_member_title_rules(chat.id)
-            reputation = db.execute("SELECT last_auto_award FROM member_reputation WHERE chat_id=? AND user_id=?", (chat.id, uid)).fetchone()
-            current_epoch = time.time()
-            if not reputation or current_epoch - float(reputation[0] or 0) >= MEMBER_POINTS_COOLDOWN:
-                db.execute("INSERT INTO member_reputation(chat_id,user_id,points,last_auto_award,updated_at) VALUES(?,?,1,?,?) "
-                           "ON CONFLICT(chat_id,user_id) DO UPDATE SET points=member_reputation.points+1,last_auto_award=excluded.last_auto_award,updated_at=excluded.updated_at",
-                           (chat.id, uid, current_epoch, now()))
-                db.execute("INSERT INTO member_points_events(chat_id,user_id,points,event_type,awarded_by,reason,created_at) VALUES(?,?,1,'message_activity',0,'مشاركة نصية مع فترة تهدئة',?)", (chat.id, uid, now()))
+        # One point for every member message received by this handler (text, media, etc.).
+        # Commands are excluded by the registered handler filter; service/bot messages are excluded above.
+        ensure_member_title_rules(chat.id)
+        current_epoch = time.time()
+        db.execute("INSERT INTO member_reputation(chat_id,user_id,points,last_auto_award,updated_at) VALUES(?,?,1,?,?) "
+                   "ON CONFLICT(chat_id,user_id) DO UPDATE SET points=member_reputation.points+1,last_auto_award=excluded.last_auto_award,updated_at=excluded.updated_at",
+                   (chat.id, uid, current_epoch, now()))
+        db.execute("INSERT INTO member_points_events(chat_id,user_id,points,event_type,awarded_by,reason,created_at) VALUES(?,?,1,'message_activity',0,'نقطة تلقائية عن رسالة',?)", (chat.id, uid, now()))
         db.commit()
     # الردود الآلية: تهيئة الردود الافتراضية مرة واحدة لكل قروب، مع تهدئة لمنع الإزعاج.
     if msg.from_user and not msg.from_user.is_bot and msg.text and not msg.text.startswith("/"):
@@ -13589,7 +13609,12 @@ async def broadcast_draft_message(update, context):
         target_id = int(raw)
         chat_id = int(pending_action.get("chat_id"))
         permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}.get(action)
-        if not await can_access_group(context.bot, user.id, chat_id) or not permission_for_action or not has_group_permission(chat_id, user.id, permission_for_action):
+        if action in {"mute", "unmute"}:
+            action_allowed = can_manage_group_mutes(user.id, chat_id)
+        else:
+            action_allowed = (external_owner_can(user.id, chat_id, "members") if external_group_active(chat_id)
+                              else has_group_permission(chat_id, user.id, permission_for_action))
+        if not await can_access_group(context.bot, user.id, chat_id) or not permission_for_action or not action_allowed:
             context.user_data.pop("awaiting_admin_action", None)
             await msg.reply_text("⛔ لا تملك الصلاحية المطلوبة لهذا الإجراء في هذا القروب.")
             return
@@ -16439,15 +16464,20 @@ async def _callback_impl(update, context):
             )
             return
         if action == "group_panel_admin":
+            member_admin_rows = [
+                [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{group_chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{group_chat_id}")],
+                [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{group_chat_id}")],
+            ]
+            if can_manage_group_mutes(uid, group_chat_id):
+                member_admin_rows.append([InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{group_chat_id}"),
+                                          InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{group_chat_id}")])
+            member_admin_rows.extend([
+                [InlineKeyboardButton("🗑️ حذف رسالة", callback_data=f"admin_action:delete:{group_chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة", callback_data=f"admin_action:pin:{group_chat_id}")],
+                [InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")],
+            ])
             await q.edit_message_text(
                 "👥 إدارة أعضاء هذا القروب فقط\nاختر إجراءً. سيطلب البوت رقم المستخدم أو رقم الرسالة في الخاص، ولا ينفّذ الإجراء إلا إذا كانت صلاحياته في Telegram تسمح بذلك.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{group_chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{group_chat_id}")],
-                    [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{group_chat_id}"), InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{group_chat_id}")],
-                    [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{group_chat_id}")],
-                    [InlineKeyboardButton("🗑️ حذف رسالة", callback_data=f"admin_action:delete:{group_chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة", callback_data=f"admin_action:pin:{group_chat_id}")],
-                    [InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")],
-                ]))
+                reply_markup=InlineKeyboardMarkup(member_admin_rows))
             return
         if action == "group_panel_logs":
             rows = db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20", (group_chat_id,)).fetchall()
@@ -17241,18 +17271,23 @@ async def _callback_impl(update, context):
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "لا تملك صلاحية هذا القروب", show_alert=True); return
         title = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
+        admin_rows = [
+            [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{chat_id}")],
+            [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{chat_id}")],
+        ]
+        if can_manage_group_mutes(uid, chat_id):
+            admin_rows.append([InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{chat_id}"),
+                               InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{chat_id}")])
+        admin_rows.extend([
+            [InlineKeyboardButton("🗑️ حذف رسالة برقمها", callback_data=f"admin_action:delete:{chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة برقمها", callback_data=f"admin_action:pin:{chat_id}")],
+            [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],
+            [InlineKeyboardButton("⬅️ لوحة القروب" if not can_use_panel(uid) else "⬅️ القروبات", callback_data=f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "administration_groups")]
+        ])
         await q.edit_message_text(
             f"🔨 إدارة القروب — {title[0] if title else chat_id}\n\n"
             "اختر الإجراء، ثم أرسل رقم المستخدم أو رقم الرسالة في الخاص. "
             "تتطلب الإجراءات صلاحيات مشرف البوت المناسبة داخل تيليجرام.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚫 حظر عضو", callback_data=f"admin_action:ban:{chat_id}"), InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_action:unban:{chat_id}")],
-                [InlineKeyboardButton("👢 طرد عضو", callback_data=f"admin_action:kick:{chat_id}"), InlineKeyboardButton("🔇 كتم عضو", callback_data=f"admin_action:mute:{chat_id}")],
-                [InlineKeyboardButton("🔊 إلغاء الكتم", callback_data=f"admin_action:unmute:{chat_id}")],
-                [InlineKeyboardButton("🗑️ حذف رسالة برقمها", callback_data=f"admin_action:delete:{chat_id}"), InlineKeyboardButton("📌 تثبيت رسالة برقمها", callback_data=f"admin_action:pin:{chat_id}")],
-                [InlineKeyboardButton("🛡️ إعدادات الحماية", callback_data=f"settings_group:{chat_id}")],
-                [InlineKeyboardButton("⬅️ لوحة القروب" if not can_use_panel(uid) else "⬅️ القروبات", callback_data=f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "administration_groups")]
-            ])
+            reply_markup=InlineKeyboardMarkup(admin_rows)
         )
         return
 
@@ -17266,8 +17301,13 @@ async def _callback_impl(update, context):
         if not await can_access_group(context.bot, uid, chat_id):
             await safe_callback_answer(q, "لا تملك صلاحية إدارة هذا القروب.", show_alert=True); return
         permission_for_action = {"ban":"ban", "unban":"unban", "kick":"kick", "mute":"mute", "unmute":"unmute", "delete":"delete", "pin":"pin"}[action]
-        if not has_group_permission(chat_id, uid, permission_for_action):
-            await safe_callback_answer(q, "رتبتك لا تسمح بهذا الإجراء في هذا القروب.", show_alert=True); return
+        if action in {"mute", "unmute"}:
+            action_allowed = can_manage_group_mutes(uid, chat_id)
+        else:
+            action_allowed = (external_owner_can(uid, chat_id, "members") if external_group_active(chat_id)
+                              else has_group_permission(chat_id, uid, permission_for_action))
+        if not action_allowed:
+            await safe_callback_answer(q, "رتبتك أو صلاحيتك لا تسمح بهذا الإجراء في هذا القروب.", show_alert=True); return
         context.user_data["awaiting_admin_action"] = {"action": action, "chat_id": chat_id}
         labels = {"ban":"رقم المستخدم الذي تريد حظره", "unban":"رقم المستخدم الذي تريد فك حظره", "kick":"رقم المستخدم الذي تريد طرده", "mute":"رقم المستخدم الذي تريد كتمه", "unmute":"رقم المستخدم الذي تريد إلغاء كتمه", "delete":"رقم الرسالة داخل القروب التي تريد حذفها", "pin":"رقم الرسالة داخل القروب التي تريد تثبيتها"}
         action_group = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
@@ -18814,6 +18854,95 @@ async def publish_campaigns_worker(app):
         await asyncio.sleep(15)
 
 
+async def weekly_member_points_publication_worker(app):
+    """Publish each group's weekly message-point leaderboard every Thursday at 20:00 Riyadh time."""
+    tz = ZoneInfo("Asia/Riyadh")
+    while True:
+        try:
+            current = datetime.now(tz)
+            days_until_thursday = (3 - current.weekday()) % 7
+            target = (current + timedelta(days=days_until_thursday)).replace(hour=20, minute=0, second=0, microsecond=0)
+            if target <= current:
+                target += timedelta(days=7)
+            await asyncio.sleep(max(1, (target - current).total_seconds()))
+
+            period_end = target.date().isoformat()
+            period_start_utc = (target - timedelta(days=7)).astimezone(timezone.utc).isoformat()
+            period_end_utc = target.astimezone(timezone.utc).isoformat()
+
+            groups = {int(cid): str(title or cid) for cid, title in owner_managed_group_rows()}
+            external_rows = db.execute(
+                "SELECT e.chat_id, COALESCE(NULLIF(e.title,''), NULLIF(w.title,''), CAST(e.chat_id AS TEXT)) "
+                "FROM external_group_control e LEFT JOIN watched_groups w ON w.chat_id=e.chat_id "
+                "WHERE e.is_external=1 AND e.enabled=1 AND COALESCE(e.is_member,1)=1"
+            ).fetchall()
+            for cid, title in external_rows:
+                groups[int(cid)] = str(title or cid)
+
+            for chat_id, title in sorted(groups.items()):
+                already_sent = db.execute(
+                    "SELECT 1 FROM weekly_points_publications WHERE chat_id=? AND period_end=?",
+                    (chat_id, period_end)
+                ).fetchone()
+                if already_sent:
+                    continue
+                rows = db.execute(
+                    "SELECT e.user_id, COALESCE(NULLIF(a.display_name,''),'عضو'), SUM(e.points) AS earned "
+                    "FROM member_points_events e LEFT JOIN member_activity a "
+                    "ON a.chat_id=e.chat_id AND a.user_id=e.user_id "
+                    "WHERE e.chat_id=? AND e.event_type='message_activity' AND e.created_at>=? AND e.created_at<? "
+                    "GROUP BY e.user_id ORDER BY earned DESC, e.user_id ASC LIMIT 10",
+                    (chat_id, period_start_utc, period_end_utc)
+                ).fetchall()
+                if rows:
+                    medals = {1: '🥇', 2: '🥈', 3: '🥉'}
+                    lines = [
+                        "🏆 حصاد نقاط الأسبوع",
+                        f"👥 القروب: {title}",
+                        "📅 الفترة: من الخميس الماضي إلى الخميس الحالي",
+                        "⏰ موعد الإعلان: كل خميس الساعة 8:00 مساءً",
+                        "━━━━━━━━━━━━━━"
+                    ]
+                    for rank, (user_id, name, earned) in enumerate(rows, 1):
+                        total_row = db.execute(
+                            "SELECT points FROM member_reputation WHERE chat_id=? AND user_id=?",
+                            (chat_id, user_id)
+                        ).fetchone()
+                        total_points = int(total_row[0]) if total_row else int(earned or 0)
+                        medal = medals.get(rank, f"{rank}.")
+                        lines.append(
+                            f"{medal} {name} — ⭐ +{int(earned or 0)} نقطة هذا الأسبوع\n"
+                            f"   🏅 اللقب: {member_title_for(chat_id, total_points)}"
+                        )
+                    lines.append("━━━━━━━━━━━━━━\n👏 شكرًا لجميع الأعضاء على تفاعلهم!")
+                    publication_text = "\n".join(lines)
+                else:
+                    publication_text = (
+                        f"🏆 حصاد نقاط الأسبوع — {title}\n\n"
+                        "لا توجد نقاط مشاركة مسجلة خلال هذا الأسبوع.\n"
+                        "ابدؤوا التفاعل والمشاركة للفوز بالألقاب الأسبوع القادم ⭐"
+                    )
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=publication_text[:3900])
+                    db.execute(
+                        "INSERT OR IGNORE INTO weekly_points_publications(chat_id,period_end,sent_at) VALUES(?,?,?)",
+                        (chat_id, period_end, now())
+                    )
+                    db.commit()
+                    await asyncio.sleep(0.15)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("Weekly points publication failed for %s (%s): %s", title, chat_id, exc)
+            # Wait briefly before calculating the next Thursday; the loop recalculates from current time.
+            await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Weekly member points publication worker failed")
+            await asyncio.sleep(60)
+
+
 async def post_init(app):
     """Start background workers and publish readiness only after Telegram/SQLite checks."""
     global HEALTH_RUNTIME_READY
@@ -18835,6 +18964,7 @@ async def post_init(app):
         (daily_group_ad_worker, "daily-group-ad-worker"),
         (global_ban_enforcement_worker, "global-ban-enforcement-worker"),
         (publish_campaigns_worker, "publish-campaigns-worker"),
+        (weekly_member_points_publication_worker, "weekly-member-points-publication-worker"),
         # Disabled per owner request: stop scheduled morning/evening group greetings.
     ]
     # Application is a library object: do not assign undocumented private attributes.
