@@ -1961,8 +1961,9 @@ STAFF_CAPABILITY_LABELS = {
     "reentry": "🚫 مراجعة المطرودين وطلبات العودة",
     "join_approval": "✅ الموافقة على انضمام الأعضاء",
     "external_groups": "🌐 إدارة القروبات الخارجية",
-    "membership_notifications": "🔔 استقبال إشعارات القروبات الخارجية",
-    "external_monitor": "👁️ الاطلاع على مركز مراقبة القروبات الخارجية (قراءة فقط)",
+    "membership_notifications": "🔔 إشعارات دخول ومغادرة الأعضاء في القروبات الخارجية",
+    "external_group_updates": "🌐 إشعارات القروبات الخارجية الجديدة وتحديثاتها",
+    "external_monitor": "👁️ الاطلاع على معلومات ومركز مراقبة القروبات الخارجية (قراءة فقط)",
     "manage_staff": "👥 إدارة الطاقم وتوزيع الصلاحيات",
 }
 
@@ -2171,10 +2172,10 @@ async def sync_group_link_record(bot, chat_id, *, member_event=False):
             log.debug("Could not resolve creator for group %s: %s", chat_id, owner_exc)
 
         old = db.execute("""SELECT title,invite_link,member_count,owner_id,owner_name,owner_username,
-                    last_metadata_notice_at
+                    last_metadata_notice_at,group_type
             FROM group_link_directory WHERE chat_id=?""", (chat_id,)).fetchone()
-        old_title, old_link, old_count, old_owner_id, old_owner_name, old_owner_username, last_notice = (
-            old if old else ("", "", None, None, "", "", "")
+        old_title, old_link, old_count, old_owner_id, old_owner_name, old_owner_username, last_notice, old_group_type = (
+            old if old else ("", "", None, None, "", "", "", "")
         )
 
         if not link:
@@ -2221,9 +2222,14 @@ async def sync_group_link_record(bot, chat_id, *, member_event=False):
              1 if member_event else 0))
         db.commit()
 
-        # Avoid notification spam: title/owner/link changes are immediate; count-only notices are throttled to 6 hours.
+        # New external groups are announced once; later title/owner/link changes are immediate.
+        # Count-only notices remain throttled to 6 hours to avoid notification spam.
         if group_type == "external" and OWNER_ID:
             changes = []
+            if not old:
+                changes.append("تم رصد قروب خارجي جديد وإضافته إلى سجل القروبات")
+            elif old_group_type != "external":
+                changes.append("تم تصنيف القروب كقروب خارجي وإضافته إلى سجل القروبات الخارجية")
             if old and old_title and old_title != title:
                 changes.append(f"تغير اسم القروب: {old_title} ← {title}")
             if old and old_owner_id and owner_id and int(old_owner_id) != int(owner_id):
@@ -2246,7 +2252,7 @@ async def sync_group_link_record(bot, chat_id, *, member_event=False):
                           + "\n".join(f"• {item}" for item in changes)
                           + f"\nعدد الأعضاء الحالي: {member_count if member_count is not None else 'غير متاح'}")
                 delivered = False
-                for recipient in sorted(membership_notification_recipients()):
+                for recipient in sorted(external_group_update_recipients()):
                     try:
                         await bot.send_message(chat_id=int(recipient), text=notice)
                         delivered = True
@@ -2277,12 +2283,30 @@ async def group_link_directory_worker(app):
 
 
 async def refresh_group_link_directory(bot):
-    """Refresh tracked groups concurrently; temporary Telegram failures never erase records."""
-    rows = db.execute("""SELECT e.chat_id FROM external_group_control e
+    """Refresh external groups frequently, but refresh internal-group metadata at most once per 24 hours."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    rows = db.execute("""SELECT e.chat_id,e.is_external,COALESCE(d.last_updated_at,'')
+        FROM external_group_control e
+        LEFT JOIN group_link_directory d ON d.chat_id=e.chat_id
         WHERE COALESCE(e.is_member,1)=1
         ORDER BY e.is_external,e.title""").fetchall()
-    known = {int(r[0]) for r in rows}
-    known.update(int(cid) for (cid,) in db.execute("SELECT chat_id FROM watched_groups").fetchall())
+    known = set()
+    for cid, is_external, last_updated in rows:
+        # External-group changes are monitored frequently. Internal metadata is
+        # refreshed on the daily cycle unless no successful sync exists yet.
+        if bool(is_external) or not last_updated or str(last_updated) <= cutoff:
+            known.add(int(cid))
+
+    # Include legacy watched groups that do not yet have an external_group_control row.
+    legacy_rows = db.execute("""SELECT w.chat_id,COALESCE(d.last_updated_at,'')
+        FROM watched_groups w
+        LEFT JOIN group_link_directory d ON d.chat_id=w.chat_id
+        LEFT JOIN external_group_control e ON e.chat_id=w.chat_id
+        WHERE e.chat_id IS NULL""").fetchall()
+    for cid, last_updated in legacy_rows:
+        if not last_updated or str(last_updated) <= cutoff:
+            known.add(int(cid))
+
     semaphore = asyncio.Semaphore(8)
     async def _sync(cid):
         async with semaphore:
@@ -3945,6 +3969,8 @@ async def grantcap(update, context):
     capability = context.args[1].lower()
     if capability not in STAFF_CAPABILITY_LABELS:
         await update.effective_message.reply_text("الصلاحية غير معروفة. استخدم أحد مفاتيح الصلاحيات المعروضة في لوحة توزيع الصلاحيات."); return
+    if capability in {"membership_notifications", "external_group_updates", "external_monitor"} and not is_deputy_owner(target):
+        await update.effective_message.reply_text("هذه الصلاحية مخصصة لنائب مالك البوت فقط."); return
     if capability == "external_groups" and context.args[2].lower() != "all":
         await update.effective_message.reply_text("صلاحية القروبات الخارجية تُمنح على النطاق all فقط."); return
     raw_scope = context.args[2].lower()
@@ -3986,8 +4012,8 @@ async def revokecap(update, context):
     capability = context.args[1].lower()
     if capability not in STAFF_CAPABILITY_LABELS:
         await update.effective_message.reply_text("الصلاحية غير معروفة. استخدم أحد مفاتيح الصلاحيات المعروضة في لوحة توزيع الصلاحيات."); return
-    if capability == "membership_notifications" and not is_deputy_owner(target):
-        await update.effective_message.reply_text("صلاحية إشعارات القروبات الخارجية مخصصة لنائب مالك البوت فقط."); return
+    if capability in {"membership_notifications", "external_group_updates", "external_monitor"} and not is_deputy_owner(target):
+        await update.effective_message.reply_text("هذه الصلاحية مخصصة لنائب مالك البوت فقط."); return
     if capability == "external_monitor" and not is_deputy_owner(target):
         await update.effective_message.reply_text("صلاحية الاطلاع على مركز مراقبة القروبات الخارجية مخصصة لنائب المالك فقط."); return
     if is_delegated_owner(target) and capability not in {"message_lock", "membership_notifications"}:
@@ -4113,26 +4139,38 @@ async def managers(update, context):
     await update.effective_message.reply_text(text)
 
 def membership_notification_recipients():
-    """مالك البوت دائمًا؛ النائب أو المفوض لا تصله إشعارات العضوية إلا بتفويض صريح."""
+    """مالك البوت دائمًا؛ إشعارات دخول/مغادرة الأعضاء للنائب تتطلب تفويضًا صريحًا."""
     recipients = {int(OWNER_ID)} if OWNER_ID else set()
     candidates = {int(r[0]) for r in db.execute("SELECT user_id FROM deputy_owners").fetchall()}
     recipients.update(uid for uid in candidates if can_use_capability(uid, "membership_notifications", 0))
     return recipients
 
 
+def external_group_update_recipients():
+    """مالك البوت دائمًا؛ تحديثات القروبات الخارجية للنائب تتطلب صلاحية مستقلة."""
+    recipients = {int(OWNER_ID)} if OWNER_ID else set()
+    candidates = {int(r[0]) for r in db.execute("SELECT user_id FROM deputy_owners").fetchall()}
+    recipients.update(uid for uid in candidates if can_use_capability(uid, "external_group_updates", 0))
+    return recipients
+
+
 async def notify_external_group_owner(context, chat_id, text):
-    """External-group events go to the bot owner and only explicitly authorized bot deputies/delegates."""
-    row=db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?",(int(chat_id),)).fetchone()
+    """Send external-group membership notices only to that group's owner, bot owner, and authorized deputies."""
+    row = db.execute(
+        "SELECT is_external,added_by FROM external_group_control WHERE chat_id=?",
+        (int(chat_id),)
+    ).fetchone()
     if not row or not row[0]:
         return False
-    # Also allow lifecycle alerts after membership is marked inactive (left/kicked),
-    # so the owner is still informed when the bot is removed from the group.
     recipients = membership_notification_recipients()
+    group_owner_id = int(row[1] or 0)
+    if group_owner_id:
+        recipients.add(group_owner_id)
     for recipient in sorted(recipients):
         try:
             await context.bot.send_message(chat_id=recipient, text=text)
         except Exception as exc:
-            log.info("External group notification failed recipient=%s chat=%s: %s",recipient,chat_id,exc)
+            log.info("External group notification failed recipient=%s chat=%s: %s", recipient, chat_id, exc)
     return True
 
 async def notify_owners(context, text, event="general"):
@@ -5784,8 +5822,8 @@ async def my_chat_member_handler(update, context):
             f"حالة الخدمة: {'مفعّلة' if enabled else 'متوقفة بقرار سابق من المالك'}\n"
             "الذكاء الاصطناعي للقروبات الخارجية معطّل افتراضيًا."
         )
-        # External group identity and activity are private to that group's local owner.
-        # Do not send its name, link, or membership details to bot owner/deputies.
+        # sync_group_link_record above sends one private metadata notice to the bot
+        # owner and deputies granted external_group_updates, avoiding duplicate alerts.
         log_action(chat.id, actor_id, "bot_added_to_group", f"external={int(external)}; status={new_status}")
         return
 
@@ -5861,9 +5899,17 @@ async def chat_member_handler(update, context):
     new = cm.new_chat_member.status
     member = cm.new_chat_member.user
     membership_actor = getattr(cm, "from_user", None)
-    # Keep the directory count and timestamps synchronized with Telegram membership events.
+    # External groups are monitored on membership changes. Internal-group directory
+    # metadata is refreshed by the daily worker to avoid repeated Telegram API calls.
     try:
-        await sync_group_link_record(context.bot, chat_id, member_event=True)
+        _scope_row = db.execute(
+            "SELECT is_external FROM external_group_control WHERE chat_id=?",
+            (int(chat_id),)
+        ).fetchone()
+        if _scope_row and bool(_scope_row[0]):
+            await sync_group_link_record(context.bot, chat_id, member_event=True)
+        else:
+            log.debug("Internal group metadata refresh deferred to daily cycle chat=%s", chat_id)
     except Exception:
         log.exception("Group-link directory update failed for membership event chat=%s", chat_id)
     if member and not member.is_bot and new in ("member", "administrator", "restricted") and old in ("left", "kicked"):
@@ -5948,13 +5994,9 @@ async def chat_member_handler(update, context):
             if owner_global_control_enabled(chat_id, "stats") and group_feature_enabled(chat_id, "stats_enabled"):
                 db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "join", _riyadh_now().isoformat()))
                 db.commit()
-            if group_feature_enabled(chat_id, "join_notices_enabled") and not authorized_direct_add:
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=f"📥 انضم عضو جديد إلى القروب: {html.escape(member.full_name or 'عضو')}\n🆔 ID: {member.id}", parse_mode="HTML")
-                except Exception as exc:
-                    log.info("Join notice failed chat=%s user=%s: %s", chat_id, member.id, exc)
-            elif authorized_direct_add:
-                log.info("PUBLIC_JOIN_NOTICE_SUPPRESSED_AUTHORIZED_ADD chat_id=%s member_id=%s actor_id=%s", chat_id, member.id, actor_id)
+            # Public join notices are disabled for internal and external groups.
+            # Membership events remain recorded and are delivered privately to authorized owners.
+            log.info("PUBLIC_JOIN_NOTICE_DISABLED chat_id=%s member_id=%s", chat_id, member.id)
         elif old in ("member", "administrator", "restricted") and new in ("left", "kicked"):
             if owner_global_control_enabled(chat_id, "stats") and group_feature_enabled(chat_id, "stats_enabled"):
                 db.execute("INSERT INTO weekly_membership_events(chat_id,event_type,event_at) VALUES(?,?,?)", (chat_id, "leave", _riyadh_now().isoformat()))
@@ -5964,12 +6006,8 @@ async def chat_member_handler(update, context):
             # Allow a fresh welcome if this same Telegram user genuinely joins again later.
             db.execute("DELETE FROM welcome_sent_events WHERE chat_id=? AND user_id=?", (chat_id, member.id))
             db.commit()
-            if group_feature_enabled(chat_id, "leave_notices_enabled"):
-                try:
-                    reason = "تمت إزالته/حظره" if new == "kicked" else "غادر القروب"
-                    await context.bot.send_message(chat_id=chat_id, text=f"📤 العضو {html.escape(member.full_name or 'عضو')} {reason}.\n🆔 ID: {member.id}", parse_mode="HTML")
-                except Exception as exc:
-                    log.info("Leave notice failed chat=%s user=%s: %s", chat_id, member.id, exc)
+            # Public leave notices are disabled for internal and external groups.
+            log.info("PUBLIC_LEAVE_NOTICE_DISABLED chat_id=%s member_id=%s", chat_id, member.id)
     s = get_settings(chat_id)
     if member and old in ("member", "administrator", "restricted") and new in ("left", "kicked") and not member.is_bot:
         reason = "غادر القروب بنفسه" if new == "left" else "تم حظره/طرده من القروب"
@@ -5985,7 +6023,7 @@ async def chat_member_handler(update, context):
                 if _ext_owner_row and _ext_owner_row[0]:
                     await notify_external_group_owner(context,chat_id,_leave_text)
                 else:
-                    await notify_owners(context,_leave_text,"membership")
+                    await notify_owner_and_deputies(context,_leave_text)
             except Exception as exc:
                 log.debug("Voluntary departure notification failed chat=%s user=%s: %s", chat_id, member.id, exc)
         else:
@@ -5997,9 +6035,16 @@ async def chat_member_handler(update, context):
             if not approval_enforcement:
                 try:
                     _ext_removed = db.execute("SELECT is_external FROM external_group_control WHERE chat_id=?", (int(chat_id),)).fetchone()
+                    _kick_notice = (
+                        f"🚫 تم طرد/حظر عضو من القروب\\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\\n"
+                        f"العضو: {member.full_name or 'عضو'} (ID: {member.id})\\n"
+                        f"المنفذ: {getattr(membership_actor, 'full_name', 'غير معروف') if membership_actor else 'غير معروف'} "
+                        f"(ID: {getattr(membership_actor, 'id', 0) if membership_actor else 0})"
+                    )
                     if _ext_removed and int(_ext_removed[0] or 0) == 1:
-                        _kick_notice=(f"🚫 تم طرد/حظر عضو من القروب الخارجي\nالقروب: {cm.chat.title or chat_id} (ID: {chat_id})\nالعضو: {member.full_name or 'عضو'} (ID: {member.id})\nالمنفذ: {getattr(membership_actor, 'full_name', 'غير معروف') if membership_actor else 'غير معروف'} (ID: {getattr(membership_actor, 'id', 0) if membership_actor else 0})")
                         await notify_external_group_owner(context, chat_id, _kick_notice)
+                    else:
+                        await notify_owner_and_deputies(context, _kick_notice)
                     await notify_reentry_restriction(context, cm.chat, member, reason, notify=not (bool(recent_command_kick) or bot_performed_removal))
                 except Exception as exc:
                     log.warning("Could not record an existing kick/ban for %s in %s: %s", member.id, chat_id, exc)
@@ -6018,25 +6063,20 @@ async def chat_member_handler(update, context):
             (int(chat_id), int(member.id), (member.full_name or "عضو")[:250], (member.username or "")[:100], now()),
         )
         db.commit()
-        # Do not depend solely on Telegram's optional NEW_CHAT_MEMBERS service message.
-        # The chat_member update is sufficient to welcome the member; the database key
-        # prevents a duplicate if the service-message handler also fires.
-        try:
-            if external_group_cap_enabled(chat_id, "welcome") and not authorized_direct_add:
-                approval_row = db.execute(
-                    "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, member.id)
-                ).fetchone()
-                approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
-                await _send_member_welcome_with_bot_photo(context, cm.chat, member, approved=approved)
-            elif authorized_direct_add:
-                log.info("PUBLIC_WELCOME_SUPPRESSED_AUTHORIZED_ADD chat_id=%s member_id=%s actor_id=%s", chat_id, member.id, actor_id)
-        except Exception:
-            log.exception("WELCOME_CHAT_MEMBER_HANDLER_FAILED chat_id=%s member_id=%s", chat_id, member.id)
-        _ext_owner_row=db.execute("SELECT is_external,added_by FROM external_group_control WHERE chat_id=?",(int(chat_id),)).fetchone()
+        # Public welcome messages are disabled in all internal and external groups.
+        log.info("PUBLIC_WELCOME_DISABLED chat_id=%s member_id=%s", chat_id, member.id)
+        _ext_owner_row = db.execute(
+            "SELECT is_external,added_by FROM external_group_control WHERE chat_id=?",
+            (int(chat_id),)
+        ).fetchone()
+        _join_notice = (
+            f"👋 دخول عضو جديد\\nالقروب: {cm.chat.title or chat_id}\\n"
+            f"العضو: {member.full_name or 'عضو'}\\nالمعرّف: {member.id}"
+        )
         if _ext_owner_row and _ext_owner_row[0]:
-            await notify_external_group_owner(context,chat_id,f"👋 دخول عضو\nالقروب: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}")
+            await notify_external_group_owner(context, chat_id, _join_notice)
         else:
-            await notify_owner_and_deputies(context, f"👋 دخول عضو\nالمجموعة: {cm.chat.title or chat_id}\nالعضو: {member.full_name}\nالمعرّف: {member.id}")
+            await notify_owner_and_deputies(context, _join_notice)
     # Bot membership transitions are handled by my_chat_member_handler, which sends
     # the detailed external-group notice to the primary owner and deputies. Do not send
     # a second generic alert here: Telegram may deliver both update types for one event.
@@ -13187,11 +13227,10 @@ async def _send_member_welcome_with_bot_photo(context, chat, member, approved=Fa
 
 
 async def new_members(update, context):
-    """Record new members and send welcome independently of owner notifications.
+    """Record new members and run verification without publishing public welcome messages.
 
-    A failure to DM the owner must never prevent the group welcome from being sent.
-    If no custom welcome is configured, send a safe default so the welcome feature
-    does not appear to do nothing after selecting a group in the panel.
+    Private membership alerts are sent once by chat_member_handler. This service-message
+    handler only maintains member records and the configured verification workflow.
     """
     msg = update.effective_message
     chat = update.effective_chat
@@ -13200,28 +13239,10 @@ async def new_members(update, context):
 
     try:
         register_group(chat)
-        # Only suppress welcomes when this chat is explicitly tracked as an external
-        # group and has been disabled. Ordinary registered groups may not have an
-        # external_group_control row, so a missing row must not silently disable welcomes.
-        _welcome_group_control = external_group_info(chat.id)
-        if _welcome_group_control and _welcome_group_control[0] and not _welcome_group_control[1]:
-            log.info("WELCOME_SKIPPED_EXTERNAL_GROUP_DISABLED chat_id=%s", chat.id)
-            return
         settings = get_settings(chat.id)
     except Exception:
-        log.exception("WELCOME_SETUP_FAILED chat_id=%s", getattr(chat, "id", None))
+        log.exception("NEW_MEMBER_SETUP_FAILED chat_id=%s", getattr(chat, "id", None))
         settings = {"entry": 0, "verify_new_members": 0}
-
-    try:
-        welcome_row = db.execute(
-            "SELECT message FROM welcome_messages WHERE chat_id=?", (chat.id,)
-        ).fetchone()
-        configured_welcome = welcome_row[0].strip() if welcome_row and welcome_row[0] else ""
-        if not external_group_cap_enabled(chat.id, "welcome"):
-            configured_welcome = ""
-    except Exception:
-        log.exception("WELCOME_CONFIG_READ_FAILED chat_id=%s", chat.id)
-        configured_welcome = ""
 
     group_title = chat.title or "القروب"
     _adding_actor = getattr(msg, "from_user", None)
@@ -13271,26 +13292,9 @@ async def new_members(update, context):
         except Exception:
             log.exception("MEMBER_ACTIVITY_SAVE_FAILED chat_id=%s member_id=%s", chat.id, member.id)
 
-        # Keep the existing per-group welcome toggle; use the bot profile photo and separate templates.
-        if external_group_cap_enabled(chat.id, "welcome") and not _owner_deputy_direct_add:
-            approval_row = db.execute(
-                "SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat.id, member.id)
-            ).fetchone()
-            approved = bool(approval_row and approval_row[0] in ("approved", "joined"))
-            await _send_member_welcome_with_bot_photo(context, chat, member, approved=approved)
-        elif _owner_deputy_direct_add:
-            log.info("PUBLIC_WELCOME_SUPPRESSED_AUTHORIZED_ADD_SERVICE chat_id=%s member_id=%s actor_id=%s", chat.id, member.id, int(getattr(_adding_actor, "id", 0) or 0))
-        else:
-            log.info("WELCOME_DISABLED chat_id=%s member_id=%s", chat.id, member.id)
-
-        try:
-            await notify_owners(
-                context,
-                f"👋 دخول عضو جديد\nالمجموعة: {group_title}\nالعضو: {display_name}\nالمعرّف: {member.id}",
-                "membership"
-            )
-        except Exception:
-            log.exception("NEW_MEMBER_OWNER_ALERT_FAILED chat_id=%s member_id=%s", chat.id, member.id)
+        # Public welcome messages are disabled in every group. The authoritative
+        # chat_member_handler sends the private notification once, avoiding duplicates.
+        log.info("PUBLIC_WELCOME_DISABLED_SERVICE_HANDLER chat_id=%s member_id=%s", chat.id, member.id)
 
         # The primary owner and registered deputies have an unrestricted direct-add
         # privilege in every group. Do not put their manually-added members into the
@@ -13350,28 +13354,32 @@ async def new_members(update, context):
             log.info("ENTRY_SERVICE_DELETE_FAILED chat_id=%s error=%r", chat.id, exc)
 
 async def service_add_handler(update, context):
+    """Remove Telegram's public join service message; private owner alerts are sent separately."""
     msg = update.message
     chat = update.effective_chat
     if not msg or not chat or not msg.new_chat_members:
         return
-    s = get_settings(chat.id)
-    # Hide Telegram's native "X added Y" service notice only when the actor is
-    # positively identified as the primary owner, deputy, or delegated owner.
-    # Self-joins and invite-link / approved-request entries retain normal notices.
-    actor = getattr(msg, "from_user", None)
-    human_members = [member for member in msg.new_chat_members if not getattr(member, "is_bot", False)]
-    authorized_manual_batch = bool(human_members) and all(
-        is_authorized_manual_add(chat.id, member, actor) for member in human_members
-    )
-    if s.get("add_lock") or authorized_manual_batch:
-        try:
-            await msg.delete()
-            if authorized_manual_batch:
-                log.info("PUBLIC_NATIVE_ADD_SERVICE_SUPPRESSED chat_id=%s actor_id=%s members=%s",
-                         chat.id, getattr(actor, "id", 0), len(human_members))
-        except Exception as exc:
-            log.info("ADD_SERVICE_DELETE_FAILED chat_id=%s authorized_manual=%s error=%r",
-                     chat.id, int(authorized_manual_batch), exc)
+    try:
+        await msg.delete()
+        log.info("PUBLIC_NATIVE_JOIN_SERVICE_SUPPRESSED chat_id=%s members=%s",
+                 chat.id, len(msg.new_chat_members))
+    except Exception as exc:
+        log.info("PUBLIC_NATIVE_JOIN_SERVICE_DELETE_FAILED chat_id=%s error=%r", chat.id, exc)
+
+
+async def service_leave_handler(update, context):
+    """Remove Telegram's public leave/kick service message from the group."""
+    msg = update.message
+    chat = update.effective_chat
+    if not msg or not chat or not getattr(msg, "left_chat_member", None):
+        return
+    try:
+        await msg.delete()
+        log.info("PUBLIC_NATIVE_LEAVE_SERVICE_SUPPRESSED chat_id=%s member_id=%s",
+                 chat.id, msg.left_chat_member.id)
+    except Exception as exc:
+        log.info("PUBLIC_NATIVE_LEAVE_SERVICE_DELETE_FAILED chat_id=%s error=%r", chat.id, exc)
+
 
 async def broadcast_draft_message(update, context):
     msg = update.effective_message
@@ -14847,8 +14855,9 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q, "الإجراء غير معروف.", show_alert=True); return
 
     if data == "external_monitor_center":
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_use_capability(uid, "external_monitor", 0):
-            await safe_callback_answer(q, "مركز المراقبة للمالك الأساسي، أو للنائب عند منحه صلاحية الاطلاع.", show_alert=True); return
+        # المالك الأساسي يطّلع دائمًا؛ نائب المالك يحتاج تفويضًا صريحًا من لوحة المالك.
+        if not (is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "external_monitor", 0))):
+            await safe_callback_answer(q, "مركز المراقبة للمالك الأساسي، أو للنائب بعد منحه صلاحية الاطلاع.", show_alert=True); return
         try:
             await refresh_external_group_membership(context.bot)
         except Exception:
@@ -14874,7 +14883,7 @@ async def _callback_impl(update, context):
         return
 
     if data.startswith("external_monitor_detail:"):
-        if is_owner(uid) or is_deputy_owner(uid) or is_delegated_owner(uid) or not can_use_capability(uid, "external_monitor", 0):
+        if not (is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "external_monitor", 0))):
             await safe_callback_answer(q, "غير مصرح لك بالاطلاع على تفاصيل المراقبة.", show_alert=True); return
         try: monitor_cid = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف القروب غير صحيح.", show_alert=True); return
@@ -15887,8 +15896,8 @@ async def _callback_impl(update, context):
         # The external monitoring center is a read-only privilege for deputy owners only.
         if cap == "external_monitor" and not is_deputy_owner(target_uid):
             await safe_callback_answer(q, "صلاحية مركز المراقبة تُمنح لنائب المالك فقط.", show_alert=True); return
-        if cap == "membership_notifications" and not is_deputy_owner(target_uid):
-            await safe_callback_answer(q, "صلاحية إشعارات القروبات الخارجية مخصصة لنائب مالك البوت فقط.", show_alert=True); return
+        if cap in {"membership_notifications", "external_group_updates", "external_monitor"} and not is_deputy_owner(target_uid):
+            await safe_callback_answer(q, "هذه الصلاحية مخصصة لنائب مالك البوت فقط.", show_alert=True); return
         exists = db.execute("SELECT 1 FROM staff_capabilities WHERE user_id=? AND capability=? AND chat_id=0", (target_uid, cap)).fetchone()
         if exists:
             db.execute("DELETE FROM staff_capabilities WHERE user_id=? AND capability=? AND chat_id=0", (target_uid, cap))
@@ -18521,10 +18530,13 @@ async def friday_prayer_reminder_worker(app):
     retry_interval_seconds = 5 * 60
     poll_interval_seconds = 60
     reminder_text = (
-        "🕌 تذكير صلاة الجمعة\\n\\n"
-        "قال الله تعالى: ﴿يَا أَيُّهَا الَّذِينَ آمَنُوا إِذَا نُودِيَ لِلصَّلَاةِ مِنْ يَوْمِ الْجُمُعَةِ فَاسْعَوْا إِلَىٰ ذِكْرِ اللَّهِ وَذَرُوا الْبَيْعَ﴾\\n"
-        "نسأل الله أن يتقبل منا ومنكم، وأن يجعل جمعتكم مباركة.\\n"
-        "لا تنسوا التبكير إلى الصلاة والإنصات للخطبة."
+        "🕌 تذكير بصلاة الجمعة\\n\\n"
+        "📖 قال الله تعالى:\\n"
+        "﴿يَا أَيُّهَا الَّذِينَ آمَنُوا إِذَا نُودِيَ لِلصَّلَاةِ مِنْ يَوْمِ الْجُمُعَةِ فَاسْعَوْا إِلَىٰ ذِكْرِ اللَّهِ وَذَرُوا الْبَيْعَ﴾\\n\\n"
+        "🌿 تذكير:\\n"
+        "لا تنسوا التبكير إلى صلاة الجمعة، والحرص على الإنصات للخطبة.\\n\\n"
+        "🤲 نسأل الله أن يتقبل منا ومنكم صالح الأعمال، وأن يجعل جمعتكم مباركة، ويملأها بالخير والبركة.\\n\\n"
+        "جمعة مباركة 🌹"
     )
     while True:
         try:
@@ -19094,9 +19106,10 @@ def main():
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER), group=0)
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER), group=0)
     app.add_handler(ChatJoinRequestHandler(chat_join_request_handler), group=0)
-    # Enforce the add-service-message setting independently from member tracking/welcome.
+    # Remove public join/leave service notices; member tracking and private alerts run separately.
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, service_add_handler), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members), group=1)
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, service_leave_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ArabicTextCommand), group=2)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_filter), group=3)
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, edited_filter), group=4)
