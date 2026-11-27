@@ -24,7 +24,7 @@ from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ChatMemberHandler, ChatJoinRequestHandler
+    ContextTypes, filters, ChatMemberHandler, ChatJoinRequestHandler, ApplicationHandlerStop
 )
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -1524,7 +1524,7 @@ async def require_admin(update):
         await update.effective_message.reply_text("⛔ خدمات البوت متوقفة عن هذا القروب من المالك الأساسي.")
         return False
     has_internal_role = (is_general_manager(uid) or is_protection_manager(uid) or is_delegated_owner(uid)
-                         or bool(group_role(chat_id, uid))
+                         or group_role(chat_id, uid) in GROUP_ROLE_PERMISSIONS
                          or can_use_capability(uid, "protection", chat_id))
     telegram_admin = await is_telegram_group_admin(update.get_bot(), uid, chat_id)
     ext = external_group_info(chat_id)
@@ -5085,8 +5085,20 @@ def chat_text_lock_authorized(uid, chat_id):
     # A user with any bot capability in this specific group is considered
     # authorized by the owner's explicit grant.
     return bool(db.execute(
-        "SELECT 1 FROM staff_capabilities WHERE user_id=? AND chat_id IN (0,?) LIMIT 1",
-        (int(uid), int(chat_id))
+        """
+        SELECT 1
+        FROM staff_capabilities sc
+        WHERE sc.user_id=?
+          AND sc.chat_id IN (0, ?)
+          AND NOT EXISTS (
+              SELECT 1 FROM staff_capability_denials sd
+              WHERE sd.user_id=sc.user_id
+                AND sd.capability=sc.capability
+                AND sd.chat_id=?
+          )
+        LIMIT 1
+        """,
+        (int(uid), int(chat_id), int(chat_id))
     ).fetchone())
 
 
@@ -5324,6 +5336,40 @@ async def set_member_title_cmd(update, context):
     log_action(chat.id,user.id,"member_title_rule_set",f"threshold={threshold}; title={title}")
     await msg.reply_text(f"✅ تم ضبط اللقب «{title}» ابتداءً من {threshold} نقطة.")
 
+async def enforce_chat_text_lock(update, context):
+    """Early enforcement for locked group chats; no Telegram chat permissions are changed."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if user.is_bot or not chat_text_lock_enabled(chat.id):
+        return
+
+    if chat_text_lock_authorized(user.id, chat.id):
+        return
+
+    # Telegram group administrators/creator may always write during the lock.
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+        if member.status in ("creator", "administrator"):
+            return
+    except Exception as exc:
+        log.warning("Could not verify member role during text lock chat=%s user=%s: %s", chat.id, user.id, exc)
+
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
+        log.info("Removed unauthorized message during text lock chat=%s user=%s message=%s",
+                 chat.id, user.id, msg.message_id)
+    except Exception as exc:
+        log.error("FAILED to remove unauthorized message during text lock chat=%s user=%s message=%s: %s",
+                  chat.id, user.id, msg.message_id, exc)
+    # Do not allow later message handlers to process a locked member's message.
+    raise ApplicationHandlerStop
+
+
 async def message_filter(update, context):
     msg = update.effective_message
     chat = update.effective_chat
@@ -5331,24 +5377,6 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
-
-    # Enforce the public writing lock in every group where the bot is active,
-    # including external groups that are otherwise paused for optional features.
-    # This must run before the external_group_active early return below.
-    if chat_text_lock_enabled(chat.id) and msg.from_user and not msg.from_user.is_bot:
-        allowed_to_write = chat_text_lock_authorized(uid, chat.id)
-        if not allowed_to_write:
-            try:
-                member = await context.bot.get_chat_member(chat_id=chat.id, user_id=uid)
-                allowed_to_write = member.status in ("creator", "administrator")
-            except Exception:
-                allowed_to_write = False
-        if not allowed_to_write:
-            try:
-                await msg.delete()
-            except Exception as exc:
-                log.warning("Could not remove message during text lock chat=%s user=%s: %s", chat.id, uid, exc)
-            return
 
     if not external_group_active(chat.id):
         return
@@ -19013,6 +19041,7 @@ def main():
     for name, fn in command_handlers.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("cancel", cancel_owner_autoreply), group=-2)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, enforce_chat_text_lock), group=-10)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, lock_all_groups_text), group=-6)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, process_private_workflows), group=-5)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, music_search_group_handler), group=-5)
