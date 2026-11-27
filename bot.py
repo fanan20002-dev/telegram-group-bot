@@ -239,6 +239,14 @@ CREATE TABLE IF NOT EXISTS logs(
     created_at TEXT
 )
 """)
+# Add actor display names without changing or deleting existing audit records.
+try:
+    _log_cols = {r[1] for r in db.execute("PRAGMA table_info(logs)").fetchall()}
+    if "actor_name" not in _log_cols:
+        db.execute("ALTER TABLE logs ADD COLUMN actor_name TEXT NOT NULL DEFAULT ''")
+    db.commit()
+except Exception:
+    log.exception("Could not add actor_name to logs")
 db.execute("""
 CREATE TABLE IF NOT EXISTS reentry_restrictions(
     chat_id INTEGER NOT NULL,
@@ -1213,15 +1221,17 @@ def set_setting(chat_id, field, value):
     db.execute(f'UPDATE settings SET "{field}"=? WHERE chat_id=?', (int(bool(value)), chat_id))
     db.commit()
 
-def log_action(chat_id, user_id, action, details=""):
+def log_action(chat_id, user_id, action, details="", actor_name=""):
+    """Append an isolated per-group audit event; actor_name is the visible admin name."""
     try:
         db.execute(
-            "INSERT INTO logs(chat_id,user_id,action,details,created_at) VALUES(?,?,?,?,?)",
-            (chat_id, user_id, action, details[:500], now())
+            "INSERT INTO logs(chat_id,user_id,action,details,created_at,actor_name) VALUES(?,?,?,?,?,?)",
+            (int(chat_id or 0), int(user_id or 0), str(action)[:100], str(details or "")[:500],
+             now(), str(actor_name or "")[:160])
         )
         db.commit()
     except Exception:
-        pass
+        log.exception("Could not record group audit action chat=%s actor=%s action=%s", chat_id, user_id, action)
 
 def is_owner(uid):
     return bool(OWNER_ID and uid == OWNER_ID)
@@ -3679,6 +3689,10 @@ async def help_cmd(update, context):
 def group_owner_panel_markup(chat_id, uid=None):
     """لوحة إشراف حديثة ومحدودة بالقروب الحالي، وتُظهر التاق فقط للمصرح لهم."""
     s = get_settings(chat_id)
+    pending_join_count = db.execute(
+        "SELECT COUNT(*) FROM join_request_events WHERE chat_id=? AND status='pending'",
+        (chat_id,)
+    ).fetchone()[0]
     link_label = "🔓 السماح بالروابط" if s.get("links") else "🔒 منع الروابط"
     link_callback = f"group_panel_toggle_links:{chat_id}"
     can_open_links = uid is None or is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", chat_id))
@@ -3692,6 +3706,10 @@ def group_owner_panel_markup(chat_id, uid=None):
          InlineKeyboardButton("🏷️ الرتب والصلاحيات", callback_data=f"group_panel_roles:{chat_id}")],
         [InlineKeyboardButton("📊 إحصائيات القروب", callback_data=f"group_panel_stats:{chat_id}"),
          InlineKeyboardButton("📋 سجل العمليات", callback_data=f"group_panel_logs:{chat_id}")],
+        [InlineKeyboardButton(
+            f"🚪 طلبات الانضمام ({pending_join_count})",
+            callback_data=f"restricted_group:{chat_id}"
+        )],
         [InlineKeyboardButton("👋 إعدادات الترحيب", callback_data=f"welcome_group:{chat_id}"),
          InlineKeyboardButton("⚠️ إدارة الإنذارات", callback_data=f"group_panel_warnings:{chat_id}")],
         [InlineKeyboardButton("🗑️ مسح 1–500 رسالة", callback_data=f"group_panel_bulkdelete:{chat_id}"),
@@ -4421,7 +4439,7 @@ async def ban(update, context):
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
-        log_action(update.effective_chat.id, update.effective_user.id, "ban", str(uid))
+        log_action(update.effective_chat.id, update.effective_user.id, "ban", str(uid), update.effective_user.full_name)
         await update.message.reply_text("✅ تم حظر العضو.")
         try:
             await notify_owner_and_deputies(context, (
@@ -4445,7 +4463,7 @@ async def unban(update, context):
     uid = target.id if hasattr(target, "id") else target
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        log_action(update.effective_chat.id, update.effective_user.id, "unban", str(uid))
+        log_action(update.effective_chat.id, update.effective_user.id, "unban", str(uid), update.effective_user.full_name)
         await update.message.reply_text("✅ تم فك الحظر.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر فك الحظر: {e}")
@@ -4460,7 +4478,7 @@ async def kick(update, context):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        log_action(update.effective_chat.id, update.effective_user.id, "kick", str(uid))
+        log_action(update.effective_chat.id, update.effective_user.id, "kick", str(uid), update.effective_user.full_name)
         await update.message.reply_text("✅ تم طرد العضو.")
         kick_notice = (
             "👢 إشعار تنفيذ طرد عضو\n"
@@ -4490,7 +4508,7 @@ async def mute(update, context):
         )
         db.execute("INSERT OR REPLACE INTO group_mutes(chat_id,user_id,muted_by,muted_at) VALUES(?,?,?,?)", (update.effective_chat.id, uid, update.effective_user.id, now()))
         db.commit()
-        log_action(update.effective_chat.id, update.effective_user.id, "mute", str(uid))
+        log_action(update.effective_chat.id, update.effective_user.id, "mute", str(uid), update.effective_user.full_name)
         await update.message.reply_text("✅ تم كتم العضو وتسجيله في قائمة المكتومين.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر الكتم: {e}")
@@ -4514,7 +4532,7 @@ async def unmute(update, context):
             )
         )
         db.execute("DELETE FROM group_mutes WHERE chat_id=? AND user_id=?", (update.effective_chat.id, uid)); db.commit()
-        log_action(update.effective_chat.id, update.effective_user.id, "unmute", str(uid))
+        log_action(update.effective_chat.id, update.effective_user.id, "unmute", str(uid), update.effective_user.full_name)
         await update.message.reply_text("✅ تم فك الكتم وإزالة العضو من قائمة المكتومين.")
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر فك الكتم: {e}")
@@ -4542,7 +4560,7 @@ async def unmuteall_cmd(update, context):
                 can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
                 can_add_web_page_previews=True))
             db.execute("DELETE FROM group_mutes WHERE chat_id=? AND user_id=?", (chat_id, uid))
-            log_action(chat_id, update.effective_user.id, "unmute", str(uid)); success += 1
+            log_action(chat_id, update.effective_user.id, "unmute", str(uid), update.effective_user.full_name); success += 1
         except Exception as exc:
             log.warning("تعذر فك كتم %s في %s: %s", uid, chat_id, exc); failed += 1
     db.commit()
@@ -4554,7 +4572,10 @@ async def del_cmd(update, context):
         await update.message.reply_text("استخدم /del بالرد على الرسالة المراد حذفها.")
         return
     try:
-        await context.bot.delete_message(update.effective_chat.id, update.message.reply_to_message.message_id)
+        target_message_id = update.message.reply_to_message.message_id
+        await context.bot.delete_message(update.effective_chat.id, target_message_id)
+        log_action(update.effective_chat.id, update.effective_user.id, "delete_message",
+                   f"message_id={target_message_id}", update.effective_user.full_name)
         await update.message.delete()
     except Exception as e:
         await update.message.reply_text(f"❌ تعذر الحذف: {e}")
@@ -4622,7 +4643,7 @@ async def set_lock(update, context, field=None, value=None):
     set_setting(update.effective_chat.id, field, value)
     state = "🔒 تم المنع." if value else "🔓 تم السماح."
     await update.effective_message.reply_text(state)
-    log_action(update.effective_chat.id, update.effective_user.id, "setting", f"{field}={value}")
+    log_action(update.effective_chat.id, update.effective_user.id, "setting", f"{field}={value}", update.effective_user.full_name)
 
 async def locks(update, context):
     uid = update.effective_user.id if update.effective_user else 0
@@ -4771,14 +4792,15 @@ async def alerts(update, context):
 async def logs_cmd(update, context):
     if not await require_admin(update): return
     rows = db.execute(
-        "SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20",
+        "SELECT user_id,actor_name,action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20",
         (update.effective_chat.id,)
     ).fetchall()
     if not rows:
         await update.effective_message.reply_text("📋 لا يوجد سجل بعد.")
         return
     text = "📋 آخر العمليات:\n\n" + "\n".join(
-        f"• {a} — {d}" for a,d,_ in rows
+        f"• {created} — {name or ('ID ' + str(actor_id))} — {action}: {details or ''}"
+        for actor_id,name,action,details,created in rows
     )
     await update.effective_message.reply_text(text)
 
@@ -4953,7 +4975,7 @@ async def ArabicTextCommand(update, context):
             report = await context.bot.send_message(chat_id, f"🗑️ اكتملت عملية المسح.\nتم حذف: {deleted} رسالة\nتعذر حذف: {failed} رسالة\n\nملاحظة: يستطيع البوت مسح الرسائل التي رصدها منذ تشغيله فقط، ولا يستطيع جلب سجل الرسائل القديم من تيليجرام.")
         except Exception:
             report = None
-        log_action(chat_id, update.effective_user.id, "bulk_delete", f"requested={count};deleted={deleted};failed={failed}")
+        log_action(chat_id, update.effective_user.id, "bulk_delete", f"requested={count};deleted={deleted};failed={failed}", update.effective_user.full_name)
         return
     if text in {"قفل رسايل", "قفل رسائل", "قفل الدردشة", "قفل المحادثة", "قفل الشات"}:
         await lock_all_messages_command(update, context)
@@ -5073,7 +5095,7 @@ async def owner_group_feature_command(update, context):
     field, enabled, response = mapping[cmd]
     register_group(chat, user)
     set_group_feature(chat.id, field, enabled)
-    log_action(chat.id, user.id, "group_feature_toggle", f"{field}={enabled}")
+    log_action(chat.id, user.id, "group_feature_toggle", f"{field}={enabled}", user.full_name)
     await msg.reply_text(response)
 
 def all_message_groups_markup(context, action):
@@ -5624,7 +5646,7 @@ async def edited_filter(update, context):
         if s["edit"]:
             try:
                 await msg.delete()
-                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "تعديل")
+                log_action(update.effective_chat.id, msg.from_user.id if msg.from_user else 0, "delete_edit", "تعديل", msg.from_user.full_name if msg.from_user else "")
             except Exception:
                 pass
 
@@ -5721,7 +5743,7 @@ async def chat_join_request_handler(update, context):
          InlineKeyboardButton("❌ رفض الطلب", callback_data=f"joinreq_deny:{chat.id}:{user.id}")]
     ])
     _external_for_text = bool((external_group_info(chat.id) or (0,))[0]) if chat.type != ChatType.CHANNEL else True
-    _approval_authority_text = "مالك القروب نفسه فقط" if _external_for_text else "المالك أو النائب أو المفوض أو الشخص المصرح له"
+    _approval_authority_text = "مالك القروب نفسه فقط" if _external_for_text else "مالك البوت أو نائب المالك الممنوح صلاحية الموافقة لهذا القروب"
     text = ("🔐 طلب انضمام يحتاج مراجعة\n"
             f"القروب: {chat.title or chat.id} (ID: {chat.id})\n"
             f"العضو: {user.full_name or 'عضو'}\n"
@@ -5741,7 +5763,11 @@ async def chat_join_request_handler(update, context):
         if OWNER_ID:
             recipients.add(int(OWNER_ID))
         if chat.type != ChatType.CHANNEL:
-            recipients.update(int(row[0]) for row in db.execute("SELECT user_id FROM deputy_owners").fetchall())
+            _deputy_rows = db.execute("SELECT user_id FROM deputy_owners").fetchall()
+            recipients.update(
+                int(row[0]) for row in _deputy_rows
+                if can_use_capability(int(row[0]), "join_approval", int(chat.id))
+            )
     for recipient in recipients:
         try:
             await context.bot.send_message(chat_id=recipient, text=text, reply_markup=keyboard)
@@ -14055,7 +14081,7 @@ async def _callback_impl(update, context):
         try:
             await context.bot.get_chat(cid)
             set_setting(cid,field,value)
-            log_action(cid,uid,"external_setting",f"{field}={value}")
+            log_action(cid,uid,"external_setting",f"{field}={value}",q.from_user.full_name)
             await safe_callback_answer(q,"تم تحديث إعداد الحماية.")
             await q.edit_message_text(f"{'🔒 تم قفل' if value else '🔓 تم فتح'} {dict(EXTERNAL_LOCK_OPTIONS).get(field,field)} في هذا القروب.",reply_markup=external_locks_markup(cid))
         except Exception as exc:
@@ -14118,8 +14144,8 @@ async def _callback_impl(update, context):
         except Exception: await safe_callback_answer(q,"القروب غير صحيح.",show_alert=True); return
         if not external_owner_can(uid,cid,"logs"):
             await safe_callback_answer(q,"لا تملك صلاحية السجل لهذا القروب.",show_alert=True); return
-        rows=db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 15",(cid,)).fetchall()
-        body="\\n".join(f"• {a}: {d or ''} ({t or ''})" for a,d,t in rows) or "لا توجد عمليات مسجلة."
+        rows=db.execute("SELECT user_id,actor_name,action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20",(cid,)).fetchall()
+        body="\\n".join(f"• {t or ''} — {name or ('ID '+str(actor))} — {a}: {d or ''}" for actor,name,a,d,t in rows) or "لا توجد عمليات مسجلة."
         await q.edit_message_text("📋 آخر عمليات القروب\\n\\n"+body[:3800],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب",callback_data=f"xowner_group:{cid}")]])); return
     if data.startswith("xowner_members:"):
         try: cid=int(data.split(":",1)[1])
@@ -14489,7 +14515,7 @@ async def _callback_impl(update, context):
             await safe_callback_answer(q, "هذا الإعداد للمالك الأساسي فقط.", show_alert=True); return
         new_state = not group_feature_enabled(chat_id, feature)
         set_group_feature(chat_id, feature, new_state)
-        log_action(chat_id, uid, "group_feature_toggle", f"{feature}={int(new_state)}")
+        log_action(chat_id, uid, "group_feature_toggle", f"{feature}={int(new_state)}", q.from_user.full_name)
         note = ""
         await q.edit_message_text(f"تم {'تشغيل' if new_state else 'إيقاف'} الإعداد بنجاح.{note}", reply_markup=group_controls_markup(chat_id)); return
 
@@ -14569,7 +14595,13 @@ async def _callback_impl(update, context):
                 or external_owner_can(uid, chat_id, "rejected")
             )
         else:
-            _allowed_external = (is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id) or can_use_capability(uid, "join_approval", chat_id))
+            _allowed_external = (
+                is_owner(uid)
+                or (is_deputy_owner(uid) and (
+                    can_use_capability(uid, "reentry", chat_id)
+                    or can_use_capability(uid, "join_approval", chat_id)
+                ))
+            )
         if not _allowed_external:
             await safe_callback_answer(q, "لا تملك صلاحية مراجعة هذا القروب.", show_alert=True); return
         title_row = (
@@ -14587,7 +14619,7 @@ async def _callback_impl(update, context):
             _can_review_return = (
                 is_owner(uid) or
                 (external_owner_can(uid, chat_id, "reentry") if _is_external_scope
-                 else (is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id)))
+                 else (is_deputy_owner(uid) and can_use_capability(uid, "reentry", chat_id)))
             )
             if status in ("pending", "blocked") and _can_review_return:
                 rows.append([InlineKeyboardButton(f"✅ السماح بالعودة {str(name or user_id)[:18]}", callback_data=f"reentry_approve:{chat_id}:{user_id}"), InlineKeyboardButton("⛔ إبقاء المنع", callback_data=f"reentry_keep:{chat_id}:{user_id}")])
@@ -14597,7 +14629,7 @@ async def _callback_impl(update, context):
             _can_review_join = (
                 is_owner(uid) or
                 (external_owner_can(uid, chat_id, "join_approval") if _is_external_scope
-                 else (is_deputy_owner(uid) or can_use_capability(uid, "join_approval", chat_id) or can_use_capability(uid, "reentry", chat_id)))
+                 else (is_deputy_owner(uid) and can_use_capability(uid, "join_approval", chat_id)))
             )
             if status == "pending" and _can_review_join:
                 rows.append([InlineKeyboardButton(f"✅ قبول {str(name or user_id)[:20]}", callback_data=f"joinreq_approve:{chat_id}:{user_id}"), InlineKeyboardButton("❌ رفض", callback_data=f"joinreq_deny:{chat_id}:{user_id}")])
@@ -14636,7 +14668,7 @@ async def _callback_impl(update, context):
             lines += ["طلبات العودة:"] + ([f"• {name or uid0} — ID {uid0} — {status}" for uid0,name,reason,status,created in bans] or ["• لا توجد طلبات عودة معلقة."])
             lines += ["", "طلبات الانضمام:"] + ([f"• {name or uid0} — ID {uid0} — {status}" for uid0,name,status,requested in reqs] or ["• لا توجد طلبات انضمام معلقة."])
             _can_decide_return = is_owner(uid) or (external_owner_can(uid, chat_id, "reentry") if ext and int(ext[0] or 0) == 1 else (is_deputy_owner(uid) or can_use_capability(uid, "reentry", chat_id)))
-            _can_decide_join = is_owner(uid) or (external_owner_can(uid, chat_id, "join_approval") if ext and int(ext[0] or 0) == 1 else (is_deputy_owner(uid) or can_use_capability(uid, "join_approval", chat_id)))
+            _can_decide_join = is_owner(uid) or (external_owner_can(uid, chat_id, "join_approval") if ext and int(ext[0] or 0) == 1 else (is_deputy_owner(uid) and can_use_capability(uid, "join_approval", chat_id)))
             if _can_decide_return:
                 for uid0,name,reason,status,created in bans:
                     rows.append([InlineKeyboardButton(f"✅ السماح {str(name or uid0)[:18]}", callback_data=f"reentry_approve:{chat_id}:{uid0}"), InlineKeyboardButton("⛔ إبقاء المنع", callback_data=f"reentry_keep:{chat_id}:{uid0}")])
@@ -14670,7 +14702,7 @@ async def _callback_impl(update, context):
         if is_external_request_group:
             authorized_approver = bool(is_owner(uid) or external_owner_can(uid, chat_id, "join_approval"))
         else:
-            authorized_approver = bool(is_owner(uid) or is_deputy_owner(uid) or can_use_capability(uid, "join_approval", chat_id))
+            authorized_approver = bool(is_owner(uid) or (is_deputy_owner(uid) and can_use_capability(uid, "join_approval", chat_id)))
         if not authorized_approver:
             await safe_callback_answer(q, "لا تملك صلاحية قبول أو رفض طلبات الانضمام لهذا القروب.", show_alert=True); return
         reqrow = db.execute("SELECT status FROM join_request_events WHERE chat_id=? AND user_id=?", (chat_id, target_id)).fetchone()
@@ -14696,7 +14728,7 @@ async def _callback_impl(update, context):
             db.commit()
             try:
                 await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=target_id)
-                log_action(chat_id, uid, "join_request_approved", f"target={target_id}")
+                log_action(chat_id, uid, "join_request_approved", f"target={target_id}", q.from_user.full_name)
                 await q.edit_message_text((q.message.text or "طلب انضمام") + f"\n\n✅ تمت الموافقة بواسطة {uid}.")
             except Exception as exc:
                 # Restore the prior state if Telegram rejected the approval.
@@ -14716,7 +14748,7 @@ async def _callback_impl(update, context):
                 await safe_callback_answer(q, "تعذر رفض الطلب في تيليجرام؛ أبقيت حالته كما هي.", show_alert=True)
                 return
             db.execute("UPDATE join_request_events SET status='denied',decided_at=?,decided_by=? WHERE chat_id=? AND user_id=?", (now(), uid, chat_id, target_id))
-            db.commit(); log_action(chat_id, uid, "join_request_denied", f"target={target_id}")
+            db.commit(); log_action(chat_id, uid, "join_request_denied", f"target={target_id}", q.from_user.full_name)
             await q.edit_message_text((q.message.text or "طلب انضمام") + f"\n\n❌ تم رفض الطلب بواسطة {uid}.")
         return
 
@@ -14963,7 +14995,7 @@ async def _callback_impl(update, context):
         enabled = 0 if row and row[0] else 1
         db.execute("INSERT INTO internal_group_capabilities(chat_id,capability,enabled,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,capability) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
                    (internal_cid,cap,enabled,uid,now()))
-        db.commit(); log_action(internal_cid,uid,"internal_capability_toggle",f"{cap}={enabled}")
+        db.commit(); log_action(internal_cid,uid,"internal_capability_toggle",f"{cap}={enabled}",q.from_user.full_name)
         await safe_callback_answer(q, "تم تحديث الصلاحية.")
         await q.edit_message_text("🏠 إدارة القروب الداخلي", reply_markup=internal_group_manage_markup(internal_cid)); return
 
@@ -16347,7 +16379,7 @@ async def _callback_impl(update, context):
         required_cap = {
             "group_panel_toggle_links": "protection", "group_panel_settings": "settings",
             "group_panel_admin": "members", "group_panel_roles": "members",
-            "group_panel_stats": "stats", "group_panel_logs": "stats", "group_panel_tag": "tag",
+            "group_panel_stats": "stats", "group_panel_logs": "logs", "group_panel_tag": "tag",
             "group_panel_warnings": "members", "group_panel_bulkdelete": "members", "group_panel_staffhelp": "members"
         }.get(action)
         # Deputy access is limited to the specific capability granted for this group.
@@ -16408,7 +16440,7 @@ async def _callback_impl(update, context):
             if current and not (is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", group_chat_id)) or ext_link_admin):
                 await safe_callback_answer(q, "فتح الروابط للأعضاء يتطلب صلاحية المالك أو مشرف القروب الخارجي المخوّل.", show_alert=True); return
             set_setting(group_chat_id, "links", 0 if current else 1)
-            log_action(group_chat_id, uid, "setting", f"links={0 if current else 1}")
+            log_action(group_chat_id, uid, "setting", f"links={0 if current else 1}", q.from_user.full_name)
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
             await q.edit_message_text(
                 f"🛡️ لوحة إدارة القروب: {html.escape((title_row[0] if title_row else str(group_chat_id)) or str(group_chat_id))}\n\n"
@@ -16489,9 +16521,12 @@ async def _callback_impl(update, context):
                 reply_markup=InlineKeyboardMarkup(member_admin_rows))
             return
         if action == "group_panel_logs":
-            rows = db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 20", (group_chat_id,)).fetchall()
+            rows = db.execute("SELECT user_id,actor_name,action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 30", (group_chat_id,)).fetchall()
             title_row = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (group_chat_id,)).fetchone()
-            body = "\n".join(f"• {created} — {action}: {details or ''}" for action, details, created in rows) or "لا توجد عمليات مسجلة بعد."
+            body = "\n".join(
+                f"• {created} — {actor_name or ('ID ' + str(actor_id))} — {action}: {details or ''}"
+                for actor_id, actor_name, action, details, created in rows
+            ) or "لا توجد عمليات مسجلة بعد."
             await q.edit_message_text(f"📋 سجلات القروب: {title_row[0] if title_row else group_chat_id}\n\n{body}"[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لوحة القروب", callback_data=f"group_panel_home:{group_chat_id}")]]))
             return
         if action == "group_panel_stats":
@@ -17037,7 +17072,7 @@ async def _callback_impl(update, context):
         if field == "links" and new_value == 0 and not (is_owner(uid) or (is_delegated_owner(uid) and can_use_capability(uid, "protection", chat_id)) or external_link_admin):
             await safe_callback_answer(q, "فتح الروابط للأعضاء يتطلب صلاحية المالك أو مشرف القروب الخارجي المخوّل.", show_alert=True); return
         set_setting(chat_id, field, new_value)
-        log_action(chat_id, uid, "setting", f"{field}={new_value}")
+        log_action(chat_id, uid, "setting", f"{field}={new_value}", q.from_user.full_name)
         back = f"group_panel_home:{chat_id}" if not can_use_panel(uid) else "home"
         await q.edit_message_text(settings_text(page), reply_markup=settings_page_markup(chat_id, page, back))
         return
@@ -18076,9 +18111,12 @@ async def _callback_impl(update, context):
         try: chat_id = int(data.split(":",1)[1])
         except ValueError: await safe_callback_answer(q, "معرّف غير صحيح", show_alert=True); return
         if not await can_access_group(context.bot, uid, chat_id): await safe_callback_answer(q, "لا تملك صلاحية هذا القروب", show_alert=True); return
-        rows = db.execute("SELECT action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 25", (chat_id,)).fetchall()
+        rows = db.execute("SELECT user_id,actor_name,action,details,created_at FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT 30", (chat_id,)).fetchall()
         title = db.execute("SELECT title FROM watched_groups WHERE chat_id=?", (chat_id,)).fetchone()
-        body = "\n".join(f"• {created} — {action}: {details or ''}" for action,details,created in rows) or "لا توجد عمليات مسجلة بعد."
+        body = "\n".join(
+            f"• {created} — {actor_name or ('ID ' + str(actor_id))} — {action}: {details or ''}"
+            for actor_id, actor_name, action, details, created in rows
+        ) or "لا توجد عمليات مسجلة بعد."
         await q.edit_message_text(f"📋 سجل القروب: {title[0] if title else chat_id}\n\n{body}"[:3900], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ السجلات", callback_data="logs")],[InlineKeyboardButton("⬅️ الرئيسية", callback_data="home")]])); return
 
     if data == "settings":
