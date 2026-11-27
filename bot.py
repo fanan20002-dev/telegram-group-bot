@@ -5127,6 +5127,17 @@ async def lock_all_messages_command(update, context):
 
     try:
         if lock:
+            # Deleting unauthorized messages is the only enforcement method that
+            # preserves the group's default permissions. Verify Telegram will allow it
+            # before reporting that the lock is active.
+            bot_id = context.bot.id
+            bot_member = await context.bot.get_chat_member(chat_id=chat.id, user_id=bot_id)
+            if getattr(bot_member, "status", "") not in ("administrator", "creator") or not getattr(bot_member, "can_delete_messages", False):
+                await msg.reply_text(
+                    "⚠️ لا يمكن تفعيل قفل الدردشة بعد. امنح البوت صلاحية «حذف الرسائل» كمشرف في هذا القروب، ثم أعد الأمر.\n"
+                    "لن أغيّر إعدادات القروب أو صلاحيات أعضائه."
+                )
+                return
             db.execute(
                 "INSERT INTO chat_text_lock_state(chat_id,enabled,updated_by,updated_at) VALUES(?,1,?,?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET enabled=1,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
@@ -5320,10 +5331,10 @@ async def message_filter(update, context):
         return
     uid = msg.from_user.id if msg.from_user else 0
     register_group(chat)
-    if not external_group_active(chat.id):
-        return
 
-    # Enforce the public writing lock without changing group-wide Telegram permissions.
+    # Enforce the public writing lock in every group where the bot is active,
+    # including external groups that are otherwise paused for optional features.
+    # This must run before the external_group_active early return below.
     if chat_text_lock_enabled(chat.id) and msg.from_user and not msg.from_user.is_bot:
         allowed_to_write = chat_text_lock_authorized(uid, chat.id)
         if not allowed_to_write:
@@ -5338,6 +5349,10 @@ async def message_filter(update, context):
             except Exception as exc:
                 log.warning("Could not remove message during text lock chat=%s user=%s: %s", chat.id, uid, exc)
             return
+
+    if not external_group_active(chat.id):
+        return
+
     if msg.from_user and not msg.from_user.is_bot:
         # Analytics collection obeys both the owner-wide scope switch and the per-group switch.
         analytics_enabled = (owner_global_control_enabled(chat.id, "stats") and group_feature_enabled(chat.id, "stats_enabled"))
